@@ -68,6 +68,8 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
     def handle_cast(:begin_drain, state), do: {:noreply, state}
 
     @impl GenServer
+    def handle_call({:local_drain_status, _deadline}, from, state), do: handle_call(:owner_status, from, state)
+
     def handle_call(:owner_status, _from, state) do
       {:reply, {:ok, %{active_turn?: false}}, state}
     end
@@ -128,6 +130,8 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
     def handle_cast(:begin_drain, state), do: {:noreply, state}
 
     @impl GenServer
+    def handle_call({:local_drain_status, _deadline}, from, state), do: handle_call(:owner_status, from, state)
+
     def handle_call(:owner_status, _from, state) do
       {:reply, {:ok, %{active_turn?: false}}, state}
     end
@@ -304,6 +308,8 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
     end
 
     @impl GenServer
+    def handle_call({:local_drain_status, _deadline}, from, state), do: handle_call(:owner_status, from, state)
+
     def handle_call(:owner_status, _from, state) do
       {:reply, {:ok, %{active_turn?: state.active_turn?}}, state}
     end
@@ -361,6 +367,8 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
     def handle_cast(:begin_drain, state), do: {:noreply, state}
 
     @impl GenServer
+    def handle_call({:local_drain_status, _deadline}, from, state), do: handle_call(:owner_status, from, state)
+
     def handle_call(:owner_status, _from, state) do
       status_calls = state.status_calls + 1
       send(state.parent, {:rollout_drain_status_call, state.key, status_calls})
@@ -412,6 +420,8 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
     def handle_cast(:begin_drain, state), do: {:noreply, state}
 
     @impl GenServer
+    def handle_call({:local_drain_status, _deadline}, from, state), do: handle_call(:owner_status, from, state)
+
     def handle_call(:owner_status, _from, %{status_calls: 0} = state) do
       {:reply, {:ok, %{active_turn?: true}}, %{state | status_calls: 1}}
     end
@@ -486,6 +496,8 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
     end
 
     @impl GenServer
+    def handle_call({:local_drain_status, _deadline}, from, state), do: handle_call(:owner_status, from, state)
+
     def handle_call(:owner_status, _from, %{answer_status?: true} = state) do
       send(state.parent, {:unresponsive_owner_call, state.key, :owner_status, :answered})
       {:reply, {:ok, %{active_turn?: true}}, state}

@@ -66,6 +66,76 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
     )
   end
 
+  @doc false
+  @spec compact_delivery_status(OwnerCleanup.t(), pos_integer()) :: :pending | :delivered | :terminal_error | :aborted | :skipped
+  def compact_delivery_status(%OwnerCleanup{} = witness, timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0 do
+    query =
+      from request in Request,
+        join: turn in CodexTurn,
+        on: turn.request_id == request.id and turn.codex_session_id == ^witness.session_id,
+        join: session in CodexSession,
+        on: session.id == turn.codex_session_id,
+        join: attempt in Attempt,
+        on: attempt.id == ^witness.attempt_id and attempt.request_id == request.id,
+        left_join: entitlement in RequestReplayEntitlement,
+        on: entitlement.request_id == request.id,
+        where: request.id == ^witness.request_id,
+        select: {session, request, attempt, turn, entitlement}
+
+    case Repo.one(query, timeout: timeout_ms, queue: false) do
+      {%CodexSession{} = session, %Request{} = request, %Attempt{} = attempt, %CodexTurn{} = turn, entitlement} ->
+        if compact_delivery_rows_match?(session, request, attempt, turn, witness, entitlement) do
+          compact_receipt_status((attempt.response_metadata || %{})["downstream_delivery"], request, attempt, turn)
+        else
+          :pending
+        end
+
+      _missing ->
+        :pending
+    end
+  rescue
+    _exception -> :pending
+  catch
+    :exit, _reason -> :pending
+  end
+
+  defp compact_delivery_rows_match?(session, request, attempt, turn, witness, entitlement) do
+    session.owner_instance_id == witness.owner_instance_id and session.owner_lease_token == witness.owner_lease_token and
+      compact_delivery_authority?(request, witness, entitlement) and
+      request.status in ["succeeded", "failed"] and attempt.status in ["succeeded", "failed"] and turn.status in [@turn_succeeded, @turn_failed, @turn_interrupted]
+  end
+
+  defp compact_delivery_authority?(request, %OwnerCleanup{replay_generation: 0} = witness, _entitlement), do: request_owner_matches?(request, witness)
+
+  defp compact_delivery_authority?(request, %OwnerCleanup{replay_generation: 1, native_replay_binding: %Binding{}} = witness, %RequestReplayEntitlement{} = entitlement),
+    do: replay_request_owner_matches?(request, witness, entitlement)
+
+  defp compact_delivery_authority?(_request, _witness, _entitlement), do: false
+
+  defp compact_receipt_status(%{"transport" => "websocket", "outcome" => outcome, "frames_after_visible" => frames, "terminal_class" => terminal, "highest_frame_class" => highest} = receipt, request, attempt, turn)
+       when is_integer(frames) and frames >= 0 and terminal in ["response.completed", "response.failed", "response.incomplete", "error", "none", "unknown"] and highest in ["none", "lifecycle", "item_added", "part_added", "delta", "other", "item_done", "terminal"] do
+    compact_receipt_outcome(outcome, receipt, request, attempt, turn)
+  end
+
+  defp compact_receipt_status(_receipt, _request, _attempt, _turn), do: :pending
+
+  defp compact_receipt_outcome(outcome, receipt, request, attempt, turn) do
+    case {outcome, receipt["terminal_class"], receipt["highest_frame_class"], receipt["write_failure"], receipt["write_failed_at"]} do
+      {"delivered", "response.completed", "terminal", nil, nil} -> completed_compact_receipt_status(request, attempt, turn)
+      {"delivered", "response.incomplete", "terminal", nil, nil} -> :terminal_error
+      {"delivered", terminal, "terminal", nil, nil} when terminal in ["response.failed", "error"] and request.status == "failed" and attempt.status == "failed" -> :terminal_error
+      {"aborted", _, _, _, _} -> :aborted
+      {"skipped", _, _, _, _} -> :skipped
+      _unproven -> :pending
+    end
+  end
+
+  defp completed_compact_receipt_status(request, attempt, turn) do
+    if request.status == "succeeded" and attempt.status == "succeeded" and turn.status == @turn_succeeded,
+      do: :delivered,
+      else: :pending
+  end
+
   @spec interrupt_direct_request(
           CodexPooler.Gateway.Websocket.DirectCleanup.receipt(),
           String.t()
@@ -974,7 +1044,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
 
   defp request_owner_matches?(
          request,
-         %OwnerCleanup{replay_generation: 1, native_replay_binding: %Binding{} = binding} =
+         %OwnerCleanup{replay_generation: 1, native_replay_binding: %Binding{}} =
            witness
        ) do
     entitlement =
@@ -984,19 +1054,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
           lock: "FOR UPDATE"
       )
 
-    match?(%RequestReplayEntitlement{status: "consumed"}, entitlement) and
-      entitlement.replay_attempt_id == witness.attempt_id and
-      {binding.request_id, binding.replay_attempt_id} == {witness.request_id, witness.attempt_id} and
-      replay_binding_identity_matches?(binding, entitlement) and
-      binding.downstream_epoch == witness.downstream_epoch and
-      binding.replay_generation == witness.replay_generation and
-      binding.provisional_binding_digest == entitlement.provisional_binding_digest and
-      binding.owner_lease_digest == entitlement.owner_lease_digest and
-      RequestReplayEntitlement.verify_owner_lease_digest(
-        witness.owner_lease_token,
-        entitlement.owner_lease_key_version,
-        entitlement.owner_lease_digest
-      )
+    replay_request_owner_matches?(request, witness, entitlement)
   end
 
   defp request_owner_matches?(_request, %OwnerCleanup{replay_generation: 1}), do: false
@@ -1019,6 +1077,18 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
   defp replay_binding_identity_matches?(binding, entitlement) do
     fields = [:codex_turn_id, :eligible_attempt_id, :semantic_turn_digest, :replay_claim_digest]
     Map.take(binding, fields) == Map.take(entitlement, fields)
+  end
+
+  defp replay_request_owner_matches?(_request, %OwnerCleanup{native_replay_binding: binding} = witness, entitlement) do
+    match?(%RequestReplayEntitlement{status: "consumed"}, entitlement) and
+      entitlement.replay_attempt_id == witness.attempt_id and
+      {binding.request_id, binding.replay_attempt_id} == {witness.request_id, witness.attempt_id} and
+      replay_binding_identity_matches?(binding, entitlement) and
+      binding.downstream_epoch == witness.downstream_epoch and
+      binding.replay_generation == witness.replay_generation and
+      binding.provisional_binding_digest == entitlement.provisional_binding_digest and
+      binding.owner_lease_digest == entitlement.owner_lease_digest and
+      RequestReplayEntitlement.verify_owner_lease_digest(witness.owner_lease_token, entitlement.owner_lease_key_version, entitlement.owner_lease_digest)
   end
 
   defp interrupt_session_transaction(session_id, opts, reason, caller_owned_transaction?) do

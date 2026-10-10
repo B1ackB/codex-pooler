@@ -96,6 +96,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     :callbacks,
     :active_turn,
     :termination_cleanup_witness,
+    :compact_delivery,
+    :compact_delivery_read,
+    :compact_activity_deadline,
     :terminal_winner_detach,
     :pending_handoff,
     :suspended_replay,
@@ -162,7 +165,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
           required(:owner_instance_id) => binary(),
           required(:upstream_alive?) => boolean(),
           required(:draining?) => boolean(),
-          required(:active_turn?) => boolean()
+          required(:active_turn?) => boolean(),
+          optional(:compact_delivery_status) => nil | :pending | :delivered | :terminal_error | :aborted | :skipped
         }
 
   # An owner is registered before its `init/1` runs and marks itself ready
@@ -289,6 +293,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   @spec owner_status(GenServer.server()) :: {:ok, owner_status()}
   def owner_status(owner), do: GenServer.call(owner, :owner_status, owner_call_timeout())
+
+  @doc false
+  @spec local_drain_status(pid(), %{at: integer(), now_ms: (-> integer())}, pos_integer()) :: {:ok, owner_status()}
+  def local_drain_status(owner, deadline, timeout \\ owner_call_timeout())
+
+  def local_drain_status(owner, %{at: at, now_ms: clock} = deadline, timeout) when is_pid(owner) and node(owner) == node() and is_integer(at) and is_function(clock, 0) and is_integer(timeout) and timeout > 0 do
+    GenServer.call(owner, {:local_drain_status, deadline}, timeout)
+  end
 
   @spec capture_downstream_idle_timeout(GenServer.server(), map(), String.t()) :: term()
   def capture_downstream_idle_timeout(owner, downstream, client_activity) when is_pid(owner) do
@@ -1666,7 +1678,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     end
   end
 
+  def handle_call({:local_drain_status, %{at: at, now_ms: clock} = deadline}, from, state) when is_integer(at) and is_function(clock, 0) do
+    deadline = if state.compact_activity_deadline && state.compact_activity_deadline.at <= at, do: state.compact_activity_deadline, else: deadline
+    handle_call(:owner_status, from, %{state | compact_activity_deadline: deadline})
+  end
+
   def handle_call(:owner_status, _from, state) do
+    state = refresh_compact_delivery(state)
+
     {:reply,
      {:ok,
       %{
@@ -1675,10 +1694,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
         owner_instance_id: state.owner_instance_id,
         upstream_alive?: Process.alive?(state.upstream_pid),
         draining?: state.draining?,
+        compact_delivery_status: if(state.compact_delivery, do: state.compact_delivery.status, else: nil),
         active_turn?:
           DownstreamState.active_turn?(state) or
             not is_nil(state.compaction_retry_submit_hold) or
-            (state.draining? and Persistence.pending_finalization?(state))
+            (state.draining? and pending_owner_finalization?(state))
       }}, state}
   end
 
@@ -2623,6 +2643,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   @impl GenServer
   def handle_info({:drain_settlement_poll, ref}, %{drain_settlement: %{ref: ref} = settlement} = state) do
+    state = refresh_compact_delivery(state)
+
     case forwarded_turn_settlement(state) do
       :settled ->
         finish_drain_settlement(state, :settled)
@@ -2641,6 +2663,16 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   end
 
   def handle_info({:drain_settlement_poll, _stale_ref}, state), do: {:noreply, state}
+
+  def handle_info({ref, result}, %{compact_delivery_read: %{ref: ref, witness: witness, deadline: deadline}} = state) do
+    Process.demonitor(ref, [:flush])
+    state = %{state | compact_delivery_read: nil}
+    state = if accept_compact_delivery_result?(state, witness, deadline), do: put_in(state.compact_delivery.status, result), else: state
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{compact_delivery_read: %{ref: ref}} = state),
+    do: {:noreply, %{state | compact_delivery_read: nil}}
 
   def handle_info(
         {:compaction_retry_submit_hold_expired, ref},
@@ -3062,6 +3094,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   @impl GenServer
   def terminate(reason, state) do
+    if state.compact_delivery_read, do: Task.shutdown(state.compact_delivery_read.task, :brutal_kill)
     :ok = log_abandoned_upstream_close(state, :draining)
     state = cancel_owner_renewal(state)
     state = cancel_pending_admissions(state, Atom.to_string(owner_exit_reason(reason, state)))
@@ -3589,6 +3622,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   # of the exit from its monitor instead.
   defp notify_drained_downstream(_state, :settled), do: :ok
 
+  # A collected provider terminal may already have reached the client even
+  # when persisting its delivery receipt failed. Cut conservatively without
+  # manufacturing another terminal or declaring successful delivery.
+  defp notify_drained_downstream(%{compact_delivery: %{witness: %OwnerCleanup{}}}, :cut), do: :ok
+
   defp notify_drained_downstream(state, :cut) do
     _result = send_owner_error(state, state.downstream, :owner_drained)
     :ok
@@ -3599,6 +3637,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   # session, or the owner already finished it and the request it witnessed is
   # still settling; `:settled` once that request settled; `:none` for any
   # other owner, which the drain cuts at once as it always did.
+  defp forwarded_turn_settlement(%{suspended_replay: nil, active_turn: nil, compact_delivery: %{status: :pending}}), do: :pending
+  defp forwarded_turn_settlement(%{suspended_replay: nil, active_turn: nil, compact_delivery: %{status: :delivered}}), do: :settled
+  defp forwarded_turn_settlement(%{suspended_replay: nil, active_turn: nil, compact_delivery: delivery}) when is_map(delivery), do: :none
+
   defp forwarded_turn_settlement(%{suspended_replay: nil} = state) do
     cond do
       forwarded_turn_awaiting_result?(state.active_turn) -> :pending
@@ -3620,7 +3662,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     ref = make_ref()
     Process.send_after(self(), {:drain_settlement_poll, ref}, @drain_settlement_poll_ms)
     deadline_ms = System.monotonic_time(:millisecond) + drain_settlement_budget_ms()
-    %{begin_drain_state(state) | drain_settlement: %{waiters: [waiter], ref: ref, deadline_ms: deadline_ms}}
+    refresh_compact_delivery(%{begin_drain_state(state) | drain_settlement: %{waiters: [waiter], ref: ref, deadline_ms: deadline_ms}})
   end
 
   defp begin_drain_state(state) do
@@ -3664,6 +3706,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     do: {:noreply, %{state | drain_settlement: %{settlement | waiters: [from | waiters]}}}
 
   defp drain(from, state) do
+    state = begin_drain_state(state)
+
     case forwarded_turn_settlement(state) do
       :pending -> {:noreply, await_forwarded_turn_settlement(state, from)}
       :settled -> {:stop, :normal, drain_reply(:settled), drain_now(state, :settled)}
@@ -4057,6 +4101,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     deferred_upstream_close = deferred_upstream_close(state.active_turn)
 
     state = %{state | termination_cleanup_witness: OwnerCleanup.from_owner_state(state)}
+    state = %{state | compact_delivery: completed_compact_delivery(state, result)}
     state = %{state | forwarded_terminal_request_id: forwarded_terminal_request_id(state)}
 
     clear_active_turn_resources(state.active_turn)
@@ -4075,6 +4120,53 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     |> apply_native_steering_owner_success(native_steering_finalized_result(result))
     |> complete_terminal_winner_detach()
     |> apply_deferred_upstream_close(deferred_upstream_close)
+  end
+
+  defp completed_compact_delivery(%{active_turn: %{collect?: true} = active, termination_cleanup_witness: %OwnerCleanup{} = witness}, result) do
+    if completed_compaction_result?(result) and (active.admission_phase == :compact or not is_nil(active.first_compact_request_identity)),
+      do: %{witness: witness, status: :pending},
+      else: nil
+  end
+
+  defp completed_compact_delivery(_state, _result), do: nil
+
+  defp compact_delivery_pending?(%{compact_delivery: %{status: :pending}}), do: true
+  defp compact_delivery_pending?(_state), do: false
+
+  defp accept_compact_delivery_result?(state, witness, deadline) do
+    match?(%{witness: ^witness}, state.compact_delivery) and
+      state.owner_instance_id == witness.owner_instance_id and state.owner_lease_token == witness.owner_lease_token and
+      compact_read_phase(state) == deadline.phase and compact_read_deadline(state).at == deadline.at and deadline.now_ms.() < deadline.at
+  end
+
+  defp compact_read_phase(%{drain_settlement: settlement}) when is_map(settlement), do: :settlement
+  defp compact_read_phase(_state), do: :activity
+
+  defp compact_read_deadline(%{drain_settlement: %{deadline_ms: deadline}}), do: %{phase: :settlement, at: deadline, now_ms: fn -> System.monotonic_time(:millisecond) end}
+  defp compact_read_deadline(%{compact_activity_deadline: deadline}) when is_map(deadline), do: Map.put(deadline, :phase, :activity)
+  defp compact_read_deadline(_state), do: nil
+
+  defp pending_owner_finalization?(%{compact_delivery: delivery} = state) when is_map(delivery), do: compact_delivery_pending?(state)
+  defp pending_owner_finalization?(state), do: Persistence.pending_finalization?(state)
+
+  # Read outside the mailbox: unavailable PostgreSQL must not hold status or
+  # drain calls past the coordinator's deadline. One bounded read at a time;
+  # the existing coordinator/settlement polls decide when to sample again.
+  defp refresh_compact_delivery(%{draining?: true, active_turn: nil, compact_delivery: %{status: :pending, witness: witness}, compact_delivery_read: nil} = state) do
+    if deadline = compact_read_deadline(state) do
+      task = Task.Supervisor.async_nolink(@task_supervisor, fn -> read_compact_delivery(witness, deadline) end)
+
+      %{state | compact_delivery_read: %{task: task, ref: task.ref, witness: witness, deadline: deadline}}
+    else
+      state
+    end
+  end
+
+  defp refresh_compact_delivery(state), do: state
+
+  defp read_compact_delivery(witness, deadline) do
+    remaining = deadline.at - deadline.now_ms.()
+    if remaining > 0, do: Persistence.compact_delivery_status(witness, min(remaining, min(100, owner_call_timeout() - 1))), else: :pending
   end
 
   defp native_steering_finalized_result({:ok, result}) when is_map(result), do: Map.get(result, :native_response_steering_finalized)

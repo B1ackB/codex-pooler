@@ -7,6 +7,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Persist
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Logger, as: OwnerLogger
   alias CodexPooler.Gateway.Websocket.OwnerCleanup
 
+  @spec compact_delivery_status(OwnerCleanup.t(), pos_integer()) :: :pending | :delivered | :terminal_error | :aborted | :skipped
+  defdelegate compact_delivery_status(witness, timeout_ms), to: Interruption
+
   @spec pending_finalization?(map()) :: boolean()
   def pending_finalization?(state) do
     case OwnerCleanup.from_owner_state(state) do

@@ -30,6 +30,18 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketPreTurnCompactionCutPeerTe
     assert log =~ "reason=owner_drained confirmation=not_applied"
   end
 
+  @tag compaction_drain_delivery: true
+  test "full compact peer owner drain waits for tracked completion handoff after accounting settled", %{peer_node: peer_node} do
+    assert Scenario.run_drain_completion(:peer, peer_node: peer_node, hold_completion: true) == :ok
+  end
+
+  @tag compaction_drain_deadline: true
+  test "full compact peer drain keeps its original deadline when the proxy receipt write fails", %{peer_node: peer_node} do
+    log = ExUnit.CaptureLog.capture_log(fn -> assert Scenario.run_drain_completion(:peer, peer_node: peer_node, hold_completion: true, receipt_failure: true) == :ok end)
+    assert log =~ "downstream delivery receipt not persisted"
+    assert log =~ "longer than 100ms"
+  end
+
   for {mode, shape, cut} <- [{"full", :pre_turn, :observed_cut}, {"full", :pre_turn, :observed_cut_exited}, {"full", :mid_turn, :observed_cut}, {"lite", :pre_turn, :observed_cut}, {"lite", :pre_turn, :observed_cut_exited}] do
     @tag mode: mode, shape: shape, topology: :peer, cut: cut
     test "#{mode} #{shape} peer admitted compaction #{cut} with the closed socket's cleanup held: the released client's first websocket retry is served",

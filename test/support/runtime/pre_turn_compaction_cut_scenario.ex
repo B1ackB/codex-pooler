@@ -13,7 +13,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
 
   import Ecto.Query
   import ExUnit.Assertions
-  import ExUnit.Callbacks, only: [on_exit: 1]
+  import ExUnit.Callbacks, only: [on_exit: 1, start_supervised!: 1]
   import Phoenix.ConnTest, only: [build_conn: 0, post: 3]
   import Plug.Conn, only: [put_req_header: 3]
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport
@@ -24,9 +24,15 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   alias CodexPooler.{ExecutionProofSupport, FakeUpstream, UnboxedFixture}
   alias CodexPooler.Gateway.Payloads.WebsocketTurnIdentity
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
+  alias CodexPooler.Gateway.Runtime.Finalization.Interruption
+  alias CodexPooler.Gateway.Transports.Streaming.DeferredStreamRegistry
   alias CodexPooler.Gateway.Transports.Websocket.{ActivityDrain, ActivityRegistry, NativeCompactionAdmission, WebsocketOwnerSession}
+  alias CodexPooler.Gateway.Transports.Websocket.RolloutDrain
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Persistence, as: OwnerPersistence
+  alias CodexPooler.Gateway.Websocket.DeliveryReceipt
   alias CodexPooler.Platform.ExecutionTerminalProof
   alias CodexPooler.Repo
+  alias CodexPoolerWeb.Runtime.BackendCodexWebsocketSupport
   alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
 
   require Logger
@@ -264,6 +270,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     port = start_public_endpoint!()
     client = connect!(port, setup) |> ordinary_turn!(turn_frame(ctx))
     await_armed!(topology, setup)
+    delivery_gate = if Keyword.get(opts, :hold_completion, false), do: install_compact_completion_gate!(client.cleanup_socket, topology)
     owner = owner_pid!(setup)
     owner_monitor = Process.monitor(owner)
     initial = :sys.get_state(owner)
@@ -271,6 +278,14 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     assert node(owner) == expected_node
     assert node(initial.upstream_pid) == expected_node
     assert Repo.get!(CodexSession, initial.codex_session_id).owner_instance_id == initial.owner_instance_id
+
+    if topology == :peer do
+      assert {:ok, %{owner_instance_id: owner_instance}} = WebsocketOwnerSession.owner_status(owner)
+      assert owner_instance == initial.owner_instance_id
+      assert_raise FunctionClauseError, fn -> WebsocketOwnerSession.local_drain_status(owner, %{at: System.monotonic_time(:millisecond) + 80, now_ms: fn -> System.monotonic_time(:millisecond) end}) end
+      assert {:ok, %{owner_instance_id: ^owner_instance}} = WebsocketOwnerSession.owner_status(owner)
+      CodexPooler.TestDiagnostics.puts(fn -> "owner_status_compatibility " <> CodexPooler.JSON.encode!(%{legacy_remote_atom: true, local_budget_api_refuses_remote_before_send: true, original_peer_owner_alive: true}) end)
+    end
 
     client = send_frame!(client, anchored_compaction_frame(ctx))
     await_barrier!(0, release_ref)
@@ -290,15 +305,26 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     :ok = FakeUpstream.release_remaining_frames(upstream, release_ref)
     await_barrier!(3, release_ref)
 
+    drain_task = if delivery_gate, do: hold_compact_delivery!(delivery_gate, owner, request_id, attempt_id, opts)
+
     {client, frames} = receive_until_terminal(client, [])
     assert frames == ["response.output_item.done", "response.completed"]
     await_compaction_settled!(setup.pool.id, ["succeeded"])
     assert Repo.get!(Request, request_id).status == "succeeded"
     assert Repo.get!(Attempt, attempt_id).status == "succeeded"
     assert charges(Repo.get!(Request, request_id)) == 1
-    state = :sys.get_state(owner)
-    assert state.draining?
-    refute match?(%NativeCompactionAdmission{phase: :pending_final}, state.native_compaction_admission)
+
+    if drain_task do
+      finish_compact_delivery_drain!(drain_task, owner, attempt_id)
+      {_conn, _websocket, after_terminal} = BackendCodexWebsocketSupport.receive_frames_until_close!(client.conn, client.websocket, client.ref)
+      assert Enum.all?(after_terminal, &match?({:close, _, _}, &1)), "a data frame followed the compact terminal"
+      CodexPooler.TestDiagnostics.puts(fn -> "compaction_delivery_causality " <> CodexPooler.JSON.encode!(%{topology: topology, request_id: request_id, attempt_id: attempt_id, held_after_db_settlement: true, receipt_absent_at_hold: true, owner_pending_at_hold: true, exact_delivered_receipt: not drain_task.failure, trailing_data_frames: 0}) end)
+    else
+      state = :sys.get_state(owner)
+      assert state.draining?
+      refute match?(%NativeCompactionAdmission{phase: :pending_final}, state.native_compaction_admission)
+    end
+
     assert Enum.count(FakeUpstream.requests(upstream), &compaction_request?/1) == 1
     assert :ok = FakeUpstream.verify!(upstream)
     Mint.HTTP.close(client.conn)
@@ -306,6 +332,259 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     assert_receive {:DOWN, ^owner_monitor, :process, ^owner, _reason}, @detection_timeout_ms
     CodexPooler.TestDiagnostics.puts(fn -> "compaction_drain_causality " <> CodexPooler.JSON.encode!(%{topology: topology, serving_mode: "full", shape: "incremental_mid_turn", session_id: initial.codex_session_id, request_id: request_id, attempt_id: attempt_id, owner_node: Atom.to_string(node(owner)), upstream_node: Atom.to_string(node(initial.upstream_pid)), terminal_released_after_owner_draining: true, request_status: "succeeded", attempt_status: "succeeded", client_events: frames, charges: 1, original_owner_exited: true}) end)
     :ok
+  end
+
+  defp install_compact_completion_gate!(socket, topology) do
+    test = self()
+    ref = make_ref()
+
+    gate = fn ->
+      monitor = Process.monitor(test)
+      send(test, {:compact_completion_held, ref, self()})
+
+      receive do
+        {:release_compact_completion, ^ref} -> :ok
+        {:DOWN, ^monitor, :process, ^test, _reason} -> :ok
+      after
+        @detection_timeout_ms -> flunk("compact completion handoff was not released")
+      end
+
+      Process.demonitor(monitor, [:flush])
+    end
+
+    options = if topology == :peer, do: [before_completion_handoff: fn _token, _watcher -> gate.() end], else: [before_local_completion_handoff: gate]
+
+    :sys.replace_state(socket, fn {name, data} ->
+      state = Map.put(data.connection.websock_state, :response_task_start_options, options)
+      {name, %{data | connection: %{data.connection | websock_state: state}}}
+    end)
+
+    ref
+  end
+
+  defp hold_compact_delivery!(ref, owner, request_id, attempt_id, opts) do
+    assert_receive {:compact_completion_held, ^ref, task}, @detection_timeout_ms
+    on_exit(fn -> send(task, {:release_compact_completion, ref}) end)
+    assert Repo.get!(Request, request_id).status == "succeeded"
+    assert Repo.get!(Attempt, attempt_id).status == "succeeded"
+    assert Repo.get!(Attempt, attempt_id).response_metadata["downstream_delivery"] == nil
+    assert :sys.get_state(owner).active_turn == nil
+    assert_compact_receipt_matrix!(:sys.get_state(owner).termination_cleanup_witness)
+    assert {:ok, %{active_turn?: true}} = WebsocketOwnerSession.owner_status(owner)
+    budget_waiter = assert_requested_owner_budget!(owner, opts)
+    failure = Keyword.get(opts, :receipt_failure, false)
+    receipt_outcome = Keyword.get(opts, :receipt_outcome)
+    if failure and is_nil(receipt_outcome), do: assert_compact_receipt_read_bound!(:sys.get_state(owner).termination_cleanup_witness, owner)
+    fault = if failure, do: install_compact_receipt_failure!(attempt_id, receipt_outcome)
+    started = System.monotonic_time(:millisecond)
+    coordinator = if Keyword.get(opts, :coordinator, false), do: start_compact_rollout!(owner)
+    call = compact_drain_call(coordinator, owner)
+    drain = Task.async(call)
+    if coordinator, do: await!(fn -> is_map(:sys.get_state(coordinator).active_drain) end, "coordinator did not begin")
+    activity_deadline = if coordinator, do: :sys.get_state(coordinator).deadline_ms
+    repeated = Task.async(call)
+    await!(fn -> is_map(:sys.get_state(owner).drain_settlement) end, "owner did not retain the pending delivery")
+    deadline = :sys.get_state(owner).drain_settlement.deadline_ms
+    owner_now = if node(owner) == node(), do: System.monotonic_time(:millisecond), else: :erpc.call(node(owner), System, :monotonic_time, [:millisecond])
+    local_deadline = System.monotonic_time(:millisecond) + deadline - owner_now
+
+    if coordinator do
+      assert :sys.get_state(coordinator).deadline_ms == activity_deadline
+      assert length(:sys.get_state(coordinator).active_drain.waiters) == 2
+    else
+      assert_compact_drain_waiters!(owner, budget_waiter)
+    end
+
+    assert :sys.get_state(owner).drain_settlement.deadline_ms == deadline
+    send(task, {:release_compact_completion, ref})
+    %{task: drain, repeated: repeated, started: started, deadline: local_deadline, failure: failure, fault: fault, coordinator: coordinator, receipt_outcome: receipt_outcome, budget_waiter: budget_waiter}
+  end
+
+  defp compact_drain_call(nil, owner), do: fn -> WebsocketOwnerSession.drain_owner(owner) end
+  defp compact_drain_call(coordinator, _owner), do: fn -> RolloutDrain.start_drain(name: coordinator, timeout_ms: 11_000) end
+
+  defp assert_compact_drain_waiters!(owner, budget_waiter) do
+    expected_waiters = if is_reference(budget_waiter), do: 3, else: 2
+    await!(fn -> length(:sys.get_state(owner).drain_settlement.waiters) == expected_waiters end, "second drain caller did not join")
+  end
+
+  defp start_compact_rollout!(owner) do
+    assert node(owner) == node()
+    assert Registry.select(WebsocketOwnerSession.Registry, [{{:"$1", :"$2", :_}, [], [:"$2"]}]) == [owner]
+    suffix = System.unique_integer([:positive])
+    activities = :"compact_drain_activities_#{suffix}"
+    streams = :"compact_drain_streams_#{suffix}"
+    name = :"compact_rollout_#{suffix}"
+    start_supervised!({ActivityRegistry, name: activities})
+    start_supervised!({DeferredStreamRegistry, name: streams})
+    start_supervised!({RolloutDrain, name: name, activity_registry: activities, stream_registry: streams})
+    name
+  end
+
+  defp finish_compact_delivery_drain!(%{failure: false} = drain, _owner, attempt_id) do
+    await!(fn -> match?(%{"outcome" => "delivered", "terminal_class" => "response.completed"}, Repo.get!(Attempt, attempt_id).response_metadata["downstream_delivery"]) end, "exact compact receipt never committed")
+    assert {:ok, :settled} = Task.await(drain.task, @detection_timeout_ms)
+    assert {:ok, :settled} = Task.await(drain.repeated, @detection_timeout_ms)
+    if is_reference(drain.budget_waiter), do: assert({:reply, {:ok, :settled}} = :gen_server.wait_response(drain.budget_waiter, @detection_timeout_ms))
+  end
+
+  defp finish_compact_delivery_drain!(%{receipt_outcome: outcome} = drain, _owner, attempt_id) when not is_nil(outcome) do
+    assert %{result: :ok, owners_drained: 1, turns_aborted: 1, turns_completed: 0} = Task.await(drain.task, @detection_timeout_ms)
+    assert %{turns_aborted: 1, turns_completed: 0} = Task.await(drain.repeated, @detection_timeout_ms)
+    receipt = Repo.get!(Attempt, attempt_id).response_metadata["downstream_delivery"]
+    if outcome == :terminal_error, do: assert(receipt["terminal_class"] == "response.incomplete"), else: assert(receipt["outcome"] == Atom.to_string(outcome))
+    assert System.monotonic_time(:millisecond) < drain.deadline
+    remove_compact_receipt_failure!(drain.fault)
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_non_success_retirement " <> CodexPooler.JSON.encode!(%{attempt_id: attempt_id, injected_receipt: outcome, turns_aborted: 1, turns_completed: 0, settled_before_deadline: true}) end)
+  end
+
+  defp finish_compact_delivery_drain!(%{failure: true} = drain, owner, attempt_id) do
+    first = Task.await(drain.task, @detection_timeout_ms)
+    second = Task.await(drain.repeated, @detection_timeout_ms)
+
+    if drain.coordinator do
+      assert %{result: :ok, owners_drained: 1, turns_aborted: 1, turns_completed: 0} = first
+      assert Map.drop(first, [:already_draining?]) == Map.drop(second, [:already_draining?])
+    else
+      assert first == :ok
+      assert second == :ok
+    end
+
+    ended = System.monotonic_time(:millisecond)
+    assert ended >= drain.deadline
+    assert ended - drain.deadline < 1_000
+    assert Repo.get!(Attempt, attempt_id).response_metadata["downstream_delivery"] == nil
+    assert Repo.get!(Attempt, attempt_id).status == "succeeded"
+    remove_compact_receipt_failure!(drain.fault)
+    assert :ok = DeliveryReceipt.persist(attempt_id, DeliveryReceipt.build(%{outcome: "delivered", terminal_class: "response.completed", highest_frame_class: "terminal", frames_after_visible: 2}))
+    refute if(node(owner) == node(), do: Process.alive?(owner), else: :erpc.call(node(owner), Process, :alive?, [owner]))
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_deadline_causality " <> CodexPooler.JSON.encode!(%{attempt_id: attempt_id, elapsed_ms: ended - drain.started, cutoff_overshoot_ms: ended - drain.deadline, repeated_waiters: 2, coordinator: not is_nil(drain.coordinator), receipt_absent_at_cutoff: true, late_receipt_did_not_revive_owner: true}) end)
+  end
+
+  defp install_compact_receipt_failure!(attempt_id, outcome) do
+    name = "compact_receipt_" <> String.replace(Ecto.UUID.generate(), "-", "")
+    on_exit(fn -> remove_compact_receipt_failure!(name) end)
+    # These are deliberate stored-receipt fault controls, not claims about the
+    # actual socket's write outcome. The client still proves one terminal.
+    action =
+      case outcome do
+        nil -> "RAISE EXCEPTION 'synthetic receipt persistence failure';"
+        :terminal_error -> "NEW.response_metadata = jsonb_set(NEW.response_metadata, '{downstream_delivery,terminal_class}', '\"response.incomplete\"');"
+        value when value in [:aborted, :skipped] -> "NEW.response_metadata = jsonb_set(NEW.response_metadata, '{downstream_delivery,outcome}', '\"#{value}\"');"
+      end
+
+    Repo.query!("CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = '#{attempt_id}'::uuid AND NEW.response_metadata ? 'downstream_delivery' THEN #{action} END IF; RETURN NEW; END $$")
+    Repo.query!("CREATE TRIGGER #{name} BEFORE UPDATE ON attempts FOR EACH ROW EXECUTE FUNCTION #{name}()")
+    name
+  end
+
+  defp remove_compact_receipt_failure!(name) do
+    Repo.query!("DROP TRIGGER IF EXISTS #{name} ON attempts")
+    Repo.query!("DROP FUNCTION IF EXISTS #{name}()")
+  end
+
+  defp assert_compact_receipt_read_bound!(witness, owner) do
+    parent = self()
+    ref = make_ref()
+
+    holder =
+      Task.async(fn ->
+        monitor = Process.monitor(parent)
+
+        Repo.transaction(fn ->
+          Repo.query!("LOCK TABLE codex_turns IN ACCESS EXCLUSIVE MODE")
+          %{rows: [[backend]]} = Repo.query!("SELECT pg_backend_pid()")
+          send(parent, {:compact_read_lock, ref, backend})
+
+          receive do
+            {:release_compact_read_lock, ^ref} -> :ok
+            {:DOWN, ^monitor, :process, ^parent, _reason} -> :ok
+          after
+            @detection_timeout_ms -> Repo.rollback(:missing_lock_release)
+          end
+        end)
+      end)
+
+    holder_monitor = Process.monitor(holder.pid)
+    on_exit(fn -> send(holder.pid, {:release_compact_read_lock, ref}) end)
+    assert_receive {:compact_read_lock, ^ref, holder_backend}, @detection_timeout_ms
+
+    reader =
+      Task.async(fn ->
+        Repo.checkout(
+          fn ->
+            %{rows: [[backend]]} = Repo.query!("SELECT pg_backend_pid()")
+            send(parent, {:compact_read_backend, ref, backend})
+            started = System.monotonic_time(:millisecond)
+            result = Interruption.compact_delivery_status(witness, 100)
+            {result, System.monotonic_time(:millisecond) - started}
+          end,
+          timeout: 100
+        )
+      end)
+
+    reader_monitor = Process.monitor(reader.pid)
+    assert_receive {:compact_read_backend, ^ref, reader_backend}, @detection_timeout_ms
+    assert reader_backend != holder_backend
+    await!(fn -> Repo.query!("SELECT $1 = ANY(pg_blocking_pids($2))", [holder_backend, reader_backend]).rows == [[true]] end, "receipt read never waited on its distinct lock holder")
+    assert {:ok, %{active_turn?: true}} = WebsocketOwnerSession.owner_status(owner)
+    assert {:pending, elapsed} = Task.await(reader, @detection_timeout_ms)
+    assert elapsed < 1_000
+    assert_receive {:DOWN, ^reader_monitor, :process, _, :normal}, @detection_timeout_ms
+    send(holder.pid, {:release_compact_read_lock, ref})
+    assert {:ok, :ok} = Task.await(holder, @detection_timeout_ms)
+    assert_receive {:DOWN, ^holder_monitor, :process, _, :normal}, @detection_timeout_ms
+
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_read_lock_bound " <> CodexPooler.JSON.encode!(%{attempt_id: witness.attempt_id, distinct_backends: true, blocking_relation_observed: true, query_timeout_ms: 100, observed_ms: elapsed, owner_responsive: true}) end)
+  end
+
+  defp assert_compact_receipt_matrix!(witness) do
+    original = Repo.get!(Attempt, witness.attempt_id).response_metadata
+    delivered = DeliveryReceipt.build(%{outcome: "delivered", terminal_class: "response.completed", highest_frame_class: "terminal", frames_after_visible: 2})
+
+    cases = [
+      {:delivered, delivered, :delivered},
+      {:missing_terminal, Map.delete(delivered, "terminal_class"), :pending},
+      {:malformed, %{delivered | "frames_after_visible" => "two"}, :pending},
+      {:malformed_aborted, delivered |> Map.put("outcome", "aborted") |> Map.delete("terminal_class"), :pending},
+      {:completed, %{delivered | "outcome" => "completed"}, :pending},
+      {:unknown, %{delivered | "outcome" => "unknown"}, :pending},
+      {:unknown_terminal, %{delivered | "terminal_class" => "unknown"}, :pending},
+      {:write_failed, Map.put(delivered, "write_failure", "closed"), :pending},
+      {:error_terminal, %{delivered | "terminal_class" => "response.incomplete"}, :terminal_error},
+      {:contradictory_error_terminal, %{delivered | "terminal_class" => "response.failed"}, :pending},
+      {:aborted, %{delivered | "outcome" => "aborted"}, :aborted},
+      {:skipped, %{delivered | "outcome" => "skipped"}, :skipped}
+    ]
+
+    try do
+      assert :pending = Interruption.compact_delivery_status(witness, 100)
+
+      for {name, receipt, expected} <- cases do
+        assert :ok = DeliveryReceipt.persist(witness.attempt_id, receipt)
+        assert Interruption.compact_delivery_status(witness, 100) == expected, "receipt classification #{name}"
+      end
+
+      assert :ok = DeliveryReceipt.persist(witness.attempt_id, delivered)
+
+      for key <- [:session_id, :request_id, :attempt_id, :owner_lease_token] do
+        assert :pending = Interruption.compact_delivery_status(Map.put(witness, key, Ecto.UUID.generate()), 100)
+      end
+
+      assert :pending = Interruption.compact_delivery_status(%{witness | replay_generation: 2}, 100)
+      assert :pending = Interruption.compact_delivery_status(%{witness | downstream_epoch: witness.downstream_epoch + 1}, 100)
+
+      assert {:error, :matrix_complete} =
+               Repo.transaction(fn ->
+                 Repo.update_all(from(a in Attempt, where: a.id == ^witness.attempt_id), set: [status: "in_progress"])
+                 assert :pending = Interruption.compact_delivery_status(witness, 100)
+                 Repo.rollback(:matrix_complete)
+               end)
+    after
+      Repo.update_all(from(a in Attempt, where: a.id == ^witness.attempt_id), set: [response_metadata: original])
+    end
+
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_receipt_matrix " <> CodexPooler.JSON.encode!(%{request_id: witness.request_id, attempt_id: witness.attempt_id, receipt_cases: length(cases), missing: true, foreign_binding_cases: 6, nonterminal_database: true}) end)
   end
 
   # The peer shares the committed database, so its fixture is committed: the
@@ -325,7 +604,200 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     setup
   end
 
-  defp topology_setup!(_topology, upstream, _opts), do: gateway_setup(upstream, compact?: true)
+  defp topology_setup!(_topology, upstream, opts) do
+    if Keyword.get(opts, :receipt_failure, false) or Keyword.has_key?(opts, :owner_budget) do
+      enter_peer_owner_topology!()
+      setup = gateway_setup(upstream, compact?: true)
+      register_unboxed_pool_cleanup!(setup)
+      setup
+    else
+      gateway_setup(upstream, compact?: true)
+    end
+  end
+
+  defp assert_requested_owner_budget!(owner, opts) do
+    case Keyword.get(opts, :owner_budget) do
+      nil -> nil
+      mode -> assert_owner_reader_budget!(owner, mode)
+    end
+  end
+
+  defp assert_owner_reader_budget!(owner, mode) do
+    assert node(owner) == node()
+    witness = :sys.get_state(owner).termination_cleanup_witness
+    assert :sys.get_state(owner).compact_delivery_read == nil
+    parent = self()
+    ref = make_ref()
+    initial = System.monotonic_time(:millisecond)
+    clock_state = start_supervised!({Agent, fn -> %{now: initial, gate?: true} end})
+    clock = fn -> owner_reader_clock(clock_state, owner, parent, ref) end
+    deadline = %{at: initial + 80, now_ms: clock}
+    original = Repo.get!(Attempt, witness.attempt_id).response_metadata
+    on_exit(fn -> :erlang.trace_pattern({OwnerPersistence, :compact_delivery_status, 2}, false, [:local]) end)
+    lock = if mode in [:sub100, :delayed_start], do: hold_owner_reader_table!(ref)
+
+    if mode in [:delayed_result, :phase_transition], do: DeliveryReceipt.persist(witness.attempt_id, DeliveryReceipt.build(%{outcome: "delivered", terminal_class: "response.completed", highest_frame_class: "terminal", frames_after_visible: 2}))
+    assert {:ok, %{active_turn?: true}} = WebsocketOwnerSession.local_drain_status(owner, deadline)
+    assert_receive {:owner_reader_clock, ^ref, reader}, @detection_timeout_ms
+    assert :sys.get_state(owner).compact_delivery_read.task.pid == reader
+    monitor = Process.monitor(reader)
+    on_exit(fn -> send(reader, {:release_owner_reader_clock, ref}) end)
+    Code.ensure_loaded!(OwnerPersistence)
+    assert :erlang.trace_pattern({OwnerPersistence, :compact_delivery_status, 2}, true, [:local]) == 1
+    :erlang.trace(reader, true, [:call, {:tracer, self()}])
+    assert {:ok, %{active_turn?: true}} = WebsocketOwnerSession.local_drain_status(owner, %{deadline | at: deadline.at + 1_000})
+    assert :sys.get_state(owner).compact_activity_deadline.at == deadline.at
+    assert {:ok, %{active_turn?: true}} = WebsocketOwnerSession.owner_status(owner)
+
+    result = run_owner_reader_order!(mode, %{owner: owner, reader: reader, monitor: monitor, clock: clock_state, deadline: deadline, ref: ref, lock: lock, witness: witness, original_metadata: original})
+    :erlang.trace_pattern({OwnerPersistence, :compact_delivery_status, 2}, false, [:local])
+    Repo.update_all(from(a in Attempt, where: a.id == ^witness.attempt_id), set: [response_metadata: original])
+    CodexPooler.TestDiagnostics.puts(fn -> "owner_reader_budget_causality " <> CodexPooler.JSON.encode!(%{mode: mode, attempt_id: witness.attempt_id, actual_owner_task: true, activity_budget_ms: 80, repeated_deadline_unchanged: true, legacy_atom_supported: true, pending_after_read: true}) end)
+    if is_reference(result), do: result
+  end
+
+  defp owner_reader_clock(agent, owner, parent, ref) do
+    if self() not in [owner, parent] do
+      gate? = Agent.get_and_update(agent, fn state -> {state.gate?, %{state | gate?: false}} end)
+
+      if gate? do
+        monitor = Process.monitor(parent)
+        send(parent, {:owner_reader_clock, ref, self()})
+
+        receive do
+          {:release_owner_reader_clock, ^ref} -> :ok
+          {:DOWN, ^monitor, :process, ^parent, _reason} -> :ok
+        after
+          @detection_timeout_ms -> flunk("owner reader clock gate was not released")
+        end
+
+        Process.demonitor(monitor, [:flush])
+      end
+    end
+
+    Agent.get(agent, & &1.now)
+  end
+
+  defp hold_owner_reader_table!(ref) do
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        monitor = Process.monitor(parent)
+
+        Repo.transaction(fn ->
+          Repo.query!("LOCK TABLE codex_turns IN ACCESS EXCLUSIVE MODE")
+          %{rows: [[backend]]} = Repo.query!("SELECT pg_backend_pid()")
+          send(parent, {:owner_reader_lock, ref, backend})
+
+          receive do
+            {:release_owner_reader_lock, ^ref} -> :ok
+            {:DOWN, ^monitor, :process, ^parent, _reason} -> :ok
+          after
+            @detection_timeout_ms -> Repo.rollback(:missing_reader_lock_release)
+          end
+        end)
+      end)
+
+    monitor = Process.monitor(holder.pid)
+    on_exit(fn -> send(holder.pid, {:release_owner_reader_lock, ref}) end)
+    assert_receive {:owner_reader_lock, ^ref, backend}, @detection_timeout_ms
+    %{task: holder, monitor: monitor, backend: backend, ref: ref}
+  end
+
+  defp run_owner_reader_order!(:sub100, s) do
+    Agent.update(s.clock, &%{&1 | now: s.deadline.at - 40})
+    send(s.reader, {:release_owner_reader_clock, s.ref})
+    assert_receive {:trace, reader, :call, {OwnerPersistence, :compact_delivery_status, [_witness, timeout]}}, @detection_timeout_ms, "actual owner reader did not enter the persistence boundary"
+    assert reader == s.reader
+    assert timeout > 0 and timeout <= 40
+    await!(fn -> Repo.query!("SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))", [s.lock.backend]).rows == [[1]] end, "actual owner reader never blocked on its separate backend")
+    assert {:ok, %{active_turn?: true}} = WebsocketOwnerSession.owner_status(s.owner)
+    assert_receive {:DOWN, monitor, :process, reader, :normal}, @detection_timeout_ms
+    assert {monitor, reader} == {s.monitor, s.reader}
+    release_owner_reader_lock!(s.lock)
+    await!(fn -> :sys.get_state(s.owner).compact_delivery_read == nil end, "reader did not retire")
+    assert :sys.get_state(s.owner).compact_delivery.status == :pending
+    CodexPooler.TestDiagnostics.puts(fn -> "owner_reader_query_bound " <> CodexPooler.JSON.encode!(%{mode: :sub100, actual_query_timeout_ms: timeout, residual_at_query_ms: 40, distinct_backend_block_observed: true}) end)
+  end
+
+  defp run_owner_reader_order!(:delayed_start, s) do
+    Agent.update(s.clock, &%{&1 | now: s.deadline.at + 1})
+    send(s.reader, {:release_owner_reader_clock, s.ref})
+    assert_receive {:DOWN, monitor, :process, reader, :normal}, @detection_timeout_ms
+    assert {monitor, reader} == {s.monitor, s.reader}
+    trace_fence = :erlang.trace_delivered(:all)
+    assert_receive {:trace_delivered, :all, ^trace_fence}, @detection_timeout_ms
+    refute_received {:trace, ^reader, :call, {OwnerPersistence, :compact_delivery_status, _args}}
+    release_owner_reader_lock!(s.lock)
+    await!(fn -> :sys.get_state(s.owner).compact_delivery_read == nil end, "expired reader did not retire")
+    assert :sys.get_state(s.owner).compact_delivery.status == :pending
+    CodexPooler.TestDiagnostics.puts(fn -> "owner_reader_query_bound " <> CodexPooler.JSON.encode!(%{mode: :delayed_start, query_started: false, actual_owner_task_exited: true}) end)
+  end
+
+  defp run_owner_reader_order!(:delayed_result, s) do
+    :ok = :sys.suspend(s.owner)
+
+    on_exit(fn ->
+      try do
+        :sys.resume(s.owner)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    send(s.reader, {:release_owner_reader_clock, s.ref})
+    assert_receive {:trace, reader, :call, {OwnerPersistence, :compact_delivery_status, [_witness, timeout]}}, @detection_timeout_ms, "actual owner reader did not enter the persistence boundary"
+    assert reader == s.reader and timeout <= 80
+    assert_receive {:DOWN, monitor, :process, reader, :normal}, @detection_timeout_ms
+    assert {monitor, reader} == {s.monitor, s.reader}
+    Agent.update(s.clock, &%{&1 | now: s.deadline.at + 1})
+    :ok = :sys.resume(s.owner)
+    await!(fn -> :sys.get_state(s.owner).compact_delivery_read == nil end, "stale result was not consumed")
+    assert :sys.get_state(s.owner).compact_delivery.status == :pending
+    CodexPooler.TestDiagnostics.puts(fn -> "owner_reader_query_bound " <> CodexPooler.JSON.encode!(%{mode: :delayed_result, actual_query_timeout_ms: timeout, stale_completed_result_ignored: true}) end)
+  end
+
+  defp run_owner_reader_order!(:phase_transition, s) do
+    :ok = :sys.suspend(s.owner)
+
+    on_exit(fn ->
+      try do
+        :sys.resume(s.owner)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    waiter = :gen_server.send_request(s.owner, :drain)
+    assert :sys.get_state(s.owner).drain_settlement == nil
+    send(s.reader, {:release_owner_reader_clock, s.ref})
+    assert_receive {:trace, reader, :call, {OwnerPersistence, :compact_delivery_status, [_witness, timeout]}}, @detection_timeout_ms, "actual owner phase reader did not enter persistence"
+    assert reader == s.reader and timeout <= 80
+    assert_receive {:DOWN, monitor, :process, reader, :normal}, @detection_timeout_ms
+    assert {monitor, reader} == {s.monitor, s.reader}
+    Repo.update_all(from(a in Attempt, where: a.id == ^s.witness.attempt_id), set: [response_metadata: s.original_metadata])
+    :ok = :sys.resume(s.owner)
+
+    await!(
+      fn ->
+        state = :sys.get_state(s.owner)
+        is_map(state.drain_settlement) and (is_nil(state.compact_delivery_read) or state.compact_delivery_read.task.pid != s.reader)
+      end,
+      "old activity result did not leave the settlement phase"
+    )
+
+    assert :sys.get_state(s.owner).compact_delivery.status == :pending
+    CodexPooler.TestDiagnostics.puts(fn -> "owner_reader_query_bound " <> CodexPooler.JSON.encode!(%{mode: :phase_transition, old_activity_result_ignored_during_settlement: true, actual_query_timeout_ms: timeout}) end)
+    waiter
+  end
+
+  defp release_owner_reader_lock!(lock) do
+    send(lock.task.pid, {:release_owner_reader_lock, lock.ref})
+    assert {:ok, :ok} = Task.await(lock.task, @detection_timeout_ms)
+    assert_receive {:DOWN, monitor, :process, holder, :normal}, @detection_timeout_ms
+    assert {monitor, holder} == {lock.monitor, lock.task.pid}
+  end
 
   defp cut_and_resend(:no_cut, ctx, client, _port, _upstream, _release_ref) do
     {client, frames} = receive_until_terminal(client, [])

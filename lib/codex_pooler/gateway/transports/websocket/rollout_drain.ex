@@ -424,7 +424,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
     remaining_ms = max(1, deadline_ms - drain_policy.now_ms.())
 
     try do
-      case GenServer.call(owner, :owner_status, remaining_ms) do
+      case WebsocketOwnerSession.local_drain_status(owner, %{at: deadline_ms, now_ms: drain_policy.now_ms}, remaining_ms) do
+        {:ok, %{active_turn?: false, compact_delivery_status: status}} when status in [:terminal_error, :aborted, :skipped] -> drain_settled_owner(:aborted, owner)
         {:ok, %{active_turn?: true}} -> drain_owner_after_turn(owner, deadline_ms, drain_policy, :active)
         {:ok, %{active_turn?: false}} -> drain_settled_owner(:idle, owner)
       end
@@ -459,7 +460,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
     do: poll_owner_status(owner, owner_ref, deadline_ms, drain_policy)
 
   defp await_turn_outcome(owner, owner_ref, deadline_ms, drain_policy, :unobserved) do
-    case owner_status(owner, owner_ref) do
+    case owner_status(owner, owner_ref, deadline_ms, drain_policy) do
+      {:ok, %{active_turn?: false, compact_delivery_status: status}} when status in [:terminal_error, :aborted, :skipped] ->
+        :aborted
+
       {:ok, %{active_turn?: false}} ->
         :idle
 
@@ -493,7 +497,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
   end
 
   defp poll_owner_status(owner, owner_ref, deadline_ms, drain_policy) do
-    case owner_status(owner, owner_ref) do
+    case owner_status(owner, owner_ref, deadline_ms, drain_policy) do
+      {:ok, %{active_turn?: false, compact_delivery_status: status}} when status in [:terminal_error, :aborted, :skipped] ->
+        :aborted
+
       {:ok, %{active_turn?: false}} ->
         :completed
 
@@ -505,13 +512,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
     end
   end
 
-  defp owner_status(owner, owner_ref) do
+  defp owner_status(owner, owner_ref, deadline_ms, drain_policy) do
     receive do
       {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
         {:error, :owner_unavailable}
     after
       0 ->
-        WebsocketOwnerSession.owner_status(owner)
+        WebsocketOwnerSession.local_drain_status(owner, %{at: deadline_ms, now_ms: drain_policy.now_ms})
     end
   catch
     :exit, _reason -> {:error, :owner_unavailable}

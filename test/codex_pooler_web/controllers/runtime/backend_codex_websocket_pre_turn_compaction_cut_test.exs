@@ -5,6 +5,41 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketPreTurnCompactionCutTest d
 
   alias CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario, as: Scenario
 
+  for mode <- [:sub100, :delayed_start, :delayed_result, :phase_transition] do
+    @tag compaction_drain_deadline: true, owner_budget: mode
+    test "actual owner receipt reader honors its activity budget for #{mode}", %{owner_budget: mode} do
+      log = ExUnit.CaptureLog.capture_log(fn -> assert Scenario.run_drain_completion(:forwarded, hold_completion: true, owner_budget: mode) == :ok end)
+      assert log =~ "reason=owner_drained confirmation=not_applied"
+      if mode == :sub100, do: assert(log =~ "longer than 40ms")
+    end
+  end
+
+  for outcome <- [:aborted, :skipped, :terminal_error] do
+    @tag compaction_drain_delivery: true, receipt_outcome: outcome
+    test "full compact rollout retires quietly without success for stored #{outcome} receipt", %{receipt_outcome: outcome} do
+      assert Scenario.run_drain_completion(:forwarded, hold_completion: true, receipt_failure: true, receipt_outcome: outcome, coordinator: true) == :ok
+    end
+  end
+
+  @tag compaction_drain_delivery: true
+  test "full compact drain waits for local completion handoff after accounting settled" do
+    assert Scenario.run_drain_completion(:forwarded, hold_completion: true) == :ok
+  end
+
+  @tag compaction_drain_deadline: true
+  test "full compact keeps the original drain deadline when its real receipt write fails" do
+    log = ExUnit.CaptureLog.capture_log(fn -> assert Scenario.run_drain_completion(:forwarded, hold_completion: true, receipt_failure: true) == :ok end)
+    assert log =~ "downstream delivery receipt not persisted"
+    assert log =~ "longer than 100ms"
+  end
+
+  @tag compaction_drain_deadline: true
+  test "full compact rollout keeps its activity deadline and bounded settlement allowance" do
+    log = ExUnit.CaptureLog.capture_log(fn -> assert Scenario.run_drain_completion(:forwarded, hold_completion: true, receipt_failure: true, coordinator: true) == :ok end)
+    assert log =~ "downstream delivery receipt not persisted"
+    assert log =~ "longer than 100ms"
+  end
+
   @tag compaction_drain_completion: true
   test "full incremental mid-turn compact completes after its local owner begins draining" do
     log = ExUnit.CaptureLog.capture_log(fn -> assert Scenario.run_drain_completion(:forwarded) == :ok end)
