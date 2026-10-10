@@ -132,15 +132,31 @@ defmodule CodexPooler.Gateway.Persistence.SessionReadModelTest do
   end
 
   # Missing: what the planner sees before a table's first ANALYZE, in a fresh
-  # database or right after a bulk load.
+  # database or right after a bulk load. Rolled-back fixtures can leave large
+  # request indexes over a vacuum-truncated heap; clearing statistics alone
+  # still makes repeated sequential probes cheaper. Rebuild that physical
+  # fixture inside the sandbox, then clear table and index statistics together.
   defp put_statistics!(:missing) do
-    for table <- ["requests", "codex_turns"] do
-      Repo.query!("SELECT pg_clear_relation_stats('public', $1)", [table])
+    # REINDEX updates the heap's pg_class counts in place, just like ANALYZE.
+    # Two distinct transactional writes own that catalog row even if it was already clear.
+    Repo.query!("LOCK TABLE requests IN SHARE MODE")
+    Repo.query!("SELECT pg_restore_relation_stats('schemaname', 'public', 'relname', 'requests', 'reltuples', 1::real, 'relpages', 1::integer, 'relallvisible', 0::integer)")
+    Repo.query!("SELECT pg_clear_relation_stats('public', 'requests')")
+    Repo.query!("REINDEX TABLE requests")
+    tables = ["requests", "codex_turns"]
+    %{rows: indexes} = Repo.query!("SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid = ANY($1::text[]::regclass[])", [Enum.map(tables, &("public." <> &1))])
+    relations = tables ++ Enum.map(indexes, fn [index] -> String.replace_prefix(index, "public.", "") end)
+
+    for relation <- relations do
+      Repo.query!("SELECT pg_clear_relation_stats('public', $1)", [relation])
+    end
+
+    for table <- tables do
       Repo.query!("SELECT pg_clear_attribute_stats('public', $1, attname, false) FROM pg_attribute WHERE attrelid = $1::text::regclass AND attnum > 0 AND NOT attisdropped", [table])
     end
 
-    assert %{rows: [[0, [-1.0, -1.0]]]} =
-             Repo.query!("SELECT (SELECT count(*) FROM pg_stats WHERE schemaname = 'public' AND tablename IN ('requests', 'codex_turns')), array_agg(reltuples) FROM pg_class WHERE oid IN ('public.requests'::regclass, 'public.codex_turns'::regclass)")
+    assert %{rows: [[0, true]]} =
+             Repo.query!("SELECT (SELECT count(*) FROM pg_stats WHERE schemaname = 'public' AND tablename = ANY($1)), bool_and(reltuples = -1 AND relpages = 0 AND relallvisible = 0 AND relallfrozen = 0) FROM pg_class WHERE relname = ANY($2) AND relnamespace = 'public'::regnamespace", [tables, relations])
   end
 
   defp put_statistics!(:fresh) do
