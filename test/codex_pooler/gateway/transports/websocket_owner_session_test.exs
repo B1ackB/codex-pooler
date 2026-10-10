@@ -623,6 +623,171 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
              :collected_unconfirmed
   end
 
+  for order <- [:cancel_before_result, :result_before_cancel, :cancel_first_before_result, :first_before_cancel, :drain_controls, :revoked_before_result, :mismatched_before_result] do
+    @tag compaction_drain_cancel: true, order: order
+    test "a real collected compaction preserves the causal winner: #{order}", context do
+      assert_collected_compaction_cancel_order(context)
+    end
+  end
+
+  defp assert_collected_compaction_cancel_order(%{order: order} = context) do
+    parent = self()
+    gate = make_ref()
+    first? = order in [:cancel_first_before_result, :first_before_cancel]
+    real = WebsocketOwnerSession.default_upstream_boundary()
+
+    boundary = %{
+      real
+      | send: fn upstream, request, writer ->
+          result = real.send.(upstream, request, writer)
+
+          if request.websocket_delivery_mode in [:collect_compaction, :collect_full_history] do
+            assert match?({:ok, %{terminal: "response.completed"}}, result), "real collection did not produce response.completed"
+            send(parent, {:compact_result_produced, gate, self()})
+
+            receive do
+              {:release_compact_result, ^gate} -> :ok
+            after
+              @detection_timeout_ms -> flunk("the completed collection was never released")
+            end
+          end
+
+          result
+        end
+    }
+
+    terminal = terminal_frame("response.completed", "resp_cancel_collection")
+    frames = if first?, do: [CodexPooler.JSON.encode!(%{"type" => "response.output_item.done", "item" => %{"type" => "compaction", "encrypted_content" => "synthetic-compact"}}), terminal], else: [terminal]
+    {:ok, upstream} = FakeUpstream.start_link(FakeUpstream.websocket_text_frames(frames))
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    assert {:ok, owner} = start_owner(context, upstream: boundary)
+    assert {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("cancel-collection"))
+    {binding, receipt} = if first?, do: {forwarded_binding(context, downstream), nil}, else: OrdinarySuccessTestSeed.request(owner, downstream, forwarded_binding(context, downstream), FakeUpstream.url(upstream))
+    capability = if not first?, do: reserve_accounted_capability(owner, downstream, binding, receipt, System.system_time(:millisecond))
+
+    request = %UpstreamWebsocketSession.Request{
+      websocket_request()
+      | native_compaction_capability: capability,
+        expected_connection_lifecycle: %{lifecycle_id: binding.lifecycle_id, generation: binding.generation},
+        effective_serving_mode: "full",
+        websocket_delivery_mode: :collect_compaction,
+        url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+        payload: CodexPooler.JSON.encode!(%{"model" => "ordinary-authority-seed", "input" => []}),
+        timeouts: %{connect_timeout_ms: 5_000, receive_timeout_ms: 5_000},
+        writer: nil
+    }
+
+    request =
+      if first? do
+        %{request | expected_connection_lifecycle: nil, websocket_delivery_mode: :collect_full_history, request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate(), payload: CodexPooler.JSON.encode!(%{"model" => "sample-model", "input" => [%{"role" => "user", "content" => "sample"}, %{"type" => "compaction_trigger"}]}), native_compaction_metadata: %NativeCodexTurnMetadata{request_kind: :compaction, semantic_turn_key: <<1::256>>, window_id_digest: <<2::256>>, context_window_id_digest: <<3::256>>, window_number: 1}, message_mapper: &StreamProtocol.canonicalize_native_codex_responses_json_message/1}
+      else
+        request
+      end
+
+    request = ProviderCreditsDispatchSupport.wire_request!(request)
+    submitter = Task.async(fn -> WebsocketOwnerSession.submit_request(owner, Map.put(downstream, :owner_turn_id, self()), request) end)
+    assert_receive {:compact_result_produced, ^gate, producer}, @detection_timeout_ms
+    producer_monitor = Process.monitor(producer)
+
+    on_exit(fn ->
+      send(producer, {:release_compact_result, gate})
+
+      try do
+        :sys.resume(owner)
+      catch
+        :exit, _gone -> :ok
+      end
+    end)
+
+    state = :sys.get_state(owner)
+    assert state.active_turn.task_pid == producer
+    if not first?, do: assert(state.native_compaction_admission.phase == :consumed_compact)
+    bound = state.active_turn.downstream
+    assert bound.owner_turn_id == submitter.pid
+    cancellation = {:cancel_downstream, bound.pid, bound.epoch, bound.correlation_id, bound.owner_turn_id, :owner_drained}
+
+    scenario = %{owner: owner, downstream: downstream, bound: bound, binding: binding, receipt: receipt, capability: capability, request: request, producer: producer, producer_monitor: producer_monitor, gate: gate, submitter: submitter, cancellation: cancellation, first?: first?}
+    assert_collection_order(order, scenario)
+
+    provider_requests = if first?, do: 1, else: 2
+    assert FakeUpstream.count(upstream) == provider_requests
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_cancel_causality " <> CodexPooler.JSON.encode!(%{order: order, produced_terminal: "response.completed", original_producer_exited: true, provider_requests: provider_requests}) end)
+  end
+
+  defp assert_collection_order(:drain_controls, s) do
+    admission = :sys.get_state(s.owner).native_compaction_admission
+    :ok = WebsocketOwnerSession.begin_drain(s.owner)
+    assert %{draining?: true, native_compaction_admission: ^admission} = :sys.get_state(s.owner)
+    :ok = WebsocketOwnerSession.begin_drain(s.owner)
+    assert %{draining?: true, native_compaction_admission: ^admission} = :sys.get_state(s.owner)
+    assert {:error, :owner_unavailable} = GenServer.call(s.owner, {:admission_control_v1, %{action: :unknown_action}})
+
+    for control <- [
+          admission_control(:snapshot, s.downstream, []),
+          admission_control(:reserve, s.downstream, binding: s.binding, phase: :compact, control_ref: make_ref(), now_ms: System.system_time(:millisecond)),
+          admission_control(:reserve, s.downstream, binding: s.binding, phase: :final, control_ref: make_ref(), now_ms: System.system_time(:millisecond)),
+          admission_control(:mark_accounting_started, s.downstream, capability: s.capability, now_ms: System.system_time(:millisecond)),
+          admission_control(:record_ordinary_success, s.downstream, binding: s.binding, first_compact_collection: s.receipt, expires_at_ms: System.system_time(:millisecond) + 30_000)
+        ] do
+      assert {:error, :owner_drained} = WebsocketOwnerSession.admission_control(s.owner, control)
+      assert :sys.get_state(s.owner).native_compaction_admission == admission
+    end
+
+    assert {:error, :owner_drained} = WebsocketOwnerSession.submit_request(s.owner, s.downstream, s.request)
+    release_collection_result!(s)
+    assert {:ok, %{terminal: "response.completed"}} = Task.await(s.submitter, @detection_timeout_ms)
+    assert :sys.get_state(s.owner).native_compaction_admission.phase == :collected_unconfirmed
+  end
+
+  defp assert_collection_order(order, s) when order in [:revoked_before_result, :mismatched_before_result] do
+    if order == :revoked_before_result do
+      assert {:ok, nil} = WebsocketOwnerSession.admission_control(s.owner, admission_control(:clear, s.downstream, []))
+    else
+      :sys.replace_state(s.owner, fn current -> put_in(current.native_compaction_admission.binding.generation, s.binding.generation + 1) end)
+    end
+
+    release_collection_result!(s)
+    assert {:error, :native_compaction_capability_rejected} = Task.await(s.submitter, @detection_timeout_ms)
+    assert :sys.get_state(s.owner).native_compaction_admission == nil
+  end
+
+  defp assert_collection_order(order, s) when order in [:cancel_before_result, :cancel_first_before_result] do
+    :ok = :sys.suspend(s.owner)
+    # The cancellation request precedes release of the real result producer.
+    # Its normal DOWN proves its Task reply was sent while the owner remained
+    # suspended; sensitive mailbox payloads are never inspected.
+    cancellation_request = :gen_server.send_request(s.owner, s.cancellation)
+    # A system call still runs during suspension. From this same sender it
+    # fences arrival of the earlier cancellation before the producer is released.
+    assert :sys.get_state(s.owner).active_turn.task_pid == s.producer
+    release_collection_result!(s)
+    assert :sys.get_state(s.owner).active_turn.task_pid == s.producer
+    :ok = :sys.resume(s.owner)
+    assert {:reply, :ok} = :gen_server.wait_response(cancellation_request, @detection_timeout_ms)
+    assert {:error, :owner_drained} = Task.await(s.submitter, @detection_timeout_ms)
+    state = :sys.get_state(s.owner)
+    assert state.active_turn == nil
+    assert state.native_compaction_admission == nil
+    assert state.first_compact_result == nil
+    assert state.ordinary_success_result == nil
+  end
+
+  defp assert_collection_order(order, s) when order in [:result_before_cancel, :first_before_cancel] do
+    release_collection_result!(s)
+    assert {:ok, %{terminal: "response.completed"}} = Task.await(s.submitter, @detection_timeout_ms)
+    assert_retained_collection!(s)
+    assert {:error, :stale_downstream} = WebsocketOwnerSession.cancel_downstream(s.owner, s.bound, :owner_drained)
+    assert_retained_collection!(s)
+  end
+
+  defp assert_retained_collection!(%{first?: true, owner: owner}), do: assert(:sys.get_state(owner).first_compact_result != nil)
+  defp assert_retained_collection!(%{owner: owner}), do: assert(:sys.get_state(owner).native_compaction_admission.phase == :collected_unconfirmed)
+
+  defp release_collection_result!(%{producer: producer, producer_monitor: monitor, gate: gate}) do
+    send(producer, {:release_compact_result, gate})
+    assert_receive {:DOWN, ^monitor, :process, ^producer, :normal}, @detection_timeout_ms
+  end
+
   test "soft reconnect handoff timeout cannot restore admission cleared by detach", context do
     waiting =
       start_waiting_handoff(context, "admission-soft-timeout", seed_native_admission: true)

@@ -18,7 +18,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   import Plug.Conn, only: [put_req_header: 3]
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport
   import CodexPoolerWeb.Runtime.BackendCodexWebsocketSupport, only: [await_socket_connection_state!: 2, model_serving_scope: 0, set_model_serving_mode!: 3, with_info_log: 1]
-  import CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport, only: [enter_peer_owner_topology!: 0, start_shared_peer_window_owner!: 3]
+  import CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport, only: [enter_peer_owner_topology!: 0, start_shared_peer_window_owner!: 3, stop_retirable_owner!: 2]
 
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestClientRetryLink}
   alias CodexPooler.{ExecutionProofSupport, FakeUpstream, UnboxedFixture}
@@ -238,6 +238,74 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     CodexPooler.TestDiagnostics.puts(fn -> "206-330 #{mode} #{shape} #{topology} #{cut}: #{inspect(measured)}" end)
     assert :ok = FakeUpstream.verify!(upstream)
     measured
+  end
+
+  # The provider has accepted an incremental mid-turn compaction before the
+  # producing owner begins its drain. Release the terminal only after that
+  # exact owner reports draining; draining the proxy is a different scenario.
+  def run_drain_completion(topology, opts \\ []) do
+    put_owner_forwarding!(true)
+    release_ref = make_ref()
+    ctx = %{mode: "full", shape: :mid_turn, topology: topology}
+    sequence = Enum.take(upstream_sequence(ctx, :drain_completion, topology, release_ref), 2)
+    # provenance: synthetic_adversarial; released-client-shaped incremental compact with a held terminal
+    upstream = start_upstream(FakeUpstream.strict_sequence(sequence))
+
+    on_exit(fn ->
+      try do
+        FakeUpstream.release_remaining_frames(upstream, release_ref)
+      catch
+        :exit, {:noproc, _call} -> :ok
+      end
+    end)
+
+    setup = topology_setup!(topology, upstream, opts)
+    ctx = Map.put(ctx, :setup, setup)
+    port = start_public_endpoint!()
+    client = connect!(port, setup) |> ordinary_turn!(turn_frame(ctx))
+    await_armed!(topology, setup)
+    owner = owner_pid!(setup)
+    owner_monitor = Process.monitor(owner)
+    initial = :sys.get_state(owner)
+    expected_node = if topology == :peer, do: Keyword.fetch!(opts, :peer_node), else: node()
+    assert node(owner) == expected_node
+    assert node(initial.upstream_pid) == expected_node
+    assert Repo.get!(CodexSession, initial.codex_session_id).owner_instance_id == initial.owner_instance_id
+
+    client = send_frame!(client, anchored_compaction_frame(ctx))
+    await_barrier!(0, release_ref)
+
+    for barrier <- [1, 2] do
+      :ok = FakeUpstream.release_frame(upstream, release_ref)
+      await_barrier!(barrier, release_ref)
+    end
+
+    admitted = :sys.get_state(owner)
+    assert %{active_turn: %{admission_phase: :compact, collect?: true}, native_compaction_admission: %NativeCompactionAdmission{phase: :consumed_compact}} = admitted
+    request_id = admitted.active_turn.admission_request_id
+    attempt_id = admitted.active_turn.admission_attempt_id
+    assert Repo.get!(Attempt, attempt_id).request_id == request_id
+    assert :ok = WebsocketOwnerSession.begin_drain(owner)
+    assert %{draining?: true, active_turn: %{admission_request_id: ^request_id}} = :sys.get_state(owner)
+    :ok = FakeUpstream.release_remaining_frames(upstream, release_ref)
+    await_barrier!(3, release_ref)
+
+    {client, frames} = receive_until_terminal(client, [])
+    assert frames == ["response.output_item.done", "response.completed"]
+    await_compaction_settled!(setup.pool.id, ["succeeded"])
+    assert Repo.get!(Request, request_id).status == "succeeded"
+    assert Repo.get!(Attempt, attempt_id).status == "succeeded"
+    assert charges(Repo.get!(Request, request_id)) == 1
+    state = :sys.get_state(owner)
+    assert state.draining?
+    refute match?(%NativeCompactionAdmission{phase: :pending_final}, state.native_compaction_admission)
+    assert Enum.count(FakeUpstream.requests(upstream), &compaction_request?/1) == 1
+    assert :ok = FakeUpstream.verify!(upstream)
+    Mint.HTTP.close(client.conn)
+    stop_retirable_owner!(owner, :normal)
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, _reason}, @detection_timeout_ms
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_drain_causality " <> CodexPooler.JSON.encode!(%{topology: topology, serving_mode: "full", shape: "incremental_mid_turn", session_id: initial.codex_session_id, request_id: request_id, attempt_id: attempt_id, owner_node: Atom.to_string(node(owner)), upstream_node: Atom.to_string(node(initial.upstream_pid)), terminal_released_after_owner_draining: true, request_status: "succeeded", attempt_status: "succeeded", client_events: frames, charges: 1, original_owner_exited: true}) end)
+    :ok
   end
 
   # The peer shares the committed database, so its fixture is committed: the

@@ -5,6 +5,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketPreTurnCompactionCutTest d
 
   alias CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario, as: Scenario
 
+  @tag compaction_drain_completion: true
+  test "full incremental mid-turn compact completes after its local owner begins draining" do
+    log = ExUnit.CaptureLog.capture_log(fn -> assert Scenario.run_drain_completion(:forwarded) == :ok end)
+    assert log =~ "reason=owner_drained confirmation=not_applied"
+  end
+
   # A client cut during an admitted anchored native compaction (findings#206
   # row 206-310). The released client (Codex 0.156.1, observed on the wire in
   # Full and Lite) sends its pre-turn compaction anchored on the previous
