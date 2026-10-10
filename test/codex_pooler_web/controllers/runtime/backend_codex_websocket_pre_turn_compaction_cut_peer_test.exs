@@ -24,6 +24,39 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketPreTurnCompactionCutPeerTe
     %{peer_node: start_shared_bridge_peer!()}
   end
 
+  @tag compaction_drain_authority: true, real_generation: true
+  test "a real reconnected peer generation rejects an old issued capability while its compact drains", %{peer_node: peer_node} do
+    assert Scenario.run_drain_completion(:peer, peer_node: peer_node, reconnect_generation: true, hold_completion: true) == :ok
+  end
+
+  for shape <- [:pre_turn, :standalone_turn] do
+    @tag compaction_drain_completion: true, control_shape: shape
+    test "full #{shape} peer control completes after drain before provider output", %{control_shape: shape, peer_node: peer_node} do
+      assert Scenario.run_drain_completion(:peer, peer_node: peer_node, shape: shape, before_output: true, hold_completion: true) == :ok
+    end
+  end
+
+  for fault <- [:before_admission, :generation, :capability, :stale_lease, :upstream_closed, :key_revoked, :cancel_queued, :result_before_cancel] do
+    @tag compaction_drain_authority: true, compaction_drain_cancel: fault in [:cancel_queued, :result_before_cancel], fault: fault
+    test "real peer compact drain authority boundary #{fault}", %{fault: fault, peer_node: peer_node} do
+      assert Scenario.run_drain_authority(:peer, fault, peer_node: peer_node) == :ok
+    end
+  end
+
+  for order <- [:before_publication, :after_publication] do
+    @tag compaction_owned_cleanup: true, cleanup_order: order
+    test "exact compact proof cleanup preserves committed foreign proof and same-model fixture #{order}", %{peer_node: peer_node, cleanup_order: order} do
+      assert Scenario.run_scenario("full", :pre_turn, :peer, :drain_no_resend, :on_arrival, peer_node: peer_node, proof_cleanup_probe: order) == Scenario.expected(:drain_no_resend, :peer)
+    end
+  end
+
+  for {mode, form} <- [{"full", :first}, {"lite", :first}, {"lite", :incremental}] do
+    @tag compaction_drain_completion: true, mode: mode, form: form
+    test "#{mode} #{form} compact reaches the client while its actual peer owner drains", %{mode: mode, form: form, peer_node: peer_node} do
+      assert Scenario.run_drain_completion(:peer, peer_node: peer_node, mode: mode, form: form, hold_completion: true) == :ok
+    end
+  end
+
   @tag compaction_drain_completion: true
   test "full incremental mid-turn compact completes after its actual peer owner begins draining", %{peer_node: peer_node} do
     log = ExUnit.CaptureLog.capture_log(fn -> assert Scenario.run_drain_completion(:peer, peer_node: peer_node) == :ok end)

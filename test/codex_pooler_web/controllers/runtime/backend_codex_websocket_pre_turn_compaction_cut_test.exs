@@ -5,6 +5,32 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketPreTurnCompactionCutTest d
 
   alias CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario, as: Scenario
 
+  @tag compaction_drain_authority: true, real_generation: true
+  test "a real reconnected local generation rejects an old issued capability while its compact drains" do
+    assert Scenario.run_drain_completion(:forwarded, reconnect_generation: true, hold_completion: true) == :ok
+  end
+
+  for shape <- [:pre_turn, :standalone_turn] do
+    @tag compaction_drain_completion: true, control_shape: shape
+    test "full #{shape} control completes after drain before provider output", %{control_shape: shape} do
+      assert Scenario.run_drain_completion(:forwarded, shape: shape, before_output: true, hold_completion: true) == :ok
+    end
+  end
+
+  for fault <- [:before_admission, :generation, :capability, :stale_lease, :upstream_closed, :key_revoked, :cancel_queued, :result_before_cancel] do
+    @tag compaction_drain_authority: true, compaction_drain_cancel: fault in [:cancel_queued, :result_before_cancel], fault: fault
+    test "real local compact drain authority boundary #{fault}", %{fault: fault} do
+      assert Scenario.run_drain_authority(:forwarded, fault) == :ok
+    end
+  end
+
+  for {mode, form} <- [{"full", :first}, {"lite", :first}, {"lite", :incremental}] do
+    @tag compaction_drain_completion: true, mode: mode, form: form
+    test "#{mode} #{form} compact reaches the client while its local owner drains", %{mode: mode, form: form} do
+      assert Scenario.run_drain_completion(:forwarded, mode: mode, form: form, hold_completion: true) == :ok
+    end
+  end
+
   for mode <- [:sub100, :delayed_start, :delayed_result, :phase_transition] do
     @tag compaction_drain_deadline: true, owner_budget: mode
     test "actual owner receipt reader honors its activity budget for #{mode}", %{owner_budget: mode} do

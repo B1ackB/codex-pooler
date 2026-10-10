@@ -21,19 +21,21 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   import CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport, only: [enter_peer_owner_topology!: 0, start_shared_peer_window_owner!: 3, stop_retirable_owner!: 2]
 
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestClientRetryLink}
+  alias CodexPooler.Accounts.Scope
   alias CodexPooler.{ExecutionProofSupport, FakeUpstream, UnboxedFixture}
   alias CodexPooler.Gateway.Payloads.WebsocketTurnIdentity
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
   alias CodexPooler.Gateway.Runtime.Finalization.Interruption
   alias CodexPooler.Gateway.Transports.Streaming.DeferredStreamRegistry
   alias CodexPooler.Gateway.Transports.Websocket.{ActivityDrain, ActivityRegistry, NativeCompactionAdmission, WebsocketOwnerSession}
-  alias CodexPooler.Gateway.Transports.Websocket.RolloutDrain
+  alias CodexPooler.Gateway.Transports.Websocket.{RolloutDrain, UpstreamWebsocketSession, WebsocketOwnerAdmissionControlV1}
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Persistence, as: OwnerPersistence
   alias CodexPooler.Gateway.Websocket.DeliveryReceipt
-  alias CodexPooler.Platform.ExecutionTerminalProof
+  alias CodexPooler.Platform.{ExecutionRegistry, ExecutionTerminalProof, ExecutionTerminalProofs}
   alias CodexPooler.Repo
   alias CodexPoolerWeb.Runtime.BackendCodexWebsocketSupport
   alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
+  alias Ecto.Adapters.SQL.Sandbox
 
   require Logger
 
@@ -48,6 +50,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   @context_window_id "00000000-0000-4000-8000-00000000f004"
   @resumed_context_window_id "00000000-0000-4000-8000-00000000f005"
   @anchor "resp_preturn_cut_anchor00000001"
+  @reconnected_anchor "resp_preturn_cut_anchor00000002"
   @cut_response "resp_preturn_cut_compact_cut001"
   @resend_response "resp_preturn_cut_compact_resend"
   @final_response "resp_preturn_cut_final000000001"
@@ -210,12 +213,21 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   def run_scenario(mode, shape, topology, cut, dispatch \\ :on_arrival, opts \\ []) do
     put_owner_forwarding!(topology in [:forwarded, :peer])
     release_ref = make_ref()
-    ctx = %{mode: mode, shape: shape, topology: topology, before_drain: Keyword.get(opts, :before_drain), after_drain: Keyword.get(opts, :after_drain)}
+    ctx = %{mode: mode, shape: shape, topology: topology, before_drain: Keyword.get(opts, :before_drain), after_drain: Keyword.get(opts, :after_drain), proof_cleanup_probe: Keyword.get(opts, :proof_cleanup_probe)}
 
     upstream = start_upstream(FakeUpstream.strict_sequence(upstream_sequence(ctx, cut, topology, release_ref)))
+
+    foreign_fixture =
+      if ctx.proof_cleanup_probe do
+        enter_peer_owner_topology!()
+        fixture = gateway_setup(upstream, compact?: true)
+        register_unboxed_pool_cleanup!(fixture)
+        fixture
+      end
+
     setup = topology_setup!(topology, upstream, opts)
     if mode == "lite", do: set_model_serving_mode!(model_serving_scope(), setup, "lite")
-    ctx = Map.put(ctx, :setup, setup)
+    ctx = ctx |> Map.put(:setup, setup) |> Map.put(:upstream, upstream) |> Map.put(:foreign_fixture, foreign_fixture)
     port = start_public_endpoint!()
 
     settling = if dispatch == :queued, do: hold_turn_task_after_settlement!()
@@ -228,7 +240,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     # response: it is dispatched on its first send.
     first = send_frame!(first, anchored_compaction_frame(ctx))
     if dispatch == :queued, do: dispatch_queued_compaction!(ctx, settling)
-    retries = cut_and_resend(cut, ctx, first, port, upstream, release_ref)
+    {retries, proof_scope} = cut_and_resend(cut, ctx, first, port, upstream, release_ref) |> cut_result()
 
     rows = await_settled!(setup.pool.id)
     compactions = Enum.filter(rows, &compaction_row?/1)
@@ -243,8 +255,12 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
 
     CodexPooler.TestDiagnostics.puts(fn -> "206-330 #{mode} #{shape} #{topology} #{cut}: #{inspect(measured)}" end)
     assert :ok = FakeUpstream.verify!(upstream)
+    if proof_scope, do: assert_foreign_fixture_after_owned_cleanup!(ctx, proof_scope)
     measured
   end
+
+  defp cut_result({retries, %{owned_execution_ids: _} = proof_scope}), do: {retries, proof_scope}
+  defp cut_result(retries), do: {retries, nil}
 
   # The provider has accepted an incremental mid-turn compaction before the
   # producing owner begins its drain. Release the terminal only after that
@@ -252,8 +268,11 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   def run_drain_completion(topology, opts \\ []) do
     put_owner_forwarding!(true)
     release_ref = make_ref()
-    ctx = %{mode: "full", shape: :mid_turn, topology: topology}
-    sequence = Enum.take(upstream_sequence(ctx, :drain_completion, topology, release_ref), 2)
+    mode = Keyword.get(opts, :mode, "full")
+    form = Keyword.get(opts, :form, :incremental)
+    shape = Keyword.get(opts, :shape, completion_shape(mode, form))
+    ctx = %{mode: mode, shape: shape, topology: topology, reconnect_generation: Keyword.get(opts, :reconnect_generation, false)}
+    sequence = completion_sequence(ctx, form, release_ref)
     # provenance: synthetic_adversarial; released-client-shaped incremental compact with a held terminal
     upstream = start_upstream(FakeUpstream.strict_sequence(sequence))
 
@@ -266,18 +285,22 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     end)
 
     setup = topology_setup!(topology, upstream, opts)
+    if mode == "lite", do: set_model_serving_mode!(model_serving_scope(), setup, "lite")
     ctx = Map.put(ctx, :setup, setup)
     port = start_public_endpoint!()
     client = connect!(port, setup) |> ordinary_turn!(turn_frame(ctx))
     await_armed!(topology, setup)
+    {ctx, client, stale_control} = if ctx.reconnect_generation, do: reconnect_with_issued_capability!(ctx, client), else: {ctx, client, nil}
     delivery_gate = if Keyword.get(opts, :hold_completion, false), do: install_compact_completion_gate!(client.cleanup_socket, topology)
     owner = owner_pid!(setup)
+    observed_item = install_collection_item_observer!(owner)
     owner_monitor = Process.monitor(owner)
     initial = :sys.get_state(owner)
-    expected_node = if topology == :peer, do: Keyword.fetch!(opts, :peer_node), else: node()
+    expected_node = topology_node(topology, opts)
     assert node(owner) == expected_node
     assert node(initial.upstream_pid) == expected_node
     assert Repo.get!(CodexSession, initial.codex_session_id).owner_instance_id == initial.owner_instance_id
+    assert Repo.get!(CodexSession, initial.codex_session_id).owner_lease_token == initial.owner_lease_token
 
     if topology == :peer do
       assert {:ok, %{owner_instance_id: owner_instance}} = WebsocketOwnerSession.owner_status(owner)
@@ -287,20 +310,27 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
       CodexPooler.TestDiagnostics.puts(fn -> "owner_status_compatibility " <> CodexPooler.JSON.encode!(%{legacy_remote_atom: true, local_budget_api_refuses_remote_before_send: true, original_peer_owner_alive: true}) end)
     end
 
-    client = send_frame!(client, anchored_compaction_frame(ctx))
+    frame = completion_frame(ctx, form)
+    client = send_frame!(client, frame)
     await_barrier!(0, release_ref)
 
-    for barrier <- [1, 2] do
-      :ok = FakeUpstream.release_frame(upstream, release_ref)
-      await_barrier!(barrier, release_ref)
-    end
+    release_collection_prefix!(upstream, release_ref, Keyword.get(opts, :before_output, false))
 
     admitted = :sys.get_state(owner)
-    assert %{active_turn: %{admission_phase: :compact, collect?: true}, native_compaction_admission: %NativeCompactionAdmission{phase: :consumed_compact}} = admitted
+    assert %{active_turn: %{collect?: true}} = admitted
+
+    assert_completion_admission!(admitted, form)
+
     request_id = admitted.active_turn.admission_request_id
     attempt_id = admitted.active_turn.admission_attempt_id
     assert Repo.get!(Attempt, attempt_id).request_id == request_id
+    upstream_pid = initial.upstream_pid
+    assert_collection_observed!(Keyword.get(opts, :before_output, false), observed_item, upstream_pid, request_id, attempt_id)
+
+    assert_new_capability!(admitted, stale_control)
+
     assert :ok = WebsocketOwnerSession.begin_drain(owner)
+    if stale_control, do: assert({:error, :owner_drained} == WebsocketOwnerSession.admission_control(owner, stale_control))
     assert %{draining?: true, active_turn: %{admission_request_id: ^request_id}} = :sys.get_state(owner)
     :ok = FakeUpstream.release_remaining_frames(upstream, release_ref)
     await_barrier!(3, release_ref)
@@ -312,6 +342,9 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     await_compaction_settled!(setup.pool.id, ["succeeded"])
     assert Repo.get!(Request, request_id).status == "succeeded"
     assert Repo.get!(Attempt, attempt_id).status == "succeeded"
+    turn = Repo.one!(from(turn in CodexTurn, where: turn.request_id == ^request_id))
+    assert turn.status == "succeeded"
+    assert turn.final_attempt_id == attempt_id
     assert charges(Repo.get!(Request, request_id)) == 1
 
     if drain_task do
@@ -330,8 +363,352 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     Mint.HTTP.close(client.conn)
     stop_retirable_owner!(owner, :normal)
     assert_receive {:DOWN, ^owner_monitor, :process, ^owner, _reason}, @detection_timeout_ms
-    CodexPooler.TestDiagnostics.puts(fn -> "compaction_drain_causality " <> CodexPooler.JSON.encode!(%{topology: topology, serving_mode: "full", shape: "incremental_mid_turn", session_id: initial.codex_session_id, request_id: request_id, attempt_id: attempt_id, owner_node: Atom.to_string(node(owner)), upstream_node: Atom.to_string(node(initial.upstream_pid)), terminal_released_after_owner_draining: true, request_status: "succeeded", attempt_status: "succeeded", client_events: frames, charges: 1, original_owner_exited: true}) end)
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_drain_causality " <> CodexPooler.JSON.encode!(%{topology: topology, serving_mode: mode, form: form, shape: shape, before_output: Keyword.get(opts, :before_output, false), barrier_ref: inspect(release_ref), owner_pid: inspect(owner), upstream_pid: inspect(initial.upstream_pid), owner_lease_matches_persisted: true, downstream_epoch: admitted.active_turn.downstream.epoch, session_id: initial.codex_session_id, request_id: request_id, attempt_id: attempt_id, owner_node: Atom.to_string(node(owner)), upstream_node: Atom.to_string(node(initial.upstream_pid)), terminal_released_after_owner_draining: true, request_status: "succeeded", attempt_status: "succeeded", turn_status: turn.status, client_events: frames, charges: 1, original_owner_exited: true}) end)
     :ok
+  end
+
+  defp topology_node(:peer, opts), do: Keyword.fetch!(opts, :peer_node)
+  defp topology_node(_topology, _opts), do: node()
+
+  defp completion_shape("full", :incremental), do: :mid_turn
+  defp completion_shape(_mode, _form), do: :pre_turn
+  defp completion_frame(ctx, :first), do: full_history_compaction_frame(ctx)
+  defp completion_frame(ctx, :incremental), do: anchored_compaction_frame(ctx)
+  defp release_collection_prefix!(_upstream, _release_ref, true), do: :ok
+
+  defp release_collection_prefix!(upstream, release_ref, false) do
+    for barrier <- [1, 2] do
+      :ok = FakeUpstream.release_frame(upstream, release_ref)
+      await_barrier!(barrier, release_ref)
+    end
+  end
+
+  defp assert_completion_admission!(admitted, :first), do: assert(is_tuple(admitted.active_turn.first_compact_request_identity))
+  defp assert_completion_admission!(admitted, :incremental), do: assert(%{active_turn: %{admission_phase: :compact}, native_compaction_admission: %NativeCompactionAdmission{phase: :consumed_compact}} = admitted)
+  defp assert_new_capability!(_admitted, nil), do: :ok
+
+  defp assert_new_capability!(admitted, control) do
+    assert admitted.native_compaction_admission.binding.generation > control.capability.binding.generation
+    refute admitted.native_compaction_admission.capability == control.capability
+  end
+
+  defp assert_collection_observed!(true, _ref, _upstream, _request, _attempt), do: :ok
+
+  defp assert_collection_observed!(false, ref, upstream, request, attempt) do
+    assert_receive {^ref, :collected_item, ^upstream, ^request, ^attempt}, @detection_timeout_ms
+  end
+
+  defp completion_sequence(%{reconnect_generation: true} = ctx, :incremental, release_ref) do
+    [first | _] = upstream_sequence(ctx, :drain_completion, ctx.topology, release_ref)
+    second = FakeUpstream.expect_request(method: "WEBSOCKET", websocket_connection_ordinal: 2, json: [valid: true, forbidden: ["previous_response_id"]], respond: completed_frames(@reconnected_anchor, [function_call()]))
+    compact = FakeUpstream.expect_request(method: "WEBSOCKET", websocket_connection_ordinal: 2, json: [valid: true, equals: %{"previous_response_id" => @reconnected_anchor}], respond: FakeUpstream.barrier_websocket_frames(held_compaction_messages(), notify: self(), release_ref: release_ref))
+    [first, second, compact]
+  end
+
+  defp completion_sequence(ctx, :incremental, release_ref), do: Enum.take(upstream_sequence(ctx, :drain_completion, ctx.topology, release_ref), 2)
+
+  defp completion_sequence(ctx, :first, release_ref) do
+    [turn | _] = upstream_sequence(ctx, :drain_completion, ctx.topology, release_ref)
+    compact = FakeUpstream.expect_request(method: "WEBSOCKET", websocket_connection_ordinal: 1, json: [valid: true, equals: lite_marker_expectation(%{"type" => "response.create"}, ctx.mode), forbidden: ["previous_response_id"]], respond: FakeUpstream.barrier_websocket_frames(held_compaction_messages(), notify: self(), release_ref: release_ref))
+    [turn, compact]
+  end
+
+  defp reconnect_with_issued_capability!(ctx, client) do
+    owner = owner_pid!(ctx.setup)
+    initial = :sys.get_state(owner)
+    bound = initial.downstream
+    binding = initial.native_compaction_admission.binding
+    control_ref = make_ref()
+    reserve = owner_control!(:reserve, bound, binding: binding, phase: :compact, control_ref: control_ref, now_ms: System.system_time(:millisecond))
+    assert {:ok, capability} = WebsocketOwnerSession.admission_control(owner, reserve)
+    cancel = owner_control!(:cancel, bound, capability: capability, disposition: :pre_accounting, now_ms: System.system_time(:millisecond))
+    assert {:ok, %NativeCompactionAdmission{phase: :pending_compact}} = WebsocketOwnerSession.admission_control(owner, cancel)
+    assert :ok == UpstreamWebsocketSession.invalidate_connection(initial.upstream_pid)
+    payload = ctx |> frame([prompt("first"), function_call(), function_call_output()], @turn_id, @window_id) |> put_in(["client_metadata", "x-codex-turn-metadata"], turn_metadata(%{"request_kind" => "turn"})) |> CodexPooler.JSON.encode!()
+    client = ordinary_turn!(client, payload)
+
+    await!(
+      fn ->
+        match?(%{native_compaction_admission: %NativeCompactionAdmission{phase: :pending_compact, binding: %{generation: generation}}} when generation > binding.generation, :sys.get_state(owner))
+      end,
+      "the real reconnected upstream never armed a newer generation"
+    )
+
+    current = :sys.get_state(owner)
+    assert current.upstream_pid == initial.upstream_pid
+    assert current.native_compaction_admission.binding.lifecycle_id == binding.lifecycle_id
+    assert current.native_compaction_admission.binding.generation > binding.generation
+    assert {:error, :binding_mismatch} == WebsocketOwnerSession.admission_control(owner, reserve)
+    assert :sys.get_state(owner).native_compaction_admission == current.native_compaction_admission
+    fresh = owner_control!(:reserve, bound, binding: current.native_compaction_admission.binding, phase: :compact, control_ref: make_ref(), now_ms: System.system_time(:millisecond))
+    assert {:ok, fresh_capability} = WebsocketOwnerSession.admission_control(owner, fresh)
+    assert {:error, :capability_mismatch} == WebsocketOwnerSession.admission_control(owner, cancel)
+    assert :sys.get_state(owner).native_compaction_admission.capability == fresh_capability
+    fresh_cancel = owner_control!(:cancel, bound, capability: fresh_capability, disposition: :pre_accounting, now_ms: System.system_time(:millisecond))
+    assert {:ok, %NativeCompactionAdmission{phase: :pending_compact}} = WebsocketOwnerSession.admission_control(owner, fresh_cancel)
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_generation_causality " <> CodexPooler.JSON.encode!(%{topology: ctx.topology, session_id: initial.codex_session_id, old_generation: binding.generation, new_generation: current.native_compaction_admission.binding.generation, old_capability_issued_and_cancelled: true, stale_binding_refused_before_drain: true, stale_capability_refused_before_drain: true, fresh_capability_cancel_succeeded: true, real_connection_reopened: true, owner_node: Atom.to_string(node(owner))}) end)
+    {Map.put(ctx, :anchor, @reconnected_anchor), client, cancel}
+  end
+
+  defp owner_control!(action, bound, attrs) do
+    control = struct(WebsocketOwnerAdmissionControlV1, [version: 1, action: action, downstream: Map.take(bound, [:pid, :epoch, :correlation_id])] ++ attrs)
+    assert {:ok, ^control} = WebsocketOwnerAdmissionControlV1.new(Map.from_struct(control))
+    control
+  end
+
+  def run_drain_authority(topology, fault, opts \\ []) do
+    put_owner_forwarding!(true)
+    release_ref = make_ref()
+    ctx = %{mode: "full", shape: :mid_turn, topology: topology}
+    sequence = completion_sequence(ctx, :incremental, release_ref)
+    sequence = if fault == :before_admission, do: Enum.take(sequence, 1), else: sequence
+    upstream = start_upstream(FakeUpstream.strict_sequence(sequence))
+
+    on_exit(fn ->
+      try do
+        FakeUpstream.release_remaining_frames(upstream, release_ref)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    setup = topology_setup!(topology, upstream, opts)
+    ctx = Map.put(ctx, :setup, setup)
+    port = start_public_endpoint!()
+    client = connect!(port, setup) |> ordinary_turn!(turn_frame(ctx))
+    await_armed!(topology, setup)
+    owner = owner_pid!(setup)
+    observed_item = install_collection_item_observer!(owner)
+    owner_monitor = Process.monitor(owner)
+    initial = :sys.get_state(owner)
+    expected_node = topology_node(topology, opts)
+    assert node(owner) == expected_node
+    assert node(initial.upstream_pid) == expected_node
+    persisted = Repo.get!(CodexSession, initial.codex_session_id)
+    assert persisted.owner_lease_token == initial.owner_lease_token
+    assert persisted.owner_instance_id == initial.owner_instance_id
+
+    if fault == :before_admission, do: assert(:ok == WebsocketOwnerSession.begin_drain(owner))
+    result_gate = if fault in [:cancel_queued, :result_before_cancel], do: install_real_collection_result_gate!(owner)
+    client = send_frame!(client, anchored_compaction_frame(ctx))
+
+    if fault == :before_admission do
+      {client, terminal} = receive_frame!(client)
+      assert terminal["type"] == "error"
+      assert terminal["error"]["code"] == "owner_unavailable"
+      refute Enum.any?(pool_requests(setup.pool.id), &compaction_row?/1)
+      assert FakeUpstream.count(upstream) == 1
+      Mint.HTTP.close(client.conn)
+      stop_retirable_owner!(owner, :normal)
+      assert_receive {:DOWN, ^owner_monitor, :process, ^owner, _}, @detection_timeout_ms
+      assert :ok == FakeUpstream.verify!(upstream)
+      CodexPooler.TestDiagnostics.puts(fn -> "compaction_authority_causality " <> CodexPooler.JSON.encode!(%{fault: fault, topology: topology, owner_node: Atom.to_string(node(owner)), new_dispatches: 0, new_attempts: 0, client_terminal: "owner_drained"}) end)
+    else
+      run_admitted_authority!(fault, %{ctx: ctx, client: client, owner: owner, owner_monitor: owner_monitor, initial: initial, upstream: upstream, release_ref: release_ref, result_gate: result_gate, observed_item: observed_item})
+    end
+
+    :ok
+  end
+
+  defp run_admitted_authority!(fault, %{ctx: ctx, client: client, owner: owner, owner_monitor: owner_monitor, initial: initial, upstream: upstream, release_ref: release_ref, result_gate: result_gate, observed_item: observed_item}) do
+    provider_handler = await_barrier!(0, release_ref)
+
+    for barrier <- [1, 2] do
+      :ok = FakeUpstream.release_frame(upstream, release_ref)
+      await_barrier!(barrier, release_ref)
+    end
+
+    admitted = :sys.get_state(owner)
+    assert %{active_turn: %{admission_phase: :compact, collect?: true}, native_compaction_admission: %NativeCompactionAdmission{phase: :consumed_compact}} = admitted
+    request_id = admitted.active_turn.admission_request_id
+    attempt_id = admitted.active_turn.admission_attempt_id
+    attempt = Repo.get!(Attempt, attempt_id)
+    assert attempt.request_id == request_id
+    upstream_pid = initial.upstream_pid
+    assert_receive {^observed_item, :collected_item, ^upstream_pid, ^request_id, ^attempt_id}, @detection_timeout_ms
+    scenario = %{ctx: ctx, client: client, owner: owner, initial: initial, admitted: admitted, upstream: upstream, provider_handler: provider_handler, release_ref: release_ref, request_id: request_id, attempt_id: attempt_id, result_gate: result_gate}
+    apply_collection_fault!(fault, scenario)
+
+    unless fault in [:upstream_closed, :stale_lease] do
+      :ok = FakeUpstream.release_remaining_frames(upstream, release_ref)
+      await_barrier!(3, release_ref)
+    end
+
+    if result_gate, do: resolve_collection_result_order!(fault, scenario)
+    finish_collection_fault!(fault, scenario)
+    if fault == :stale_lease, do: release_held_compaction!(upstream, release_ref, 3)
+    stop_retirable_owner!(owner, :normal)
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, _}, @detection_timeout_ms
+    assert :ok == FakeUpstream.verify!(upstream)
+  end
+
+  defp apply_collection_fault!(:generation, s) do
+    :sys.replace_state(s.owner, fn state -> put_in(state.native_compaction_admission.binding.generation, state.native_compaction_admission.binding.generation + 1) end)
+    assert :ok == WebsocketOwnerSession.begin_drain(s.owner)
+  end
+
+  defp apply_collection_fault!(:capability, s) do
+    bound = s.admitted.active_turn.downstream
+    control = struct(WebsocketOwnerAdmissionControlV1, version: 1, action: :clear, downstream: Map.take(bound, [:pid, :epoch, :correlation_id]))
+    assert {:ok, ^control} = WebsocketOwnerAdmissionControlV1.new(Map.from_struct(control))
+    assert {:ok, nil} = WebsocketOwnerSession.admission_control(s.owner, control)
+    assert :ok == WebsocketOwnerSession.begin_drain(s.owner)
+  end
+
+  defp apply_collection_fault!(:stale_lease, s) do
+    Repo.update_all(from(session in CodexSession, where: session.id == ^s.initial.codex_session_id), set: [owner_lease_token: Ecto.UUID.generate()])
+    send(s.owner, :renew_owner_lease)
+  end
+
+  defp apply_collection_fault!(:upstream_closed, s) do
+    assert :ok == WebsocketOwnerSession.begin_drain(s.owner)
+    monitor = Process.monitor(s.provider_handler)
+    Process.exit(s.provider_handler, :kill)
+    assert_receive {:DOWN, ^monitor, :process, _, :killed}, @detection_timeout_ms
+    assert :ok == FakeUpstream.release_remaining_frames(s.upstream, s.release_ref)
+    assert :ok == FakeUpstream.retire_frame_barriers(s.upstream, s.release_ref, s.provider_handler)
+  end
+
+  defp apply_collection_fault!(:key_revoked, s) do
+    scope = s.ctx.setup.api_key.created_by_user_id |> then(&Repo.get!(CodexPooler.Accounts.User, &1)) |> Scope.for_user(["instance_owner"])
+    assert {:ok, paused_key} = CodexPooler.Access.pause_api_key(scope, s.ctx.setup.api_key.id)
+    assert paused_key.runtime_revocation_epoch > s.ctx.setup.api_key.runtime_revocation_epoch
+    await_socket_connection_state!(s.client.cleanup_socket, fn state -> Map.get(state, :api_key_revoked?, false) end)
+    assert :ok == WebsocketOwnerSession.begin_drain(s.owner)
+    _client = send_frame!(s.client, resume_frame(s.ctx, "cut"))
+  end
+
+  defp apply_collection_fault!(fault, s) when fault in [:cancel_queued, :result_before_cancel], do: assert(:ok == WebsocketOwnerSession.begin_drain(s.owner))
+
+  defp install_real_collection_result_gate!(owner) do
+    ref = make_ref()
+    parent = self()
+
+    :sys.replace_state(owner, fn state ->
+      real = state.callbacks.upstream_sender
+
+      sender = fn upstream, request, writer ->
+        result = real.(upstream, request, writer)
+        send(parent, {ref, :real_result, self(), match?({:ok, %{terminal: "response.completed"}}, result)})
+
+        receive do
+          {^ref, :release} -> result
+        after
+          @detection_timeout_ms -> result
+        end
+      end
+
+      put_in(state.callbacks.upstream_sender, sender)
+    end)
+
+    on_exit(fn ->
+      try do
+        case :sys.get_state(owner).active_turn do
+          %{task_pid: producer} -> send(producer, {ref, :release})
+          _ -> :ok
+        end
+
+        :sys.resume(owner)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    ref
+  end
+
+  defp install_collection_item_observer!(owner) do
+    ref = make_ref()
+    parent = self()
+
+    :sys.replace_state(owner, fn state ->
+      real = state.callbacks.upstream_sender
+
+      sender = fn upstream, request, writer ->
+        observer = collection_item_observer(parent, ref, upstream, request)
+        real.(upstream, %{request | frame_observer: observer}, writer)
+      end
+
+      put_in(state.callbacks.upstream_sender, sender)
+    end)
+
+    ref
+  end
+
+  defp collection_item_observer(parent, ref, upstream, request) do
+    fn text, decoded ->
+      call_original_observer(request.frame_observer, text, decoded)
+      if decoded["type"] == "response.output_item.done", do: send(parent, {ref, :collected_item, upstream, request.request_id, request.attempt_id})
+      :ok
+    end
+  end
+
+  defp call_original_observer(observer, text, decoded) when is_function(observer, 2), do: observer.(text, decoded)
+  defp call_original_observer(observer, text, _decoded) when is_function(observer, 1), do: observer.(text)
+  defp call_original_observer(_observer, _text, _decoded), do: :ok
+
+  defp resolve_collection_result_order!(fault, s) do
+    ref = s.result_gate
+    assert_receive {^ref, :real_result, producer, true}, @detection_timeout_ms
+    producer_monitor = Process.monitor(producer)
+    bound = s.admitted.active_turn.downstream
+
+    if fault == :cancel_queued do
+      :ok = :sys.suspend(s.owner)
+      cancellation = {:cancel_downstream, bound.pid, bound.epoch, bound.correlation_id, bound.owner_turn_id, :owner_drained}
+      request = :gen_server.send_request(s.owner, cancellation)
+      assert :sys.get_state(s.owner).active_turn.task_pid == producer
+      send(producer, {ref, :release})
+      assert_receive {:DOWN, ^producer_monitor, :process, ^producer, :normal}, @detection_timeout_ms
+      :ok = :sys.resume(s.owner)
+      assert {:reply, :ok} = :gen_server.wait_response(request, @detection_timeout_ms)
+    else
+      send(producer, {ref, :release})
+      assert_receive {:DOWN, ^producer_monitor, :process, ^producer, :normal}, @detection_timeout_ms
+      await!(fn -> :sys.get_state(s.owner).active_turn == nil end, "real collection result was not consumed")
+      assert {:error, :stale_downstream} == WebsocketOwnerSession.cancel_downstream(s.owner, bound, :owner_drained)
+    end
+  end
+
+  defp finish_collection_fault!(fault, s) do
+    if fault == :key_revoked do
+      {_conn, _websocket, wire_frames} = BackendCodexWebsocketSupport.receive_frames_until_close!(s.client.conn, s.client.websocket, s.client.ref)
+      events = for {:text, text} <- wire_frames, do: CodexPooler.JSON.decode!(text)["type"]
+      assert events == ["response.output_item.done", "response.completed"]
+    else
+      {client, events} = receive_until_terminal(s.client, [])
+      if fault == :result_before_cancel, do: assert(events == ["response.output_item.done", "response.completed"]), else: assert(events == ["error"])
+      Mint.HTTP.close(client.conn)
+    end
+
+    expected = if fault in [:key_revoked, :result_before_cancel], do: "succeeded", else: "failed"
+    await_compaction_settled!(s.ctx.setup.pool.id, [expected])
+    request = Repo.get!(Request, s.request_id)
+    attempt = Repo.get!(Attempt, s.attempt_id)
+    assert request.status == expected
+    assert attempt.status == expected
+    turn = Repo.one!(from(turn in CodexTurn, where: turn.request_id == ^request.id))
+    assert turn.final_attempt_id == attempt.id
+    refute turn.status == "in_progress"
+    await!(fn -> is_map(Repo.get!(Attempt, s.attempt_id).response_metadata["downstream_delivery"]) end, "the exact authority-fenced attempt has no delivery receipt")
+    receipt = Repo.get!(Attempt, s.attempt_id).response_metadata["downstream_delivery"]
+    assert receipt["outcome"] == "delivered"
+    assert receipt["terminal_class"] == if(expected == "succeeded", do: "response.completed", else: "error")
+    ledger = Repo.all(from(entry in LedgerEntry, where: entry.request_id == ^request.id, select: entry.entry_kind))
+    assert Enum.count(ledger, &(&1 == "reservation")) == 1
+    assert Enum.count(ledger, &(&1 == "release")) == 1
+    assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 1
+    assert Enum.count(pool_requests(s.ctx.setup.pool.id), &compaction_row?/1) == 1
+    assert length(pool_requests(s.ctx.setup.pool.id)) == 2
+    assert Enum.count(FakeUpstream.requests(s.upstream), &compaction_request?/1) == 1
+    assert charges(request) <= 1
+
+    if fault in [:generation, :capability] do
+      assert is_map(:sys.get_state(s.owner))
+      assert :sys.get_state(s.owner).native_compaction_admission == nil
+    end
+
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_authority_causality " <> CodexPooler.JSON.encode!(%{fault: fault, topology: s.ctx.topology, owner_node: Atom.to_string(node(s.owner)), upstream_node: Atom.to_string(node(s.initial.upstream_pid)), request_id: request.id, attempt_id: attempt.id, execution_id: attempt.owner_execution_id, request_status: request.status, attempt_status: attempt.status, turn_status: turn.status, receipt: receipt, reservation_count: 1, release_count: 1, error_code: request.last_error_code, charges: charges(request), provider_compactions: 1, attempts: 1}) end)
   end
 
   defp install_compact_completion_gate!(socket, topology) do
@@ -824,13 +1201,14 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
       end
     end
 
-    publisher = if ctx.topology == :peer, do: start_proof_publisher!()
+    publisher = if ctx.topology == :peer, do: prepare_cut_execution_proof!(ctx)
     drains = drain_socket_node!(ctx, client)
     {client, frame} = receive_frame!(client)
     assert %{"type" => "error", "status" => 503, "error" => %{"code" => "owner_drained"}} = frame
     # The released client drops the connection its compaction failed on.
     Mint.HTTP.close(client.conn)
     Enum.each(drains, &Task.await(&1, @detection_timeout_ms))
+    assert_proxy_drain_separation!(ctx, client.cleanup_socket, :after_proxy_drain)
     if is_function(ctx.after_drain, 0), do: ctx.after_drain.()
     if publisher, do: await_cut_execution_proof!(ctx, publisher)
     retries = released_client_retries!(ctx, port, fn -> :ok end)
@@ -852,20 +1230,29 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
 
   defp cut_and_resend(:drain_no_resend, ctx, client, _port, upstream, release_ref) do
     await_barrier!(0, release_ref)
-    publisher = start_proof_publisher!()
+    publisher = prepare_cut_execution_proof!(ctx)
     drains = drain_socket_node!(ctx, client)
     {client, frame} = receive_frame!(client)
     assert %{"type" => "error", "status" => 503, "error" => %{"code" => "owner_drained"}} = frame
     Mint.HTTP.close(client.conn)
     Enum.each(drains, &Task.await(&1, @detection_timeout_ms))
-    attempt = await_cut_execution_proof!(ctx, publisher)
+    assert_proxy_drain_separation!(ctx, client.cleanup_socket, :after_proxy_drain)
+    publisher = await_cut_execution_proof!(ctx, publisher)
+    attempt = publisher.attempt
 
     {:ok, _summary} = CodexPooler.Accounting.recover_dead_execution_attempts(DateTime.add(attempt.started_at, 119, :second))
     before_eligible = cut_request_state(attempt.request_id)
     {:ok, _summary} = CodexPooler.Accounting.recover_dead_execution_attempts(DateTime.add(attempt.started_at, 121, :second))
     eligible = cut_request_state(attempt.request_id)
     release_held_compaction!(upstream, release_ref, 1)
-    %{before_eligible: before_eligible, eligible: eligible}
+    result = %{before_eligible: before_eligible, eligible: eligible}
+
+    if ctx.proof_cleanup_probe do
+      assert_owned_proof_cleanup!(publisher)
+      {result, publisher}
+    else
+      result
+    end
   end
 
   defp cut_and_resend(:unobserved_cut, ctx, client, port, upstream, release_ref) do
@@ -953,6 +1340,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     [task] = MapSet.to_list(state.tasks)
     entry = Enum.find(ActivityRegistry.activities(), &(&1.pid == task))
     refute Map.get(entry, :terminal_delivered?, false), "the compaction's terminal went out before the drain"
+    assert_proxy_drain_separation!(ctx, client.cleanup_socket, :before_proxy_drain)
     if is_function(ctx.before_drain, 2), do: ctx.before_drain.(state, entry)
     policy = %{now_ms: fn -> System.monotonic_time(:millisecond) end, schedule_wait: &schedule_drain_wait/3, cancel_wait: &cancel_drain_wait/2, owner_post_deadline_call_budget_ms: 5_000}
     task_drain = Task.async(fn -> ActivityDrain.drain(entry, System.monotonic_time(:millisecond) - 1, policy, ActivityRegistry) end)
@@ -965,6 +1353,18 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     end
   end
 
+  defp assert_proxy_drain_separation!(%{topology: :peer} = ctx, socket, phase) do
+    owner = owner_pid!(ctx.setup)
+    state = :sys.get_state(owner)
+    refute state.draining?
+    assert node(owner) == node(state.upstream_pid)
+    refute node(owner) == node(socket)
+    assert Repo.get!(CodexSession, state.codex_session_id).owner_instance_id == state.owner_instance_id
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_proxy_drain " <> CodexPooler.JSON.encode!(%{phase: phase, session_id: state.codex_session_id, owner_node: Atom.to_string(node(owner)), upstream_node: Atom.to_string(node(state.upstream_pid)), proxy_node: Atom.to_string(node(socket)), owner_draining: false, owner_pid: inspect(owner), socket_pid: inspect(socket)}) end)
+  end
+
+  defp assert_proxy_drain_separation!(_ctx, _socket, _phase), do: :ok
+
   defp schedule_drain_wait(recipient, token, wait_ms), do: Process.send_after(recipient, {:rollout_drain_wait_elapsed, token}, wait_ms)
 
   defp cancel_drain_wait(timer, _token) do
@@ -972,23 +1372,96 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     :ok
   end
 
-  # The production publisher, which `config/test.exs` disables, proves the end
-  # of an execution about 100 ms after its process exits, before the released
-  # client's first retry about 200 ms after the failure. The peer shares the
-  # committed database, so the proofs it writes are removed at exit.
-  defp start_proof_publisher! do
-    proofs_before = Repo.all(from(proof in ExecutionTerminalProof, select: proof.execution_id))
-    UnboxedFixture.register_unboxed_cleanup!(fn -> Repo.delete_all(from(proof in ExecutionTerminalProof, where: proof.execution_id not in ^proofs_before)) end)
-    CodexPooler.ExecutionProofSupport.start_publisher!(name: :compaction_drain_cut_proof_publisher, interval_ms: 60_000)
+  # Publish only this scenario's exact executor proof before a resend. Starting
+  # the global publisher here also commits unrelated retained executions from
+  # earlier tests. Capture ownership before the cut, and use the real registry
+  # and proof writer after the executor ends; never delete a snapshot complement.
+  defp prepare_cut_execution_proof!(ctx) do
+    [cut] = Enum.filter(pool_requests(ctx.setup.pool.id), &compaction_row?/1)
+    attempt = Repo.one!(from(attempt in Attempt, where: attempt.request_id == ^cut.id))
+    owned_execution_ids = Repo.all(from(attempt in Attempt, join: request in Request, on: request.id == attempt.request_id, where: request.pool_id == ^ctx.setup.pool.id, select: attempt.owner_execution_id))
+    assert attempt.owner_execution_id in owned_execution_ids
+    cleanup = fn -> Repo.delete_all(from(proof in ExecutionTerminalProof, where: proof.execution_id in ^owned_execution_ids)) end
+    UnboxedFixture.register_unboxed_cleanup!(cleanup)
+    foreign = if ctx.proof_cleanup_probe == :before_publication, do: committed_foreign_proof!(ctx)
+    %{attempt: attempt, cleanup: cleanup, owned_execution_ids: owned_execution_ids, foreign: foreign}
   end
 
-  defp await_cut_execution_proof!(ctx, publisher) do
-    [cut] = Enum.filter(pool_requests(ctx.setup.pool.id), &(&1.endpoint == @compact_endpoint))
-    attempt = Repo.one!(from(attempt in Attempt, where: attempt.request_id == ^cut.id, order_by: [desc: attempt.attempt_number], limit: 1))
-    :ok = ExecutionProofSupport.await_terminal!(attempt, publisher)
+  defp await_cut_execution_proof!(ctx, %{attempt: attempt} = proof_scope) do
+    :ok = ExecutionProofSupport.publish_terminal!(attempt)
+    foreign = if ctx.proof_cleanup_probe == :after_publication, do: committed_foreign_proof!(ctx), else: proof_scope.foreign
     # The socket node flushes this proof before exiting; the child-VM test in
     # execution_proof_shutdown_test.exs covers that shutdown boundary.
-    attempt
+    %{proof_scope | foreign: foreign}
+  end
+
+  defp committed_foreign_proof!(ctx) do
+    foreign_id = Ecto.UUID.generate()
+    UnboxedFixture.register_unboxed_cleanup!(fn -> Repo.delete_all(from(proof in ExecutionTerminalProof, where: proof.execution_id == ^foreign_id)) end)
+    fixture = ctx.foreign_fixture
+    assert fixture.model.exposed_model_id == ctx.setup.model.exposed_model_id
+    refute fixture.pool.id == ctx.setup.pool.id
+    parent = self()
+    ref = make_ref()
+
+    inserter = Task.async(fn -> Sandbox.unboxed_run(Repo, fn -> insert_foreign_proof!(parent, ref, foreign_id) end) end)
+
+    monitor = Process.monitor(inserter.pid)
+    on_exit(fn -> send(inserter.pid, {ref, :insert}) end)
+    assert_receive {^ref, :checked_out, foreign_backend}, @detection_timeout_ms
+    [[observer_backend]] = Repo.query!("SELECT pg_backend_pid()").rows
+    refute observer_backend == foreign_backend
+    send(inserter.pid, {ref, :insert})
+    assert Task.await(inserter, @detection_timeout_ms) == foreign_backend
+    assert_receive {:DOWN, ^monitor, :process, _, :normal}, @detection_timeout_ms
+    assert Repo.get!(ExecutionTerminalProof, foreign_id).execution_id == foreign_id
+    %{id: foreign_id, fixture: fixture, foreign_backend: foreign_backend, observer_backend: observer_backend}
+  end
+
+  defp insert_foreign_proof!(parent, ref, foreign_id) do
+    Repo.checkout(fn ->
+      [[backend]] = Repo.query!("SELECT pg_backend_pid()").rows
+      send(parent, {ref, :checked_out, backend})
+
+      receive do
+        {^ref, :insert} -> :ok
+      after
+        @detection_timeout_ms -> flunk("foreign proof insertion barrier was not released")
+      end
+
+      assert :ok == ExecutionRegistry.register(foreign_id)
+      assert :ok == ExecutionRegistry.complete(foreign_id)
+      [proof] = ExecutionRegistry.pending_proofs([foreign_id])
+      assert {:ok, 1} == ExecutionTerminalProofs.publish([proof])
+      assert :ok == ExecutionRegistry.acknowledge([foreign_id])
+      backend
+    end)
+  end
+
+  defp assert_owned_proof_cleanup!(publisher) do
+    assert Repo.get!(ExecutionTerminalProof, publisher.attempt.owner_execution_id)
+    publisher.cleanup.()
+    refute Repo.exists?(from(proof in ExecutionTerminalProof, where: proof.execution_id in ^publisher.owned_execution_ids))
+    assert Repo.get!(ExecutionTerminalProof, publisher.foreign.id)
+    assert Repo.get!(CodexPooler.Pools.Pool, publisher.foreign.fixture.pool.id)
+    assert Repo.get!(publisher.foreign.fixture.model.__struct__, publisher.foreign.fixture.model.id)
+    assert Repo.get!(publisher.foreign.fixture.pricing.__struct__, publisher.foreign.fixture.pricing.id)
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_owned_cleanup " <> CodexPooler.JSON.encode!(%{owned_execution_ids: publisher.owned_execution_ids, exact_attempt_id: publisher.attempt.id, foreign_execution_id: publisher.foreign.id, foreign_backend: publisher.foreign.foreign_backend, observer_backend: publisher.foreign.observer_backend, owned_proofs_absent: true, foreign_proof_preserved: true, same_model_fixture_preserved: true}) end)
+  end
+
+  defp assert_foreign_fixture_after_owned_cleanup!(ctx, proof_scope) do
+    owner = owner_pid!(ctx.setup)
+    monitor = Process.monitor(owner)
+    stop_retirable_owner!(owner, :normal)
+    assert_receive {:DOWN, ^monitor, :process, ^owner, _}, @detection_timeout_ms
+    :ok = WebsocketCleanupFence.await_session_cleanups!()
+    cleanup_unboxed_pool!(ctx.setup)
+    refute Repo.get(CodexPooler.Pools.Pool, ctx.setup.pool.id)
+    assert Repo.get!(CodexPooler.Pools.Pool, proof_scope.foreign.fixture.pool.id)
+    assert Repo.get!(proof_scope.foreign.fixture.model.__struct__, proof_scope.foreign.fixture.model.id)
+    assert Repo.get!(proof_scope.foreign.fixture.pricing.__struct__, proof_scope.foreign.fixture.pricing.id)
+    assert Repo.get!(ExecutionTerminalProof, proof_scope.foreign.id)
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_fixture_cleanup " <> CodexPooler.JSON.encode!(%{removed_pool_id: ctx.setup.pool.id, preserved_pool_id: proof_scope.foreign.fixture.pool.id, preserved_model_id: proof_scope.foreign.fixture.model.id, preserved_pricing_id: proof_scope.foreign.fixture.pricing.id, preserved_execution_id: proof_scope.foreign.id, original_owner_exited: true}) end)
   end
 
   defp cut_request_state(request_id) do
@@ -1258,7 +1731,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
 
   defp await_barrier!(barrier, release_ref) do
     receive do
-      {:fake_upstream_frame_barrier, ^barrier, _handler, ^release_ref} -> :ok
+      {:fake_upstream_frame_barrier, ^barrier, handler, ^release_ref} -> handler
     after
       @detection_timeout_ms -> flunk("the upstream never reached frame barrier #{barrier}")
     end
@@ -1597,7 +2070,6 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
 
   defp put_owner_forwarding!(enabled?) do
     previous = Application.fetch_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, enabled?)
 
     on_exit(fn ->
       case previous do
@@ -1605,6 +2077,8 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
         {:ok, value} -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
       end
     end)
+
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, enabled?)
   end
 
   defp compaction_item(label), do: %{"type" => "compaction", "encrypted_content" => "synthetic-preturn-cut-#{label}"}
@@ -1657,7 +2131,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   defp anchored_compaction_frame(ctx) do
     ctx
     |> frame(compaction_delta(ctx.shape), compaction_turn(ctx.shape), @window_id)
-    |> Map.put("previous_response_id", @anchor)
+    |> Map.put("previous_response_id", Map.get(ctx, :anchor, @anchor))
     |> put_in(["client_metadata", "x-codex-turn-metadata"], compaction_metadata(ctx.shape))
     |> CodexPooler.JSON.encode!()
   end
