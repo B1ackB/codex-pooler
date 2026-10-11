@@ -943,38 +943,44 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
     payload = payload(setup)
     request_options = request_options(auth, payload, setup)
 
-    capture_stream_outcome_telemetry(fn ->
-      assert {:ok, reserved} =
-               Accounting.reserve(auth, setup.model, payload, %{
-                 endpoint: @endpoint_path,
-                 transport: "http_sse",
-                 correlation_id: "stream-outcome-interrupted-#{System.unique_integer([:positive])}",
-                 request_metadata: %{}
-               })
+    for reason <- [:closed, :econnreset, :enotconn, :epipe, :einval] do
+      capture_stream_outcome_telemetry(fn ->
+        assert {:ok, reserved} =
+                 Accounting.reserve(auth, setup.model, payload, %{
+                   endpoint: @endpoint_path,
+                   transport: "http_sse",
+                   correlation_id: "stream-outcome-interrupted-#{System.unique_integer([:positive])}",
+                   request_metadata: %{}
+                 })
 
-      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+        assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
 
-      response_context = %ResponseContext{
-        context:
-          retry_context(setup, auth, request_options, reserved.request,
-            candidates: [{setup.assignment, setup.identity}],
-            attempt: attempt
-          ),
-        response: sse_response()
-      }
+        response_context = %ResponseContext{
+          context:
+            retry_context(setup, auth, request_options, reserved.request,
+              candidates: [{setup.assignment, setup.identity}],
+              attempt: attempt
+            ),
+          response: sse_response()
+        }
 
-      assert {:ok, %{finalization_disposition: :inserted}} =
-               Streaming.finalize_failure("", {:chunk, :closed}, response_context)
+        assert {:ok, %{finalization_disposition: :inserted}} =
+                 Streaming.finalize_failure("", {:chunk, reason}, response_context)
 
-      assert_receive {:stream_outcome,
-                      %{
-                        outcome: "interrupted",
-                        downstream_transport: "http_sse",
-                        upstream_transport: "http_sse"
-                      }}
+        assert Repo.reload!(reserved.request).last_error_code == "client_disconnected"
+        assert Repo.reload!(attempt).network_error_code == "client_disconnected"
+        assert Repo.aggregate(from(l in CodexPooler.Accounting.LedgerEntry, where: l.request_id == ^reserved.request.id and l.entry_kind == "settlement"), :count) == 1
 
-      refute_receive {:stream_outcome, _metadata}, 50
-    end)
+        assert_receive {:stream_outcome,
+                        %{
+                          outcome: "interrupted",
+                          downstream_transport: "http_sse",
+                          upstream_transport: "http_sse"
+                        }}
+
+        refute_receive {:stream_outcome, _metadata}, 50
+      end)
+    end
   end
 
   test "HTTP stream terminal finalization stays silent when the request is already finalized" do

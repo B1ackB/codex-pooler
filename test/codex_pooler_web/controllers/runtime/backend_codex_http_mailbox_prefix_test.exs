@@ -7,6 +7,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpMailboxPrefixTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Payloads.{NativeHttpTurnIdentity, RequestOptions}
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
+  alias CodexPooler.Gateway.Runtime.Finalization.{Metadata, Streaming}
   alias CodexPooler.Platform.{ExecutionIdentity, ExecutionRegistry, ExecutionTerminalProof, ExecutionTerminalProofs}
   alias CodexPooler.Repo
   alias Ecto.Adapters.SQL.Sandbox
@@ -54,6 +55,20 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpMailboxPrefixTest do
     assert_receive {:DOWN, ^writer_monitor, :process, _, :normal}, @budget
     assert reason == :einval
     assert_failed_mailbox_write!(reason)
+  end
+
+  test "downstream socket closure codes are interruptions while other write errors remain failures" do
+    for reason <- [:closed, :econnreset, :enotconn, :epipe, :einval] do
+      assert_failed_mailbox_write!(reason)
+    end
+
+    for reason <- [:timeout, {:timeout, :send}, :emsgsize, :visible_output_unavailable, :unexpected_write_error] do
+      assert Streaming.error_code({:chunk, reason}) == "downstream_stream_error"
+      refute Metadata.safe_reason({:chunk, reason}) == "client disconnected while writing downstream stream"
+    end
+
+    refute Streaming.error_code(:einval) == "client_disconnected"
+    refute Streaming.error_code({:upstream_stream_interrupted, :einval}) == "client_disconnected"
   end
 
   # A comprehension expands and compiles a test's body once per generated test, so a loop that generates more than a few tests keeps
@@ -589,5 +604,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpMailboxPrefixTest do
     refute_received {:mailbox_prefix_write, ^ref, :send, _item, _error}
   end
 
-  defp assert_failed_mailbox_write!(reason), do: assert(reason in [:closed, :econnreset, :enotconn, :epipe, :einval])
+  defp assert_failed_mailbox_write!(reason) do
+    assert reason in [:closed, :econnreset, :enotconn, :epipe, :einval]
+    assert Streaming.error_code({:chunk, reason}) == "client_disconnected", "misclassified downstream socket error: #{inspect(reason)}"
+    assert Metadata.safe_reason({:chunk, reason}) == "client disconnected while writing downstream stream"
+  end
 end

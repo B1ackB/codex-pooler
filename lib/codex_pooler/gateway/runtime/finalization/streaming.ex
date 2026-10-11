@@ -515,7 +515,9 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
 
   @spec error_code(term()) :: String.t()
   def error_code(:native_preamble_limit_exceeded), do: "upstream_response_too_large"
-  def error_code({:chunk, :closed}), do: "client_disconnected"
+  # A peer reset can close the port after gen_tcp resolves its transport, so
+  # even a valid HTTP chunk can return :einval instead of :closed.
+  def error_code({:chunk, reason}) when reason in [:closed, :econnreset, :enotconn, :epipe, :einval], do: "client_disconnected"
   def error_code({:chunk, _reason}), do: "downstream_stream_error"
   def error_code({:upstream_idle_timeout, _reason}), do: "stream_idle_timeout"
   # A rollout drain is our own lifecycle event, not an upstream failure. Keep
