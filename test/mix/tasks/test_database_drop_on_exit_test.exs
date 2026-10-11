@@ -47,7 +47,7 @@ defmodule CodexPooler.MixTasks.TestDatabaseDropOnExitTest do
   end
   """
 
-  # A process registered where the rollout drain looks for websocket owners, answering the three
+  # A process registered where the rollout drain looks for websocket owners, answering the
   # calls the drain makes with a turn that never ends, and left running when its test finishes.
   @leaked_owner_test ~S"""
   defmodule CodexPooler.DropOnExitProbe.LeakedOwner do
@@ -68,6 +68,10 @@ defmodule CodexPooler.MixTasks.TestDatabaseDropOnExitTest do
     end
 
     @impl GenServer
+    def handle_call({:local_drain_status, %{at: at, now_ms: clock}}, from, state)
+        when is_integer(at) and is_function(clock, 0),
+        do: handle_call(:owner_status, from, state)
+
     def handle_call(:owner_status, _from, state), do: {:reply, {:ok, %{active_turn?: true}}, state}
 
     def handle_call(:drain, _from, state) do
@@ -114,8 +118,21 @@ defmodule CodexPooler.MixTasks.TestDatabaseDropOnExitTest do
     end
 
     @impl GenServer
+    def handle_call({:local_drain_status, %{at: at, now_ms: clock}}, from, answer_status?)
+        when is_integer(at) and is_function(clock, 0),
+        do: handle_call(:owner_status, from, answer_status?)
+
     def handle_call(:owner_status, _from, true), do: {:reply, {:ok, %{active_turn?: true}}, true}
-    def handle_call(_request, _from, answer_status?), do: {:noreply, answer_status?}
+
+    def handle_call(:owner_status, _from, false) do
+      IO.puts("drop-on-exit-probe blocked_call=status")
+      {:noreply, false}
+    end
+
+    def handle_call(:drain, _from, answer_status?) do
+      IO.puts("drop-on-exit-probe blocked_call=drain")
+      {:noreply, answer_status?}
+    end
   end
 
   defmodule CodexPooler.DropOnExitProbe.UnresponsiveOwnerTest do
@@ -240,6 +257,7 @@ defmodule CodexPooler.MixTasks.TestDatabaseDropOnExitTest do
 
       assert run.exit_code == 0, run.output
       assert run.receipts["database"] == run.database, run.output
+      assert run.receipts["blocked_call"] == if(answer_status?, do: "drain", else: "status"), run.output
 
       assert Map.has_key?(run.receipts, "drain_begin_ms") and Map.has_key?(run.receipts, "drain_down_ms"),
              "the rollout drain never reached the unresponsive owner, or never stopped\n#{run.output}"
