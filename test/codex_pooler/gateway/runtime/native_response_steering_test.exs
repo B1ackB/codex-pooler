@@ -286,6 +286,10 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteeringTest do
         # Killing this exact owner makes the in-flight real GenServer.call exit.
         Process.exit(owner, :kill)
         assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :killed}, @detection_timeout_ms
+        # The database commit precedes execution retirement. The lane's reply
+        # acknowledges both, while the suspended socket still cannot Close.
+        assert_receive {ref, :open_reply, {:error, :owner_unavailable}}, @detection_timeout_ms
+        assert ref == acquisition_probe.ref
         [_original, compensated] = await_rows!(fixture.setup, 2, &Enum.all?(&1, fn row -> row.completed_at != nil end))
         assert compensated.id == successor.id
         assert compensated.status == "failed"
@@ -296,8 +300,6 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteeringTest do
         assert Repo.get_by!(CodexTurn, request_id: successor.id).status not in ["accepted", "in_progress"]
         assert_complete_ledger!(compensated)
         assert ExecutionRegistry.status(settled_attempt.owner_execution_id, fixture.lane) == :dead
-        assert_receive {ref, :open_reply, {:error, :owner_unavailable}}, @detection_timeout_ms
-        assert ref == acquisition_probe.ref
         assert is_nil(:sys.get_state(fixture.lane).active)
         assert :ok = :sys.resume(client.socket)
       end)
