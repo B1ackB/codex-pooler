@@ -12,6 +12,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
   alias CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession}
+  alias CodexPooler.Gateway.Runtime.Finalization.ResponseUsage
   alias CodexPooler.Gateway.Runtime.Service
   alias CodexPooler.Gateway.Transports.OrdinarySuccessTestSeed
   alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
@@ -19,6 +20,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponsesSequence
   alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
+  alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
   alias CodexPooler.Gateway.Transports.Websocket.ForwardedSendWitnessV1
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
   alias CodexPooler.Gateway.Transports.Websocket.NativeReplayAdmission
@@ -3410,6 +3412,249 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     refute_received {:websocket_owner_frame, "reconnect-after-terminal", 2, {:error, :upstream_websocket_terminal_delivery_timeout, _payload}}
 
     assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  for interruption <- [:detach, :submitter_down, :timeout, :invalidation_failure, :retirement, :worker_failure, :owner_death, :drain, :replacement] do
+    @tag retained_interruption: interruption
+    test "known pending usage survives #{interruption} through an independent receipt worker", %{retained_interruption: interruption} = context do
+      parent = self()
+      context = %{context | codex_session_id: Ecto.UUID.generate(), owner_lease_token: Ecto.UUID.generate()}
+      on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+      registry = start_supervised!({ActivityRegistry, name: :owner_retained_receipt_registry})
+      terminal = terminal_frame("response.completed", "resp_retained_pending")
+      usage = ResponseUsage.from_stream_event(%{"usage" => %{"input_tokens" => 100, "output_tokens" => 20, "total_tokens" => 120}})
+      {:ok, result} = terminal_result(terminal, "response.completed")
+      controls = WebsocketOwnerNodeHarness.two_sender_controls()
+      upstream = WebsocketOwnerNodeHarness.two_sender_upstream_boundary(parent, controls, terminal_frames: [terminal], task_result: {:ok, Map.put(result, :response_usage, usage)})
+
+      upstream = Map.put(upstream, :invalidate, fn _ -> if interruption == :invalidation_failure, do: {:error, :upstream_websocket_not_connected}, else: :ok end)
+
+      persistence = %{
+        renew_owner_token: fn _, _, _ ->
+          send(parent, :receipt_owner_renewed)
+          {:ok, %{owner_lease_token: context.owner_lease_token, owner_instance_id: context.owner_instance_id}}
+        end,
+        release_owner_lease: fn _, _, _ -> :ok end,
+        interrupt_codex_session: fn _, _ -> :ok end,
+        retained_usage: fn snapshot ->
+          send(parent, {:receipt_worker_waiting, self(), snapshot})
+          receive do: (:release_receipt -> {:ok, %{finalization_disposition: :inserted}})
+        end
+      }
+
+      {:ok, owner} = start_owner(context, upstream: upstream, persistence: persistence, pool_id: Ecto.UUID.generate(), api_key_id: Ecto.UUID.generate(), receipt_registry: registry, terminal_delivery_timeout_ms: @terminal_delivery_scenario_timeout_ms)
+      {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("retained-pending"))
+      request = %{websocket_request() | request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate()}
+      submitter = Task.async(fn -> WebsocketOwnerSession.submit_request(owner, downstream, request) end)
+      barriers = await_two_sender_barriers(controls)
+      release_controlled(barriers, controls, :task_result)
+      %{active_turn: active} = await_pending_terminal_result(owner)
+      {:ok, producer_owner} = WebsocketOwnerSession.owner_status(owner)
+      assert producer_owner.active_turn?
+      registry_module = ActivityRegistry
+      assert %{pending_producers: 1} = registry_module.receipt_cohort(name: registry)
+
+      if interruption != :replacement do
+        {_epoch, []} = registry_module.begin_drain(name: registry)
+        assert %{closed?: false, entries: []} = registry_module.receipt_cohort(name: registry)
+      end
+
+      owner_monitor = Process.monitor(owner)
+
+      case interruption do
+        :submitter_down ->
+          Process.unlink(submitter.pid)
+          Process.exit(submitter.pid, :kill)
+
+        kind when kind in [:timeout, :invalidation_failure] ->
+          {turn_ref, token} = active.terminal_delivery_timeout
+          send(owner, {:websocket_owner_terminal_delivery_timeout, turn_ref, token})
+
+        :retirement ->
+          Process.exit(:sys.get_state(owner).upstream_pid, :kill)
+
+        :drain ->
+          assert :ok = WebsocketOwnerSession.drain_owner(owner)
+
+        _ ->
+          assert :ok = WebsocketOwnerSession.detach_downstream(owner, downstream)
+      end
+
+      assert_receive {:receipt_worker_waiting, worker, snapshot}, @detection_timeout_ms
+      assert snapshot.usage.total_tokens == 120
+
+      expected_code =
+        case interruption do
+          kind when kind in [:timeout, :invalidation_failure] -> "upstream_stream_error"
+          :retirement -> "owner_crashed"
+          :drain -> "owner_drained"
+          _ -> "client_disconnected"
+        end
+
+      assert snapshot.failure.error_code == expected_code
+      assert snapshot.failure.status == "failed"
+      assert snapshot.failure.response_status_code == if(interruption in [:timeout, :invalidation_failure], do: 502, else: 499)
+      assert worker != owner and worker != active.task_pid
+      on_exit(fn -> send(worker, :release_receipt) end)
+      if interruption not in [:submitter_down, :retirement], do: assert({:error, %{body: "", response_usage: %{total_tokens: 120}}} = Task.await(submitter, @detection_timeout_ms))
+      assert %{pending_producers: 0} = registry_module.receipt_cohort(name: registry)
+      assert [%{pid: ^worker, kind: :receipt_settlement}] = registry_module.activities(name: registry)
+
+      if interruption != :drain do
+        assert %{active_turn: %{receipt_settlement: %{pid: ^worker} = receipt}} = :sys.get_state(owner)
+        send(owner, :renew_owner_lease)
+        assert_receive :receipt_owner_renewed, @detection_timeout_ms
+
+        if interruption == :detach do
+          WebsocketOwnerSession.detach_downstream(owner, downstream)
+          send(owner, {:DOWN, active.submitter_monitor, :process, submitter.pid, :normal})
+          {turn_ref, token} = active.terminal_delivery_timeout
+          send(owner, {:websocket_owner_terminal_delivery_timeout, turn_ref, token})
+          send(owner, {:websocket_owner_receipt_settled, make_ref(), receipt.ref, receipt.token, :inserted})
+          assert %{active_turn: %{receipt_settlement: ^receipt}} = :sys.get_state(owner)
+        end
+      end
+
+      monitor = Process.monitor(worker)
+
+      if interruption == :owner_death do
+        Process.exit(owner, :kill)
+        assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :killed}, @detection_timeout_ms
+        assert Process.alive?(worker)
+      end
+
+      if interruption == :worker_failure, do: Process.exit(worker, :kill), else: send(worker, :release_receipt)
+      assert_receive {:DOWN, ^monitor, :process, ^worker, worker_reason}, @detection_timeout_ms
+      assert worker_reason == if(interruption == :worker_failure, do: :killed, else: :normal)
+      if interruption == :retirement, do: assert({:error, %{body: "", response_usage: %{total_tokens: 120}}} = Task.await(submitter, @detection_timeout_ms))
+      if interruption not in [:owner_death, :drain, :retirement], do: assert(%{active_turn: nil} = await_active_turn_cleared(owner))
+      if interruption in [:drain, :retirement], do: assert_receive({:DOWN, ^owner_monitor, :process, ^owner, _}, @detection_timeout_ms)
+      expected_outcome = if interruption == :worker_failure, do: :failed, else: :completed
+
+      if interruption != :replacement do
+        cohort = await_receipt_cohort(registry)
+        assert %{closed?: true, entries: [%{status: {:finished, ^expected_outcome}}]} = cohort
+      end
+
+      CodexPooler.TestDiagnostics.puts("retained owner scenario=#{interruption} tokens=120 worker_outcome=#{expected_outcome} producer_closed=true")
+      release_controlled(barriers, controls, :nonterminal_frames)
+      terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+      release_controlled(terminal_barrier, controls, :terminal_frames)
+
+      if interruption == :replacement do
+        {:ok, next_downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("replacement-receipt"))
+        next_submitter = Task.async(fn -> WebsocketOwnerSession.submit_request(owner, next_downstream, %{request | request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate()}) end)
+        next_barriers = await_two_sender_barriers(controls)
+        %{active_turn: next_active} = :sys.get_state(owner)
+        assert next_active.ref != active.ref
+        {old_turn, old_timer} = active.terminal_delivery_timeout
+        send(owner, {:websocket_owner_terminal_delivery_timeout, old_turn, old_timer})
+        send(owner, {:websocket_owner_receipt_settled, active.ref, make_ref(), make_ref(), :inserted})
+        send(owner, {active.task_ref, active.pending_result})
+        assert %{active_turn: %{ref: next_ref, pending_result: nil, receipt_settlement: nil}} = :sys.get_state(owner)
+        assert next_ref == next_active.ref
+        release_controlled(next_barriers, controls, :nonterminal_frames)
+        next_terminal = await_controlled_barrier(:terminal_frames, controls)
+        release_controlled(next_terminal, controls, :terminal_frames)
+        release_controlled(next_barriers, controls, :task_result)
+        assert {:ok, %{response_usage: %{total_tokens: 120}}} = Task.await(next_submitter, @detection_timeout_ms)
+        assert %{active_turn: nil} = :sys.get_state(owner)
+        assert %{pending_producers: 0} = registry_module.receipt_cohort(name: registry)
+      end
+    end
+  end
+
+  test "receipt admission refuses drained registry before the upstream task starts", context do
+    registry_module = ActivityRegistry
+    registry = start_supervised!({registry_module, name: :owner_rejected_receipt_registry})
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    {:ok, owner} = start_owner(context, upstream: upstream, receipt_registry: registry)
+    assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+    {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("drained-receipt"))
+    registry_module.begin_drain(name: registry)
+    request = %{websocket_request() | request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate()}
+    assert {:error, :owner_drained} = WebsocketOwnerSession.submit_request(owner, downstream, request)
+    assert %{active_turn: nil} = :sys.get_state(owner)
+    assert %{frames: []} = Agent.get(upstream_pid, & &1)
+    assert %{pending_producers: 0} = registry_module.receipt_cohort(name: registry)
+  end
+
+  for receipt_kind <- [:missing, :malformed, :legacy_principal, :already_finalized, :delivered] do
+    @tag retained_receipt_kind: receipt_kind
+    test "owner receipt control #{receipt_kind} never starts replacement accounting", %{retained_receipt_kind: kind} = context do
+      parent = self()
+      context = %{context | codex_session_id: Ecto.UUID.generate(), owner_lease_token: Ecto.UUID.generate()}
+      on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+      registry = start_supervised!({ActivityRegistry, name: :owner_receipt_control_registry})
+      frame = terminal_frame("response.completed", "resp_receipt_control")
+      {:ok, result} = terminal_result(frame, "response.completed")
+      usage = %{status: "usage_known", input_tokens: 100, output_tokens: 20, total_tokens: 120}
+
+      result =
+        case kind do
+          :missing -> result
+          :malformed -> Map.put(result, :response_usage, %{usage | total_tokens: -1})
+          :already_finalized -> result |> Map.put(:response_usage, usage) |> Map.put(:native_response_steering_finalized, {:ok, %{stale_generation?: true}})
+          _ -> Map.put(result, :response_usage, usage)
+        end
+
+      controls = WebsocketOwnerNodeHarness.two_sender_controls()
+      upstream = WebsocketOwnerNodeHarness.two_sender_upstream_boundary(parent, controls, terminal_frames: [frame], task_result: {:ok, result})
+      principal = if kind == :legacy_principal, do: [], else: [pool_id: Ecto.UUID.generate(), api_key_id: Ecto.UUID.generate()]
+
+      persistence = %{
+        renew_owner_token: fn _, token, _ -> {:ok, %{owner_lease_token: token, owner_instance_id: context.owner_instance_id}} end,
+        release_owner_lease: fn _, _, _ -> :ok end,
+        interrupt_codex_session: fn _, _ -> :ok end,
+        retained_usage: fn _ ->
+          send(parent, :unexpected_receipt_worker)
+          {:ok, %{finalization_disposition: :inserted}}
+        end
+      }
+
+      {:ok, owner} = start_owner(context, [upstream: upstream, persistence: persistence, receipt_registry: registry, terminal_delivery_timeout_ms: @terminal_delivery_scenario_timeout_ms] ++ principal)
+      {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("receipt-control"))
+      request = %{websocket_request() | request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate()}
+      task = Task.async(fn -> WebsocketOwnerSession.submit_request(owner, downstream, request) end)
+      barriers = await_two_sender_barriers(controls)
+      release_controlled(barriers, controls, :task_result)
+      await_pending_terminal_result(owner)
+
+      if kind == :delivered do
+        release_controlled(barriers, controls, :nonterminal_frames)
+        terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+        release_controlled(terminal_barrier, controls, :terminal_frames)
+        assert {:ok, %{response_usage: %{total_tokens: 120}}} = Task.await(task, @detection_timeout_ms)
+        assert :ok = WebsocketOwnerSession.detach_downstream(owner, downstream)
+      else
+        log =
+          capture_log(fn ->
+            assert :ok = WebsocketOwnerSession.detach_downstream(owner, downstream)
+            reply = Task.await(task, @detection_timeout_ms)
+
+            if kind == :already_finalized do
+              assert {:error, %{native_response_steering_finalized: {:ok, %{stale_generation?: true}}}} = reply
+            else
+              assert reply == {:error, :client_disconnected}
+            end
+          end)
+
+        if kind == :legacy_principal, do: assert(log =~ "legacy_principal_unavailable")
+        release_controlled(barriers, controls, :nonterminal_frames)
+        terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+        release_controlled(terminal_barrier, controls, :terminal_frames)
+      end
+
+      assert %{active_turn: nil} = :sys.get_state(owner)
+      assert %{pending_producers: 0} = ActivityRegistry.receipt_cohort(name: registry)
+      assert ActivityRegistry.activities(name: registry) == []
+      refute_received :unexpected_receipt_worker
+    end
+  end
+
+  defp await_receipt_cohort(registry, deadline \\ detection_deadline()) do
+    cohort = ActivityRegistry.receipt_cohort(name: registry)
+    if Enum.any?(cohort.entries, &(&1.status == :active)) and poll_again?(deadline), do: await_receipt_cohort(registry, deadline), else: cohort
   end
 
   test "detach while a terminal result is pending keeps client disconnect precedence", context do

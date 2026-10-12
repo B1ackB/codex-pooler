@@ -13,6 +13,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   alias CodexPooler.Gateway.Persistence.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Finalization.ExpiredOwnerGenerationCleanup
   alias CodexPooler.Gateway.Runtime.Finalization.Interruption
+  alias CodexPooler.Gateway.Runtime.Finalization.RetainedUsage
   alias CodexPooler.Gateway.Runtime.Finalization.SettlementRetry
   alias CodexPooler.Gateway.Runtime.NativeResponseSteering
   alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
@@ -79,6 +80,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   # The one-shot collection result belongs to this existing owner lifecycle.
   # credo:disable-for-next-line Credo.Check.Warning.StructFieldAmount
   defstruct [
+    :receipt_registry,
     :first_compact_result,
     :ordinary_success_result,
     :codex_session_id,
@@ -1460,6 +1462,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
       {:ok,
        %__MODULE__{
+         receipt_registry: Keyword.get(opts, :receipt_registry, ActivityRegistry),
          codex_session_id: codex_session_id,
          turn_claim_session: turn_claim_session(codex_session_id, opts),
          owner_lease_token: owner_lease_token,
@@ -2152,14 +2155,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   def handle_call({:begin_steering_successor, lane, socket, identity, turn_id}, _from, %{native_response_steering: lane, downstream: %{pid: socket} = downstream, active_turn: nil, draining?: false} = state) do
     cleanup = OwnerCleanup.capture(state, identity, downstream, identity.replay_generation)
-    # Provider-created generations have no client replay payload or replay
-    # entitlement. The tagged descriptor keeps identity/lease cleanup but is
-    # deliberately excluded from inherited-turn and replay controls.
-    descriptor = Map.merge(identity, %{kind: :native_response_steering, codex_turn_id: turn_id, downstream_status: :attached, visible_output?: false})
-    descriptor = Map.merge(descriptor, %{semantic_turn_key: nil, semantic_turn_digest: nil, replay_claim_digest: nil, authorization_snapshot: nil, model_id: nil, endpoint: "/backend-api/codex/responses"})
-    active = %{ref: make_ref(), writer_capability: make_ref(), task_pid: lane, task_ref: nil, native_steering_monitor: Process.monitor(lane), submitter_monitor: nil, reply_to: nil, downstream: downstream, terminal_forwarded?: false, pending_result: nil, terminal_delivery_timeout: nil, terminal_delivery_timer_ref: nil, output_commit_probe: nil, collect?: false, submission_observed?: false, descriptor: descriptor, cleanup_witness: cleanup, visible_output?: false, upstream_pid: state.upstream_pid, admission_phase: nil, admission_request_id: identity.request_id, admission_attempt_id: identity.attempt_id, first_compact_request_identity: nil, ordinary_request_identity: nil, task_settled?: false, submitter_exited?: false, reply_sent?: false, native_response_steering: lane}
-    state.callbacks.downstream_sender.(socket, {:native_response_steering_open, lane, identity})
-    {:reply, :ok, %{state | active_turn: active}}
+
+    case begin_owner_receipt_producer(state, cleanup) do
+      {:ok, producer} ->
+        # Provider-created generations have no client replay payload or replay
+        # entitlement. The tagged descriptor keeps identity/lease cleanup but is
+        # deliberately excluded from inherited-turn and replay controls.
+        descriptor = Map.merge(identity, %{kind: :native_response_steering, codex_turn_id: turn_id, downstream_status: :attached, visible_output?: false})
+        descriptor = Map.merge(descriptor, %{semantic_turn_key: nil, semantic_turn_digest: nil, replay_claim_digest: nil, authorization_snapshot: nil, model_id: nil, endpoint: "/backend-api/codex/responses"})
+        active = %{ref: make_ref(), writer_capability: make_ref(), task_pid: lane, task_ref: nil, native_steering_monitor: Process.monitor(lane), submitter_monitor: nil, reply_to: nil, downstream: downstream, terminal_forwarded?: false, pending_result: nil, terminal_delivery_timeout: nil, terminal_delivery_timer_ref: nil, output_commit_probe: nil, collect?: false, submission_observed?: false, descriptor: descriptor, cleanup_witness: cleanup, visible_output?: false, upstream_pid: state.upstream_pid, admission_phase: nil, admission_request_id: identity.request_id, admission_attempt_id: identity.attempt_id, first_compact_request_identity: nil, ordinary_request_identity: nil, task_settled?: false, submitter_exited?: false, reply_sent?: false, native_response_steering: lane}
+        active = Map.merge(active, %{receipt_producer: producer, receipt_registry: state.receipt_registry, receipt_settlement: nil})
+        state.callbacks.downstream_sender.(socket, {:native_response_steering_open, lane, identity})
+        {:reply, :ok, %{state | active_turn: active}}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:begin_steering_successor, _lane, _socket, _identity, _turn}, _from, state), do: {:reply, {:error, :owner_busy}, state}
@@ -2247,16 +2258,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     with {:ok, active_turn_downstream} <- active_turn_downstream(state.downstream, downstream),
          {:ok, upstream_payload, state, admission_phase} <-
            prepare_owner_admission_submission(state, active_turn_downstream, upstream_payload) do
-      ref = make_ref()
-      writer_capability = make_ref()
-      {submitter_pid, _tag} = from
-
       # The submission as it arrived: the admission it carries, validated just
       # above, still names its turn (`admission_turn_descriptor/1`).
       {descriptor, state} =
         take_next_turn_descriptor(state, active_turn_downstream, submitted_payload)
-
-      task = start_upstream_task(state, ref, upstream_payload, descriptor, writer_capability)
 
       cleanup_witness =
         OwnerCleanup.capture(
@@ -2266,61 +2271,76 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
           cleanup_replay_generation(upstream_payload, descriptor)
         )
 
-      if cleanup_witness do
-        send(active_turn_downstream.pid, {
-          :websocket_owner_cleanup_witness,
-          active_turn_downstream.correlation_id,
-          active_turn_downstream.epoch,
-          Map.get(active_turn_downstream, :owner_turn_id),
-          cleanup_witness
-        })
+      case begin_owner_receipt_producer(state, cleanup_witness) do
+        {:ok, receipt_producer} -> install_upstream_submission(state, from, active_turn_downstream, upstream_payload, descriptor, {cleanup_witness, receipt_producer}, admission_phase, submission_notification?)
+        {:error, reason} -> {:reply, {:error, reason}, state}
       end
-
-      active_turn = %{
-        ref: ref,
-        writer_capability: writer_capability,
-        task_pid: task.pid,
-        task_ref: task.ref,
-        submitter_monitor: Process.monitor(submitter_pid),
-        reply_to: from,
-        downstream: active_turn_downstream,
-        terminal_forwarded?: false,
-        pending_result: nil,
-        terminal_delivery_timeout: nil,
-        terminal_delivery_timer_ref: nil,
-        output_commit_probe: nil,
-        collect?: collect_request?(upstream_payload),
-        submission_observed?: submission_notification?,
-        descriptor: descriptor,
-        cleanup_witness: cleanup_witness,
-        visible_output?: false,
-        upstream_pid: state.upstream_pid,
-        admission_phase: admission_phase,
-        admission_request_id: admission_request_id(upstream_payload),
-        admission_attempt_id: admission_attempt_id(upstream_payload),
-        first_compact_request_identity: NativeCompactionAdmission.FirstCompactResult.request_identity(upstream_payload),
-        ordinary_request_identity: ordinary_request_identity(upstream_payload),
-        task_settled?: false,
-        submitter_exited?: false,
-        reply_sent?: false
-      }
-
-      if context = Map.get(state.pending_admissions, Map.get(downstream, :owner_turn_id)),
-        do: ActivityRegistry.handoff_direct_cleanup(context)
-
-      state = forget_pending_admission(state, Map.get(downstream, :owner_turn_id))
-
-      {:noreply,
-       %{
-         state
-         | active_turn: active_turn,
-           first_compact_result: nil,
-           ordinary_success_result: nil
-       }}
     else
       {:error, reason, next_state} -> {:reply, {:error, reason}, next_state}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
+  end
+
+  defp install_upstream_submission(state, from, active_turn_downstream, upstream_payload, descriptor, {cleanup_witness, receipt_producer}, admission_phase, submission_notification?) do
+    ref = make_ref()
+    writer_capability = make_ref()
+    {submitter_pid, _tag} = from
+    task = start_upstream_task(state, ref, upstream_payload, descriptor, writer_capability)
+
+    if cleanup_witness do
+      send(active_turn_downstream.pid, {
+        :websocket_owner_cleanup_witness,
+        active_turn_downstream.correlation_id,
+        active_turn_downstream.epoch,
+        Map.get(active_turn_downstream, :owner_turn_id),
+        cleanup_witness
+      })
+    end
+
+    active_turn = %{
+      ref: ref,
+      writer_capability: writer_capability,
+      task_pid: task.pid,
+      task_ref: task.ref,
+      submitter_monitor: Process.monitor(submitter_pid),
+      reply_to: from,
+      downstream: active_turn_downstream,
+      terminal_forwarded?: false,
+      pending_result: nil,
+      terminal_delivery_timeout: nil,
+      terminal_delivery_timer_ref: nil,
+      output_commit_probe: nil,
+      collect?: collect_request?(upstream_payload),
+      submission_observed?: submission_notification?,
+      descriptor: descriptor,
+      cleanup_witness: cleanup_witness,
+      receipt_producer: receipt_producer,
+      receipt_registry: state.receipt_registry,
+      receipt_settlement: nil,
+      visible_output?: false,
+      upstream_pid: state.upstream_pid,
+      admission_phase: admission_phase,
+      admission_request_id: admission_request_id(upstream_payload),
+      admission_attempt_id: admission_attempt_id(upstream_payload),
+      first_compact_request_identity: NativeCompactionAdmission.FirstCompactResult.request_identity(upstream_payload),
+      ordinary_request_identity: ordinary_request_identity(upstream_payload),
+      task_settled?: false,
+      submitter_exited?: false,
+      reply_sent?: false
+    }
+
+    if context = Map.get(state.pending_admissions, Map.get(active_turn_downstream, :owner_turn_id)),
+      do: ActivityRegistry.handoff_direct_cleanup(context)
+
+    state = forget_pending_admission(state, Map.get(active_turn_downstream, :owner_turn_id))
+
+    {:noreply,
+     %{
+       state
+       | active_turn: active_turn,
+         first_compact_result: nil,
+         ordinary_success_result: nil
+     }}
   end
 
   defp prepare_owner_admission_submission(
@@ -2731,9 +2751,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   def handle_info({:websocket_owner_upstream_frame, _ref, _payload}, state), do: {:noreply, state}
 
+  def handle_info({:websocket_owner_receipt_settled, turn_ref, ref, token, disposition}, %{active_turn: %{ref: turn_ref, receipt_settlement: %{ref: ref, token: token, monitor: monitor}}} = state) do
+    Process.demonitor(monitor, [:flush])
+    state |> complete_owner_receipt(disposition) |> continue_or_retire()
+  end
+
+  def handle_info({:websocket_owner_receipt_settled, _turn_ref, _ref, _token, _disposition}, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, monitor, :process, pid, _reason}, %{active_turn: %{receipt_settlement: %{monitor: monitor, pid: pid}}} = state) do
+    # Registry independently observes this failure; it cannot become a committed receipt.
+    state |> complete_owner_receipt(:failed) |> continue_or_retire()
+  end
+
   def handle_info({ref, result}, %{active_turn: %{task_ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
     state = put_in(state.active_turn.task_ref, nil)
+    state = retain_cancelled_task_receipt(state, result)
     result = DownstreamState.effective_active_turn_result(state.active_turn, result)
     {result, state} = retain_first_compact_result(result, state)
     {result, state} = retain_ordinary_success_result(result, state)
@@ -2849,7 +2882,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
       state
       |> clear_native_compaction_admission(:caller_exit)
-      |> finish_active_turn({:error, :client_disconnected})
+      |> settle_active_turn({:error, :client_disconnected})
       |> continue_or_retire()
     end
   end
@@ -2912,6 +2945,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
       end
 
     state
+    |> put_in([Access.key(:active_turn), :receipt_failure], receipt_failure(:upstream_websocket_terminal_delivery_timeout))
     |> settle_active_turn(result)
     |> continue_or_retire()
   end
@@ -3605,15 +3639,23 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     state =
       if DownstreamState.active_turn?(state) do
         terminate_predecessor_task(state.active_turn)
-        _result = Persistence.interrupt_codex_session(state, :owner_drained)
-        reply_active_turn(state, {:error, :owner_drained})
-        finish_active_turn(state, {:error, :owner_drained})
+        state = record_drain_interruption(state)
+        settle_active_turn(state, {:error, :owner_drained})
       else
         :ok = notify_drained_downstream(state, how)
         state
       end
 
     %{state | draining?: true, owner_exit_cause: :drain_cut}
+  end
+
+  defp record_drain_interruption(%{active_turn: %{receipt_settlement: receipt}} = state) when is_map(receipt), do: state
+
+  defp record_drain_interruption(state) do
+    case Persistence.interrupt_codex_session(state, :owner_drained) do
+      :ok -> put_in(state.active_turn[:receipt_failure], %{receipt_failure(:owner_drained) | response_status_code: 499})
+      {:error, _reason} -> state
+    end
   end
 
   # After a forwarded turn that settled, its downstream may still be taking
@@ -4351,6 +4393,129 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     |> DownstreamState.maybe_schedule_idle_shutdown()
   end
 
+  defp begin_owner_receipt_producer(_state, nil), do: {:ok, nil}
+
+  defp begin_owner_receipt_producer(state, %OwnerCleanup{} = cleanup) do
+    ActivityRegistry.begin_receipt_producer(receipt_identity(cleanup), name: state.receipt_registry)
+  end
+
+  defp receipt_identity(cleanup), do: Map.take(cleanup, [:request_id, :attempt_id, :replay_generation])
+
+  defp finish_owner_receipt_producer(%{receipt_producer: producer, receipt_registry: registry}) when is_reference(producer) do
+    ActivityRegistry.finish_receipt_producer(producer, name: registry)
+  end
+
+  defp finish_owner_receipt_producer(_active), do: :ok
+
+  defp retain_interrupted_receipt(%{active_turn: %{receipt_settlement: receipt}} = state, _result) when is_map(receipt), do: {:started, state}
+
+  defp retain_interrupted_receipt(%{active_turn: active} = state, {:error, error} = cancellation) do
+    held = active.pending_result || get_in(active, [:output_commit_probe, :result])
+    failure = Map.get(active, :receipt_failure) || receipt_failure(if(is_map(error), do: error[:reason], else: error))
+
+    with false <- active.terminal_forwarded?,
+         {:ok, result} when is_map(result) <- held,
+         false <- Map.has_key?(result, :native_response_steering_finalized),
+         {:ok, snapshot} <- capture_owner_receipt(active.cleanup_witness, state.turn_claim_session, result[:response_usage], failure),
+         producer when is_reference(producer) <- Map.get(active, :receipt_producer) do
+      start_owner_receipt(state, producer, snapshot, cancellation)
+    else
+      _absent_or_invalid -> :none
+    end
+  end
+
+  defp retain_interrupted_receipt(_state, _result), do: :none
+
+  defp capture_owner_receipt(_cleanup, nil, %{status: "usage_known"}, _failure) do
+    Elixir.Logger.warning("websocket retained receipt unavailable reason_class=legacy_principal_unavailable")
+    {:error, :legacy_principal_unavailable}
+  end
+
+  defp capture_owner_receipt(cleanup, principal, usage, failure), do: RetainedUsage.capture(cleanup, principal, usage, failure)
+
+  defp start_owner_receipt(state, producer, snapshot, {:error, error}) do
+    owner = self()
+    ref = make_ref()
+    turn_ref = state.active_turn.ref
+    registry = state.receipt_registry
+    finalizer = Map.get(state.persistence, :retained_usage, &RetainedUsage.finalize/1)
+    # This closure carries only process identities and the finalizer boundary.
+    # The metadata-only snapshot arrives only after registry responsibility exists.
+    {:ok, worker} = Task.Supervisor.start_child(@task_supervisor, fn -> receipt_worker(owner, turn_ref, ref, registry, finalizer) end)
+    monitor = Process.monitor(worker)
+
+    case ActivityRegistry.register_receipt_settlement(producer, receipt_identity(snapshot), worker, name: registry) do
+      {:ok, token} ->
+        :ok = ActivityRegistry.finish_receipt_producer(producer, name: registry)
+        reply = {:error, %{body: "", headers: []} |> Map.merge(if(is_map(error), do: error, else: %{reason: error})) |> Map.put(:response_usage, snapshot.usage)}
+        active = state.active_turn |> cancel_predecessor_delivery_timers() |> Map.put(:receipt_producer, nil) |> Map.put(:receipt_settlement, %{ref: ref, pid: worker, monitor: monitor, token: token, cancellation_reply: reply})
+        state = %{state | active_turn: active}
+        state = if state.retire_after_active_turn?, do: state, else: reply_receipt_cancellation(state, reply)
+        send(worker, {:initialize_receipt, token, snapshot})
+        {:started, state}
+
+      {:error, _reason} ->
+        Process.exit(worker, :kill)
+        Process.demonitor(monitor, [:flush])
+        :none
+    end
+  end
+
+  defp receipt_worker(owner, turn_ref, ref, registry, finalizer) do
+    owner_monitor = Process.monitor(owner)
+
+    receive do
+      {:initialize_receipt, token, snapshot} ->
+        Process.demonitor(owner_monitor, [:flush])
+        disposition = receipt_disposition(finalizer.(snapshot))
+        :ok = ActivityRegistry.complete_receipt_settlement(token, disposition, name: registry)
+        send(owner, {:websocket_owner_receipt_settled, turn_ref, ref, token, disposition})
+
+      {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+        :ok
+    end
+  end
+
+  defp receipt_disposition({:ok, %{finalization_disposition: disposition}}) when disposition in [:inserted, :reused, :replaced], do: disposition
+  defp receipt_disposition({:stale_generation, _result}), do: :superseded
+  defp receipt_disposition(_result), do: :failed
+
+  defp complete_owner_receipt(state, disposition) do
+    result = state.active_turn.receipt_settlement.cancellation_reply
+    state = if state.retire_after_active_turn? and disposition in [:inserted, :reused, :replaced], do: %{state | exit_interrupted?: true}, else: state
+    state = if state.active_turn.reply_sent?, do: state, else: state |> settle_retiring_turn() |> reply_receipt_cancellation(result)
+
+    if is_map(state.pending_handoff) do
+      state
+      |> put_in([Access.key(:active_turn), :receipt_settlement], nil)
+      |> settle_predecessor_without_receipt(result)
+      |> maybe_ready_pending_handoff()
+    else
+      finish_active_turn(state, result)
+    end
+  end
+
+  defp reply_receipt_cancellation(state, reply) do
+    reply_active_turn(state, reply)
+    put_in(state.active_turn.reply_sent?, true)
+  end
+
+  defp retain_cancelled_task_receipt(%{active_turn: %{canceled_result: _, pending_result: nil}} = state, {:ok, %{response_usage: %{status: "usage_known"}}} = result), do: put_in(state.active_turn.pending_result, result)
+  defp retain_cancelled_task_receipt(state, _result), do: state
+
+  defp reuse_finalized_steering_result(%{active_turn: %{pending_result: {:ok, %{native_response_steering_finalized: finalized}}}}, {:error, error}) do
+    {:error, %{body: "", headers: []} |> Map.merge(if(is_map(error), do: error, else: %{reason: error})) |> Map.put(:native_response_steering_finalized, finalized)}
+  end
+
+  defp reuse_finalized_steering_result(_state, result), do: result
+
+  defp receipt_failure(reason) when reason in [:client_disconnected, :owner_drained, :upstream_websocket_terminal_delivery_timeout, :owner_crashed, :owner_forward_timeout] do
+    {:ok, payload} = WebsocketOwnerContract.safe_error_payload(reason, nil)
+    %{status: "failed", response_status_code: payload.status, error_code: payload.code}
+  end
+
+  defp receipt_failure(_reason), do: nil
+
   defp settle_cancelled_active_turn(state, reason) do
     case state.active_turn do
       %{output_commit_probe: probe} when is_map(probe) ->
@@ -4374,7 +4539,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   defp maybe_settle_cancelled_without_pending_handoff(state, reason),
     do: settle_cancelled_active_turn(state, reason)
 
+  defp settle_active_turn(%{active_turn: %{receipt_settlement: receipt}} = state, _result) when is_map(receipt), do: state
+
   defp settle_active_turn(state, result) do
+    result = reuse_finalized_steering_result(state, result)
+
+    case retain_interrupted_receipt(state, result) do
+      {:started, state} -> state
+      :none -> settle_active_turn_without_receipt(state, result)
+    end
+  end
+
+  defp settle_active_turn_without_receipt(state, result) do
     if output_commit_probe_required?(state, result) do
       retain_output_commit_probe(state, result)
     else
@@ -4437,6 +4613,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
       active_turn when is_map(active_turn) ->
         state = cancel_active_turn_for_upstream_exit(state)
+        state = put_in(state.active_turn[:receipt_failure], %{receipt_failure(:owner_crashed) | response_status_code: 499})
 
         state
         |> settle_active_turn(upstream_exit_result(state, reason))
@@ -4535,9 +4712,15 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   end
 
   defp settle_active_turn_without_downstream_delivery(state, result) do
-    state = settle_retiring_turn(state)
-    reply_active_turn(state, result)
-    clear_active_turn(state)
+    case retain_interrupted_receipt(state, result) do
+      {:started, state} ->
+        state
+
+      :none ->
+        state = settle_retiring_turn(state)
+        reply_active_turn(state, result)
+        clear_active_turn(state)
+    end
   end
 
   defp settle_probe_before_reconnect(%{active_turn: %{output_commit_probe: %{result: result}}} = state) do
@@ -4557,12 +4740,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   end
 
   defp clear_active_turn_resources(active_turn) do
+    finish_owner_receipt_producer(active_turn)
     cancel_terminal_delivery_timer(active_turn)
     cancel_output_commit_probe_timer(active_turn)
     DownstreamState.clear_active_turn_monitors(active_turn)
   end
 
   defp settle_predecessor_task(state, result) do
+    case retain_interrupted_receipt(state, result) do
+      {:started, state} -> state
+      :none -> settle_predecessor_without_receipt(state, result)
+    end
+  end
+
+  defp settle_predecessor_without_receipt(state, result) do
     active_turn =
       state.active_turn
       |> cancel_predecessor_delivery_timers()
@@ -4591,6 +4782,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     |> Map.put(:terminal_delivery_timer_ref, nil)
   end
 
+  defp maybe_ready_pending_handoff(%{active_turn: %{receipt_settlement: receipt}} = state) when is_map(receipt), do: state
+
   defp maybe_ready_pending_handoff(
          %{
            pending_handoff: %{status: :waiting} = pending,
@@ -4603,7 +4796,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
            }
          } = state
        ) do
-    DownstreamState.clear_active_turn_monitors(state.active_turn)
+    clear_active_turn_resources(state.active_turn)
     :ok = log_abandoned_upstream_close(state, :handoff)
     pending = %{pending | status: :ready}
 

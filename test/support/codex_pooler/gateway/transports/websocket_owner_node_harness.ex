@@ -4,6 +4,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Persistence.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Finalization.Interruption
+  alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.TerminalDiscriminator
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
 
@@ -209,6 +210,8 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
 
         {:ok, _task_supervisor} =
           Task.Supervisor.start_link(name: CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.TaskSupervisor)
+
+        {:ok, _activities} = ActivityRegistry.start_link([])
 
         {:ok, _abandoned_submissions} =
           Registry.start_link(keys: :unique, name: CodexPooler.Gateway.Transports.Websocket.AbandonedSubmissions.Registry)
