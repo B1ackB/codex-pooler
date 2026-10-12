@@ -5,10 +5,12 @@ defmodule CodexPooler.Gateway.Transports.NativeSteeringDrainWitnessTest do
   import CodexPoolerWeb.Runtime.BackendCodexWebsocketSupport, only: [socket_connection_state!: 1, model_serving_scope: 0, set_model_serving_mode!: 3, released_client_frame: 2]
   import CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport, only: [enter_peer_owner_topology!: 0, start_shared_bridge_peer!: 0, start_shared_peer_window_owner!: 3]
 
-  alias CodexPooler.Accounting.Request
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Runtime.NativeResponseSteering
   alias CodexPooler.Gateway.Transports.Streaming.DeferredStreamRegistry
   alias CodexPooler.Gateway.Transports.Websocket.{ActivityRegistry, RolloutDrain, WebsocketOwnerSession}
+  alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
   alias CodexPooler.Repo
   alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
 
@@ -43,6 +45,8 @@ defmodule CodexPooler.Gateway.Transports.NativeSteeringDrainWitnessTest do
       owner_before = :sys.get_state(owner)
       assert owner_before.active_turn.descriptor.request_id == identity.request_id
       refute owner_before.active_turn.terminal_forwarded?
+      upstream_monitor = Process.monitor(owner_before.upstream_pid)
+      lane_monitor = Process.monitor(lane)
 
       for stale <- [Map.put(identity, :request_id, Ecto.UUID.generate()), Map.update!(identity, :replay_generation, &(&1 + 1))] do
         :ok = WebsocketOwnerSession.complete_steering_successor(owner, lane, stale, {:error, :stale_completion})
@@ -71,7 +75,8 @@ defmodule CodexPooler.Gateway.Transports.NativeSteeringDrainWitnessTest do
       assert_receive {^done, :done_held}, @budget
       state = :sys.get_state(owner)
       assert is_nil(state.active_turn)
-      assert Repo.get!(Request, identity.request_id).status == "failed"
+      assert %{status: "failed", usage_status: "usage_unknown"} = Repo.get!(Request, identity.request_id)
+      assert [%{usage_status: "usage_unknown"}] = Repo.all(from entry in LedgerEntry, where: entry.request_id == ^identity.request_id and entry.entry_kind == "settlement")
       :ok = WebsocketOwnerSession.complete_steering_successor(owner, lane, identity, {:error, :duplicate_completion})
       send(worker, {cutoff, :release})
       summary = Task.await(drain, @budget)
@@ -79,15 +84,155 @@ defmodule CodexPooler.Gateway.Transports.NativeSteeringDrainWitnessTest do
       assert :sys.get_state(coordinator).active_drain == nil
       assert_receive {^summary_probe, :summary_seen}, @budget
       refute_received {^summary_probe, :summary_seen}
+      assert_receive {:DOWN, ^upstream_monitor, :process, _upstream, _reason}, @budget
+      assert Process.alive?(lane)
+      refute_received {:DOWN, ^lane_monitor, :process, ^lane, _reason}
       send(client.socket, {done, :release})
       {client, trailing_types} = receive_close!(client)
       assert trailing_types == ["response.output_text.delta"]
       Mint.HTTP.close(client.conn)
       :ok = WebsocketCleanupFence.await_listener_socket_cleanup!(client.socket)
+      assert_receive {:DOWN, ^lane_monitor, :process, ^lane, _reason}, @budget
       assert Map.take(summary, [:owners_seen, :owners_drained, :turns_completed, :turns_aborted, :owners_failed]) == %{owners_seen: 1, owners_drained: 1, turns_completed: 0, turns_aborted: 1, owners_failed: 0}
       assert length(FakeUpstream.websocket_steers(fixture.upstream)) == 1
       assert FakeUpstream.physical_counts(fixture.upstream).websocket_generation == 1
       assert FakeUpstream.physical_counts(fixture.upstream).http_generation == 0
+    end
+  end
+
+  test "a no-terminal successor accounting failure does not release its producer before delivery", %{peer_node: peer_node} do
+    log = ExUnit.CaptureLog.capture_log(fn -> assert_uncommitted_successor_fenced!(peer_node) end)
+    assert log =~ "gateway accounting finalization failed"
+    assert log =~ "reason=upstream_reference_mismatch"
+  end
+
+  defp assert_uncommitted_successor_fenced!(peer_node) do
+    fixture = fixture!("full", :local, peer_node)
+    {client, handler} = open_successor!(fixture)
+    state = socket_connection_state!(client.socket)
+    identity = state.native_response_steering_active.identity
+    lane = state.native_response_steering
+    upstream = :sys.get_state(state.websocket_owner_pid).upstream_pid
+    upstream_monitor = Process.monitor(upstream)
+    attempt = Repo.get!(Attempt, identity.attempt_id)
+    fallback = CodexPooler.PoolerFixtures.active_upstream_assignment_fixture(fixture.setup.pool)
+    on_exit(fn -> Repo.get!(Attempt, attempt.id) |> Ecto.Changeset.change(upstream_identity_id: attempt.upstream_identity_id) |> Repo.update!() end)
+    attempt |> Ecto.Changeset.change(upstream_identity_id: fallback.identity.id) |> Repo.update!()
+    done = hold_done!(client.socket, identity, true)
+    trace_delivery_reply!(lane)
+    hold = fixture.hold
+    :ok = FakeUpstream.release_frame(fixture.upstream, hold)
+    assert_receive {:fake_upstream_frame_barrier, 4, ^handler, ^hold}, @budget
+    :ok = FakeUpstream.release_frame(fixture.upstream, hold)
+    send(handler, :fake_upstream_abrupt_close_websocket)
+    assert_receive {^done, :done_held}, @budget
+    assert_receive {^done, :result, {:error, %{code: "gateway_accounting_failed"}}}, @budget
+    assert_lane_call!(lane, NativeResponseSteering, :await_delivery, 2)
+    refute_received {:trace, ^lane, :call, {GenServer, :reply, 2}}
+    assert Repo.get!(Request, identity.request_id).status == "in_progress"
+    refute Repo.exists?(from entry in LedgerEntry, where: entry.request_id == ^identity.request_id and entry.entry_kind == "settlement")
+    assert Process.alive?(upstream)
+    refute_received {:DOWN, ^upstream_monitor, :process, ^upstream, _reason}
+    Repo.get!(Attempt, attempt.id) |> Ecto.Changeset.change(upstream_identity_id: attempt.upstream_identity_id) |> Repo.update!()
+    send(client.socket, {done, :release})
+    assert_lane_call!(lane, NativeResponseSteering, :reply_after_delivery, 2)
+    {client, _trailing} = receive_close!(client)
+    Mint.HTTP.close(client.conn)
+    :ok = WebsocketCleanupFence.await_listener_socket_cleanup!(client.socket)
+    drain_owner_after_delivery!(state.websocket_owner_pid, upstream)
+    assert_receive {:DOWN, ^upstream_monitor, :process, ^upstream, :normal}, @budget
+  end
+
+  defp trace_delivery_reply!(lane) do
+    patterns = [{NativeResponseSteering, :await_delivery, 2}, {NativeResponseSteering, :reply_after_delivery, 2}, {GenServer, :reply, 2}]
+    trace_lane_calls!(lane, patterns)
+  end
+
+  defp trace_lane_calls!(lane, patterns) do
+    on_exit(fn ->
+      Enum.each(patterns, &:erlang.trace_pattern(&1, false, [:local]))
+      if Process.alive?(lane), do: :erlang.trace(lane, false, [:call])
+    end)
+
+    :sys.replace_state(lane, fn state ->
+      Process.flag(:sensitive, false)
+      state
+    end)
+
+    Enum.each(patterns, &:erlang.trace_pattern(&1, true, [:local]))
+    1 = :erlang.trace(lane, true, [:call, :arity, {:tracer, self()}])
+  end
+
+  defp assert_lane_call!(lane, module, function, arity) do
+    receive do
+      {:trace, ^lane, :call, {^module, ^function, ^arity}} -> :ok
+    after
+      @budget -> flunk("expected lane call #{inspect(module)}.#{function}/#{arity} missing")
+    end
+  end
+
+  test "foreign receipt token and context cannot end the exact successor delivery wait", %{peer_node: peer_node} do
+    fixture = fixture!("full", :local, peer_node)
+    {client, handler} = open_successor!(fixture)
+    state = socket_connection_state!(client.socket)
+    identity = state.native_response_steering_active.identity
+    lane = state.native_response_steering
+    token = :sys.get_state(lane).delivery_receipt_token
+    upstream = :sys.get_state(state.websocket_owner_pid).upstream_pid
+    lane_monitor = Process.monitor(lane)
+    done = hold_done!(client.socket, identity)
+    trace_lane_calls!(lane, [{NativeResponseSteering, :receive_delivery, 3}, {DeliveryReceiptHandoff, :settle, 1}])
+    1 = :erlang.trace_pattern({NativeResponseSteering, :receive_delivery, 3}, [{[:_, :_, :"$1"], [], [{:message, :"$1"}]}], [:local])
+    hold = fixture.hold
+    :ok = FakeUpstream.release_frame(fixture.upstream, hold)
+    assert_receive {:fake_upstream_frame_barrier, 4, ^handler, ^hold}, @budget
+    :ok = FakeUpstream.release_frame(fixture.upstream, hold)
+    send(handler, :fake_upstream_abrupt_close_websocket)
+    assert_receive {^done, :done_held}, @budget
+    deadline = assert_delivery_deadline!(lane)
+    envelope = %{registry: ActivityRegistry, token: token, context: identity, receipt: %{}}
+
+    for foreign <- [Map.put(envelope, :token, make_ref()), put_in(envelope.context.attempt_id, Ecto.UUID.generate()), put_in(envelope.context.replay_generation, identity.replay_generation + 1)] do
+      :ok = NativeResponseSteering.delivery_complete(lane, identity, :delivered, foreign)
+      assert assert_delivery_deadline!(lane) == deadline
+      refute_received {:trace, ^lane, :call, {DeliveryReceiptHandoff, :settle, 1}}
+      assert %{finished?: false, envelope: nil} = :sys.get_state(ActivityRegistry).delivery_receipts[token]
+    end
+
+    :ok = NativeResponseSteering.delivery_complete(lane, identity, :delivered, envelope)
+    assert_lane_call!(lane, DeliveryReceiptHandoff, :settle, 1)
+    assert assert_delivery_deadline!(lane) == deadline
+    assert %{finished?: false, envelope: nil} = :sys.get_state(ActivityRegistry).delivery_receipts[token]
+    refute Map.has_key?(Repo.get!(Attempt, identity.attempt_id).response_metadata, "downstream_delivery")
+
+    send(client.socket, {done, :release})
+    assert_lane_call!(lane, DeliveryReceiptHandoff, :settle, 1)
+    {client, _trailing} = receive_close!(client)
+    Mint.HTTP.close(client.conn)
+    :ok = WebsocketCleanupFence.await_listener_socket_cleanup!(client.socket)
+    assert_receive {:DOWN, ^lane_monitor, :process, ^lane, _reason}, @budget
+    assert %{"downstream_delivery" => %{"outcome" => "aborted"}} = Repo.get!(Attempt, identity.attempt_id).response_metadata
+    drain_owner_after_delivery!(state.websocket_owner_pid, upstream)
+  end
+
+  defp drain_owner_after_delivery!(owner, upstream) do
+    owner_monitor = Process.monitor(owner)
+    upstream_monitor = Process.monitor(upstream)
+    ref = make_ref()
+    clock = fn -> System.monotonic_time(:millisecond) end
+    assert {:ok, %{active_turn?: false}} = WebsocketOwnerSession.local_drain_status(owner, %{at: clock.() + @budget, now_ms: clock, observer_ref: ref})
+    assert_receive {:websocket_owner_drain_observing, ^owner, ^ref}, @budget
+    assert :ok = WebsocketOwnerSession.drain_owner(owner)
+    assert_receive {:websocket_owner_drain_finished, ^owner, ^ref, :ok}, @budget
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :normal}, @budget
+    assert_receive {:DOWN, ^upstream_monitor, :process, ^upstream, :normal}, @budget
+  end
+
+  defp assert_delivery_deadline!(lane) do
+    receive do
+      {:trace, ^lane, :call, {NativeResponseSteering, :receive_delivery, 3}, deadline} when is_integer(deadline) -> deadline
+    after
+      @budget -> flunk("expected exact lane delivery deadline marker missing")
     end
   end
 
@@ -324,7 +469,7 @@ defmodule CodexPooler.Gateway.Transports.NativeSteeringDrainWitnessTest do
 
   def probe(probe, _event, _name), do: probe
 
-  defp hold_done!(socket, identity) do
+  defp hold_done!(socket, identity, include_result? \\ false) do
     ref = make_ref()
 
     on_exit(fn ->
@@ -337,13 +482,14 @@ defmodule CodexPooler.Gateway.Transports.NativeSteeringDrainWitnessTest do
       end
     end)
 
-    :ok = :sys.install(socket, {ref, &__MODULE__.hold_done/3, %{ref: ref, identity: identity, parent: self()}})
+    :ok = :sys.install(socket, {ref, &__MODULE__.hold_done/3, %{ref: ref, identity: identity, parent: self(), include_result?: include_result?}})
     ref
   end
 
   @doc false
-  def hold_done(%{identity: identity, ref: ref, parent: parent}, {:in, {:native_response_steering_done, _lane, identity, _result}}, _name) do
+  def hold_done(%{identity: identity, ref: ref, parent: parent, include_result?: include_result?}, {:in, {:native_response_steering_done, _lane, identity, result}}, _name) do
     send(parent, {ref, :done_held})
+    if include_result?, do: send(parent, {ref, :result, result})
 
     receive do
       {^ref, :release} -> :done

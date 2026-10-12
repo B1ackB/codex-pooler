@@ -163,7 +163,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketLocalCompactionTest do
     first = prewarm!(first, turn)
     {first, opener} = send_turn!(first, opener_frame(turn))
     assert %{"type" => "response.completed", "response" => %{"id" => "resp_local_compaction_opener"}} = List.last(opener)
-    assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @detection_timeout_ms
+    assert_request_finalized!(first, "succeeded")
 
     second = connect!(port, setup, turn, "compaction")
     steered = frame(turn, "turn", 0, [user_message("synthetic steered input")], %{"previous_response_id" => "resp_local_compaction_opener"})
@@ -173,13 +173,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketLocalCompactionTest do
     continuation = frame(turn, "turn", 0, [tool_result], %{"previous_response_id" => "resp_local_compaction_opener"})
     {second, continuation_events} = send_turn!(second, continuation)
     assert [native_previous_response_retry_event()] == continuation_events
-    assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "failed"}}}, @detection_timeout_ms
+    assert_request_finalized!(second, "failed")
     drop!(second)
 
     resend = frame(turn, "turn", 0, history(turn) ++ [tool_call_item(), tool_result], %{})
     {first, resent} = send_turn!(first, resend)
     assert %{"type" => "response.completed", "response" => %{"id" => "resp_local_compaction_resend"}} = List.last(resent)
-    assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @detection_timeout_ms
+    assert_request_finalized!(first, "succeeded")
 
     assert [_opener, _resend] = FakeUpstream.requests(upstream)
     assert FakeUpstream.websocket_connection_count(upstream) == 2
@@ -196,7 +196,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketLocalCompactionTest do
     first = prewarm!(first, turn)
     {first, opener} = send_turn!(first, opener_frame(turn))
     assert %{"type" => "response.completed"} = List.last(opener)
-    assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @detection_timeout_ms
+    assert_request_finalized!(first, "succeeded")
     binding = owner_binding(first, owner_reader)
 
     # The client's summarization request, on a new websocket. While the
@@ -210,7 +210,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketLocalCompactionTest do
     {second, summary} = receive_turn!(second)
     assert_receive {:fake_upstream_frame_barrier, 3, _handler, ^summary_hold}, @detection_timeout_ms
     assert %{"type" => "response.completed", "response" => %{"id" => "resp_local_compaction_summary"}} = List.last(summary)
-    assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @detection_timeout_ms
+    assert_request_finalized!(second, "succeeded")
 
     # The client drops the compaction's session, and its websocket with it:
     # nothing of that reaches the turn's socket.
@@ -221,7 +221,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketLocalCompactionTest do
     # The turn resumes on its first websocket, in the next context window.
     {first, resumed} = send_turn!(first, resumed_frame(turn))
     assert %{"type" => "response.completed", "response" => %{"id" => "resp_local_compaction_resumed"}} = List.last(resumed)
-    assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @detection_timeout_ms
+    assert_request_finalized!(first, "succeeded")
 
     # One row per request, each served once in the Pool's mode: the opener
     # under the turn's claim, the summarization request under a compaction
@@ -315,10 +315,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketLocalCompactionTest do
   defp expected_claim_classes(:same_turn), do: ["codex-turn", "codex-request", "codex-resume", "codex-request", "codex-resume"]
   defp expected_claim_classes(:next_turn), do: ["codex-turn", "codex-request", "codex-resume", "codex-turn", "codex-request", "codex-resume"]
 
+  defp assert_request_finalized!(client, status) do
+    request_id = Repo.one!(from request in Request, where: request.pool_id == ^client.pool_id and request.id not in ^client.prior_request_ids, select: request.id)
+    assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"request_id" => ^request_id, "status" => ^status}}}, @detection_timeout_ms
+  end
+
   defp serve_turn!(client, frame, response_id) do
     {client, events} = send_turn!(client, frame)
     assert %{"type" => "response.completed", "response" => %{"id" => ^response_id}} = List.last(events)
-    assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @detection_timeout_ms
+    assert_request_finalized!(client, "succeeded")
     client
   end
 
@@ -484,7 +489,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketLocalCompactionTest do
 
     {conn, websocket, ref, _response_headers} = public_websocket_connect_with_request_headers!(port, setup, turn.thread, @turn_path, headers)
     socket = WebsocketCleanupFence.await_new_listener_socket!(before)
-    %{conn: conn, websocket: websocket, ref: ref, socket: socket}
+    %{conn: conn, websocket: websocket, ref: ref, socket: socket, pool_id: setup.pool.id}
   end
 
   defp drop!(client) do
@@ -628,6 +633,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketLocalCompactionTest do
   defp send_turn!(client, frame), do: client |> send_frame!(frame) |> receive_turn!()
 
   defp send_frame!(client, frame) do
+    prior_request_ids = Repo.all(from request in Request, where: request.pool_id == ^client.pool_id, select: request.id)
+    client = Map.put(client, :prior_request_ids, prior_request_ids)
     {conn, websocket} = public_websocket_send_text!(client.conn, client.websocket, client.ref, frame)
     %{client | conn: conn, websocket: websocket}
   end

@@ -630,7 +630,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.MultiNodeP
     assert [request] = request_logs(setup.pool.id)
     assert request.status == "failed"
     assert request.transport == "http_sse"
-    rows = assert_forwarding_cardinality!(request, nil, "failed")
+    rows = assert_forwarding_cardinality!(request, nil, "failed", "interrupted")
     assert_no_markers_persisted!(rows, setup.pool.id, [marker])
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.transport == "websocket"

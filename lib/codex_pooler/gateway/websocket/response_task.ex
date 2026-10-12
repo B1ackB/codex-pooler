@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
 
   alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace
+  alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
   alias CodexPooler.Platform.ExecutionIdentity
   alias CodexPooler.Platform.ExecutionRegistry
 
@@ -88,7 +89,7 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
       end
 
     run_before_local_completion_handoff(Keyword.get(opts, :before_local_completion_handoff))
-    complete_local_owner(parent, result)
+    complete_local_owner(parent, result, registry)
   end
 
   @spec acknowledge_delivery(pid(), activity_token()) :: :ok
@@ -248,7 +249,8 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
 
   defp complete_local_owner(
          parent,
-         {:socket_response_result, :owner_completion_pending, :ok} = result
+         {:socket_response_result, :owner_completion_pending, :ok} = result,
+         registry
        ) do
     token = make_ref()
     # No registry entry tracks this task, so a socket that dies without
@@ -257,7 +259,22 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
     send(parent, {:websocket_response_activity, self(), token})
     send(parent, {:codex_response_done, self(), result})
 
+    complete_local_owner_delivery(parent, parent_monitor, token, registry)
+  end
+
+  defp complete_local_owner(parent, result, _registry),
+    do: send(parent, {:codex_response_done, self(), result})
+
+  defp complete_local_owner_delivery(parent, parent_monitor, token, registry) do
     receive do
+      {:websocket_response_delivery_ack, ^token, delivery, envelope} when delivery in [:completed, :aborted, :delivered] ->
+        case DeliveryReceiptHandoff.settle(envelope) do
+          {:error, :stale_delivery} -> :ok
+          result -> send(self(), {:websocket_response_delivery_ack, token, if(result == :ok and delivery != :aborted, do: :completed, else: :aborted)})
+        end
+
+        complete_local_owner_delivery(parent, parent_monitor, token, registry)
+
       {:websocket_response_delivery_ack, ^token, :completed} ->
         Process.demonitor(parent_monitor, [:flush])
         complete_delivered_execution()
@@ -274,12 +291,10 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
         complete_delivered_execution()
 
       {:DOWN, ^parent_monitor, :process, ^parent, _reason} ->
+        _result = DeliveryReceiptHandoff.settle_pending(name: registry)
         :ok
     end
   end
-
-  defp complete_local_owner(parent, result),
-    do: send(parent, {:codex_response_done, self(), result})
 
   # The socket acknowledged that this task's result reached the client, so
   # the execution the task carried is retired as `completed` in every
@@ -365,13 +380,7 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
     # settles the cancellation as undelivered instead of parking this watcher.
     parent_monitor = Process.monitor(parent)
 
-    delivery =
-      receive do
-        {:websocket_response_delivery_ack, ^token, :completed} -> :completed
-        {:websocket_response_delivery_ack, ^token, :aborted} -> :aborted
-        {:websocket_response_delivery_ack, ^token} -> :aborted
-        {:DOWN, ^parent_monitor, :process, ^parent, _reason} -> :aborted
-      end
+    delivery = await_cancellation_delivery(parent, parent_monitor, token, registry)
 
     Process.demonitor(parent_monitor, [:flush])
 
@@ -389,6 +398,29 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
           kill_coordinator?,
           before_cancelled_coordinator_termination
         )
+    end
+  end
+
+  defp await_cancellation_delivery(parent, parent_monitor, token, registry) do
+    receive do
+      {:websocket_response_delivery_ack, ^token, outcome, envelope} when outcome in [:completed, :aborted, :delivered] ->
+        case DeliveryReceiptHandoff.settle(envelope) do
+          {:error, :stale_delivery} -> await_cancellation_delivery(parent, parent_monitor, token, registry)
+          result -> if result == :ok and outcome != :aborted, do: :completed, else: :aborted
+        end
+
+      {:websocket_response_delivery_ack, ^token, :completed} ->
+        :completed
+
+      {:websocket_response_delivery_ack, ^token, :aborted} ->
+        :aborted
+
+      {:websocket_response_delivery_ack, ^token} ->
+        :aborted
+
+      {:DOWN, ^parent_monitor, :process, ^parent, _reason} ->
+        _result = DeliveryReceiptHandoff.settle_pending(name: registry)
+        :aborted
     end
   end
 
@@ -423,6 +455,12 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
     :ok
   end
 
+  defp complete_receipt_delivery(token, delivery, result, registry) do
+    delivery = if result == :ok and delivery != :aborted, do: :completed, else: :aborted
+    ActivityRegistry.complete(token, delivery, name: registry)
+    if delivery == :completed, do: complete_delivered_execution(), else: :ok
+  end
+
   # The socket acknowledges delivery from its callback loop or terminate/2. A
   # socket that dies without running either (a handler crash or a brutal
   # shutdown kill) would leave this task parked with its activity still live,
@@ -437,6 +475,12 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
 
   defp await_delivery(parent, parent_monitor, token, registry, cancel_callback, outcome) do
     receive do
+      {:websocket_response_delivery_ack, ^token, delivery, envelope} when delivery in [:completed, :aborted, :delivered] ->
+        case DeliveryReceiptHandoff.settle(envelope) do
+          {:error, :stale_delivery} -> await_delivery(parent, parent_monitor, token, registry, cancel_callback, outcome)
+          result -> complete_receipt_delivery(token, delivery, result, registry)
+        end
+
       {:websocket_response_delivery_ack, ^token, :completed} ->
         ActivityRegistry.complete(token, :completed, name: registry)
         complete_delivered_execution()
@@ -455,6 +499,7 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
         await_delivery(parent, parent_monitor, token, registry, cancel_callback, :aborted)
 
       {:DOWN, ^parent_monitor, :process, ^parent, _reason} ->
+        _result = DeliveryReceiptHandoff.settle_pending(name: registry)
         ActivityRegistry.complete(token, :aborted, name: registry)
     end
   end

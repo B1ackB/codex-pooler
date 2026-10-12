@@ -35,6 +35,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   alias CodexPooler.Gateway.Websocket
   alias CodexPooler.Gateway.Websocket.Adapter
   alias CodexPooler.Gateway.Websocket.DeliveryReceipt
+  alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
   alias CodexPooler.Gateway.Websocket.DirectCleanup
   alias CodexPooler.Gateway.Websocket.DownstreamSession
   alias CodexPooler.Gateway.Websocket.NativeCompactionRefusalLog
@@ -579,8 +580,8 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     outcome = native_terminal_delivery_outcome(key, pushed)
     evidence = written_delivery_evidence(key, pushed)
     _recorded = record_downstream_delivery_receipt(identity, evidence, state, outcome)
-    NativeResponseSteering.delivery_complete(lane, identity, outcome)
-    state = Map.delete(state, :native_response_steering_active)
+    acknowledge_legacy_native_delivery(state, lane, identity, outcome)
+    state = state |> Map.delete(:native_response_steering_active) |> Map.update(:receipt_handoffs, %{}, &Map.delete(&1, identity.request_id))
 
     native_response_steering_completion_result(result, pushed, state)
     |> close_if_revoked_idle()
@@ -602,34 +603,21 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     {:stop, :normal, {1011, "native response steering unavailable"}, state}
   end
 
+  defp handle_socket_info({:downstream_receipt_enrolled, task, identity, token}, state) when is_pid(task) and is_reference(token) do
+    {:ok, remember_delivery_handoff(state, task, identity, token)}
+  end
+
   defp handle_socket_info({:direct_request_cleanup, pid, ref, receipt}, state) do
     {:ok, accept_direct_cleanup(state, pid, ref, receipt)}
   end
 
   defp handle_socket_info({:codex_response_done, pid, result}, state) when is_pid(pid) do
-    _trace =
-      NativeCompactionTrace.emit(:finalization_finished, %{
-        pid_role: :response_task,
-        response_task_pid: pid,
-        activity_token: get_in(state, [:response_task_activities, pid]),
-        outcome: response_result_outcome(result)
-      })
-
-    state =
-      state
-      |> mark_response_task_result_ready(pid)
-      |> put_response_task_cleanup_result(pid, result)
-
-    cleanup_receipt = unacknowledged_delivery_cleanup_receipt(state, pid)
-    {completion_source, _response_result} = socket_response_result(result)
-
-    result =
-      pid
-      |> handle_response_done(result, state)
-      |> maybe_schedule_response_delivery(pid, completion_source)
-      |> maybe_record_unacknowledged_delivery(pid, cleanup_receipt)
-
-    close_if_revoked_idle(result)
+    if tracked_response_task?(state, pid) or active_public_turn?(state, pid) or Map.get(state, :websocket_owner_reconnect_turn_pid) == pid do
+      complete_known_response_task(pid, result, state)
+    else
+      acknowledge_retired_response_task(state, pid)
+      {:ok, state}
+    end
   end
 
   defp handle_socket_info({:websocket_response_delivery_complete, pid, token}, state)
@@ -783,6 +771,43 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
 
   defp native_response_steering_failure_close_detail(reason), do: Adapter.close_detail(reason)
 
+  defp acknowledge_retired_response_task(state, pid) do
+    case get_in(state, [:response_task_activities, pid]) do
+      token when is_reference(token) ->
+        _result = ActivityRegistry.acknowledge_retired_delivery(pid, token, name: response_task_activity_registry(state))
+        :ok
+
+      _none ->
+        :ok
+    end
+  end
+
+  defp complete_known_response_task(pid, result, state) do
+    _trace =
+      NativeCompactionTrace.emit(:finalization_finished, %{
+        pid_role: :response_task,
+        response_task_pid: pid,
+        activity_token: get_in(state, [:response_task_activities, pid]),
+        outcome: response_result_outcome(result)
+      })
+
+    state =
+      state
+      |> mark_response_task_result_ready(pid)
+      |> put_response_task_cleanup_result(pid, result)
+
+    cleanup_receipt = unacknowledged_delivery_cleanup_receipt(state, pid)
+    {completion_source, _response_result} = socket_response_result(result)
+
+    result =
+      pid
+      |> handle_response_done(result, state)
+      |> maybe_schedule_response_delivery(pid, completion_source)
+      |> maybe_record_unacknowledged_delivery(pid, cleanup_receipt)
+
+    close_if_revoked_idle(result)
+  end
+
   defp handle_response_done(pid, result, state) do
     case api_key_revocation_disposition(result) do
       {:revoked, disabling_epoch} ->
@@ -856,6 +881,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp terminate_socket(reason, state) do
+    state = absorb_delivery_handoffs(state)
     :ok = record_written_error_frame_receipts(state)
     :ok = confirm_written_delivery_evidence(state)
     :ok = log_downstream_idle_timeout(reason, state)
@@ -886,7 +912,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
         outcome = native_terminal_delivery_outcome(key, entry.evidence)
         evidence = written_delivery_evidence(key, entry.evidence)
         _recorded = record_downstream_delivery_receipt(entry.identity, evidence, state, outcome)
-        NativeResponseSteering.delivery_complete(lane, entry.identity, outcome)
+        acknowledge_legacy_native_delivery(state, lane, entry.identity, outcome)
       end
 
       NativeResponseSteering.cancel(lane, :client_disconnected)
@@ -902,6 +928,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     close_upstream_websocket_session(state)
 
     state = acknowledge_response_task_cleanup(state)
+    remaining_tasks = remaining_tasks |> MapSet.reject(&ActivityRegistry.delivery_settling?(&1, name: response_task_activity_registry(state)))
 
     {remaining_tasks, state} =
       remaining_response_tasks_after_cleanup(state, reason, remaining_tasks)
@@ -1153,8 +1180,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
       case authoritative_delivery_target(state, pid, registry) do
         {:ok, token, ^pid} ->
           outcome = response_task_cleanup_outcome(state, pid, token, pid, registry)
-          ResponseTask.acknowledge_delivery(pid, token, outcome)
-          :ok = record_drained_delivery_receipt(state, pid, outcome)
+          :ok = handoff_response_task_delivery(state, pid, pid, token, outcome, termination_receipt_outcome(state, pid, outcome))
           Map.update(state, :terminate_pending_receipts, MapSet.new(), &MapSet.delete(&1, pid))
 
         _watcher_or_unknown ->
@@ -4972,8 +4998,15 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp clear_downstream_delivery_evidence(state, pid) do
-    Map.update(state, :downstream_delivery_evidence, %{}, &Map.delete(&1, pid))
+    state
+    |> Map.update(:downstream_delivery_evidence, %{}, &Map.delete(&1, pid))
+    |> clear_task_delivery_handoffs(pid)
   end
+
+  defp clear_task_delivery_handoffs(%{receipt_handoffs: handoffs} = state, pid),
+    do: %{state | receipt_handoffs: Map.reject(handoffs, fn {_request, entry} -> entry.task == pid end)}
+
+  defp clear_task_delivery_handoffs(state, _pid), do: state
 
   # Besides the count, the evidence keeps the highest class of frame pushed
   # (`DeliveryReceipt.frame_class/1`): a turn cut after only lifecycle, item or
@@ -5081,6 +5114,21 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     end
   end
 
+  defp remember_delivery_handoff(state, task, identity, token) do
+    state
+    |> Map.put(:receipt_handoff_socket, self())
+    |> Map.update(:receipt_handoffs, %{identity.request_id => %{task: task, identity: identity, token: token}}, &Map.put(&1, identity.request_id, %{task: task, identity: identity, token: token}))
+  end
+
+  defp absorb_delivery_handoffs(state) do
+    receive do
+      {:downstream_receipt_enrolled, task, identity, token} when is_pid(task) and is_reference(token) ->
+        state |> remember_delivery_handoff(task, identity, token) |> absorb_delivery_handoffs()
+    after
+      0 -> state
+    end
+  end
+
   defp record_downstream_delivery_receipt(state, pid, ack_outcome) do
     state
     |> Map.get(:direct_cleanup_receipts, %{})
@@ -5138,19 +5186,47 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   defp pushed_terminal_evidence?(_evidence), do: false
 
   defp record_downstream_delivery_receipt(
-         %{request_id: request_id} = cleanup,
+         %{request_id: _request_id} = cleanup,
          evidence,
          state,
          ack
-       ) do
-    DeliveryReceipt.record(
+       ),
+       do: record_downstream_delivery_receipt(cleanup, evidence, state, ack, :fallback)
+
+  defp record_downstream_delivery_receipt(_cleanup, _evidence, _state, _ack), do: :ok
+
+  defp record_downstream_delivery_receipt(%{request_id: request_id} = cleanup, evidence, state, ack, recipient) do
+    state = resolve_delivery_handoff(state, cleanup)
+
+    {context, receipt} = downstream_delivery_packet(cleanup, evidence, state, ack)
+
+    case Map.get(Map.get(state, :receipt_handoffs, %{}), request_id) do
+      %{token: token, identity: identity} when state.receipt_handoff_socket == self() ->
+        recipient = native_receipt_recipient(state, identity, ack, recipient)
+        result = DeliveryReceiptHandoff.publish(token, context, receipt, recipient, name: response_task_activity_registry(state))
+        if result != :ok, do: Logger.warning("websocket delivery receipt handoff failed reason=unavailable")
+        :ok
+
+      %{token: token} ->
+        _result = DeliveryReceiptHandoff.settle_cleanup(token, context, receipt, name: response_task_activity_registry(state))
+        :ok
+
+      _legacy ->
+        DeliveryReceipt.record(context, receipt)
+    end
+  end
+
+  defp downstream_delivery_packet(%{request_id: request_id} = cleanup, evidence, state, ack) do
+    context =
       %{
         request_id: request_id,
         attempt_id: Map.get(cleanup, :attempt_id),
         replay_generation: Map.get(cleanup, :replay_generation),
         delivery_failure: Map.get(cleanup, :delivery_failure),
         codex_session_id: codex_session_id(state)
-      },
+      }
+
+    receipt =
       %{
         outcome: downstream_delivery_outcome(ack, evidence),
         terminal_class: evidence.terminal_class,
@@ -5161,10 +5237,43 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
       |> Map.merge(pushed_completed_items(evidence))
       |> Map.merge(Map.take(evidence, [:write_failure, :write_failed_at, :incomplete_reason, :end_turn]))
       |> DeliveryReceipt.build()
-    )
+
+    {context, receipt}
   end
 
-  defp record_downstream_delivery_receipt(_cleanup, _evidence, _state, _ack), do: :ok
+  defp downstream_delivery_packet(_cleanup, _evidence, _state, _ack), do: nil
+
+  defp resolve_delivery_handoff(state, cleanup) do
+    identity = Map.take(cleanup, [:request_id, :attempt_id, :replay_generation])
+
+    case ActivityRegistry.delivery_receipt_token(identity, name: response_task_activity_registry(state)) do
+      {:ok, token} -> remember_delivery_handoff(state, get_in(state, [:receipt_handoffs, identity.request_id, :task]) || self(), identity, token)
+      :unknown -> state
+    end
+  end
+
+  defp acknowledge_legacy_native_delivery(state, lane, identity, outcome) do
+    state = resolve_delivery_handoff(state, identity)
+    unless Map.has_key?(Map.get(state, :receipt_handoffs, %{}), identity.request_id), do: NativeResponseSteering.delivery_complete(lane, identity, outcome)
+  end
+
+  defp native_receipt_recipient(%{native_response_steering: lane, native_response_steering_active: %{identity: identity}}, identity, outcome, :fallback),
+    do: {:native, lane, identity, outcome}
+
+  defp native_receipt_recipient(_state, _identity, _outcome, recipient), do: recipient
+
+  defp handoff_response_task_delivery(state, pid, ack_pid, token, outcome, receipt_outcome) do
+    cleanup = get_in(state, [:direct_cleanup_receipts, pid])
+    state = if is_map(cleanup), do: resolve_delivery_handoff(state, cleanup), else: state
+    evidence = written_delivery_evidence(pid, downstream_delivery_evidence(state, pid))
+
+    if is_map(cleanup) and Map.has_key?(Map.get(state, :receipt_handoffs, %{}), cleanup.request_id) do
+      record_downstream_delivery_receipt(cleanup, evidence, state, receipt_outcome, {:response_task, ack_pid, token, outcome})
+    else
+      acknowledge_response_task_delivery(ack_pid, token, outcome)
+      record_downstream_delivery_receipt(state, pid, receipt_outcome)
+    end
+  end
 
   # A digest that could not be derived stays in the list as `nil` and is
   # dropped by the receipt, so the list no longer matches the count.
@@ -5273,8 +5382,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
         ack_pid = Map.get(Map.get(state, :response_task_delivery_recipients, %{}), pid, pid)
         outcome = Map.get(Map.get(state, :response_task_delivery_outcomes, %{}), pid, :delivered)
 
-        :ok = acknowledge_response_task_delivery(ack_pid, token, outcome)
-        :ok = record_downstream_delivery_receipt(state, pid, outcome)
+        :ok = handoff_response_task_delivery(state, pid, ack_pid, token, outcome, outcome)
 
         _trace =
           NativeCompactionTrace.emit(:delivery_finished, %{
@@ -5382,8 +5490,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
 
   defp acknowledge_and_record_termination(state, registry, pid, token, ack_pid) do
     outcome = response_task_cleanup_outcome(state, pid, token, ack_pid, registry)
-    ResponseTask.acknowledge_delivery(ack_pid, token, outcome)
-    record_downstream_delivery_receipt(state, pid, termination_receipt_outcome(state, pid, outcome))
+    handoff_response_task_delivery(state, pid, ack_pid, token, outcome, termination_receipt_outcome(state, pid, outcome))
   end
 
   # A terminating socket acknowledges a task whose result it never saw
@@ -5484,12 +5591,6 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
       {:ok, token, ack_pid} -> {:ok, token, ack_pid, :socket_state}
       :unknown -> :unknown
     end
-  end
-
-  defp record_drained_delivery_receipt(state, pid, outcome) do
-    if MapSet.member?(Map.get(state, :terminate_acknowledged_tasks, MapSet.new()), pid),
-      do: :ok,
-      else: record_downstream_delivery_receipt(state, pid, termination_receipt_outcome(state, pid, outcome))
   end
 
   defp response_task_cleanup_outcome(state, pid, token, pid, registry) do
@@ -6587,13 +6688,24 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   # is durable by then, where it used to be written only after the interrupt
   # (findings#270 row 270-364).
   defp stop_previsible_direct_task(state, pid, context) do
-    case DirectCleanup.grant_upstream_stop(context) do
+    cleanup = get_in(state, [:direct_cleanup_receipts, pid])
+    evidence = written_delivery_evidence(pid, downstream_delivery_evidence(state, pid))
+    packet = downstream_delivery_packet(cleanup, evidence, state, :aborted)
+
+    case DirectCleanup.grant_upstream_stop(context, packet) do
       :busy ->
         cancel_direct_response(state, pid, context)
 
-      :stop ->
-        record_downstream_delivery_receipt(state, pid, :aborted)
-        DirectCleanup.terminate_admission(context, "client_disconnected")
+      {:error, reason} ->
+        {:error, reason}
+
+      {:stop, envelope} ->
+        _result = DeliveryReceiptHandoff.settle_cleanup(envelope.token, envelope.context, envelope.receipt, name: context.registry)
+
+        case DirectCleanup.terminate_admission(context, "client_disconnected") do
+          :none -> cancel_direct_response(state, pid, context)
+          result -> result
+        end
     end
   end
 
@@ -6997,11 +7109,13 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     :exit, _reason -> :ok
   end
 
+  defp unsettled_delivery_token(pid, token, registry), do: if(ActivityRegistry.delivery_settling?(pid, name: registry), do: [], else: [token])
+
   defp do_await_response_task_registry_cleanup(owned_tasks, registry, deadline) do
     active =
       Enum.flat_map(owned_tasks, fn pid ->
         case ActivityRegistry.delivery_target(pid, name: registry) do
-          {:ok, token, _ack_pid, _status} -> [token]
+          {:ok, token, _ack_pid, _status} -> unsettled_delivery_token(pid, token, registry)
           :unknown -> []
         end
       end)

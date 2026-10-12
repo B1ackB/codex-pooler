@@ -34,7 +34,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexContentFilterRetryTest do
       original = payload(setup, thread, native_text_input("synthetic delayed receipt"), 0)
       lock_key = System.unique_integer([:positive])
       trigger = "cf_receipt_#{lock_key}"
-      Repo.query!("CREATE FUNCTION #{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.response_metadata::jsonb ? 'downstream_delivery' AND OLD.response_metadata::jsonb ? 'native_content_filter_terminal' AND EXISTS (SELECT 1 FROM requests WHERE id = NEW.request_id AND pool_id = '#{setup.pool.id}'::uuid) THEN PERFORM pg_advisory_xact_lock(#{lock_key}); END IF; RETURN NEW; END $$")
+      # The writer holds the Request lock at this gate. Expire it in that same
+      # transaction only after the retry is observed waiting for the writer.
+      Repo.query!("CREATE FUNCTION #{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.response_metadata::jsonb ? 'downstream_delivery' AND OLD.response_metadata::jsonb ? 'native_content_filter_terminal' AND EXISTS (SELECT 1 FROM requests WHERE id = NEW.request_id AND pool_id = '#{setup.pool.id}'::uuid) THEN PERFORM pg_advisory_xact_lock(#{lock_key}); IF #{context.expires?} THEN UPDATE requests SET completed_at = clock_timestamp() - interval '31 seconds' WHERE id = NEW.request_id; END IF; END IF; RETURN NEW; END $$")
       Repo.query!("CREATE TRIGGER #{trigger} BEFORE UPDATE OF response_metadata ON attempts FOR EACH ROW EXECUTE FUNCTION #{trigger}()")
 
       on_exit(fn ->
@@ -64,9 +66,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexContentFilterRetryTest do
       {conn, _terminal} = read_http_terminal(conn, reference, "")
       first = await_latest_settled(setup, System.monotonic_time(:millisecond) + @budget)
 
-      if context.expires? do
-        Repo.query!("UPDATE requests SET completed_at = clock_timestamp() - interval '29 seconds' WHERE id = $1", [Ecto.UUID.dump!(first.id)])
-      end
+      refute retry_expired?(first.id)
 
       attempt = Repo.get_by!(Attempt, request_id: first.id)
       assert attempt.response_metadata["native_content_filter_terminal"]["reason"] == "content_filter"
@@ -77,15 +77,20 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexContentFilterRetryTest do
       contender = Task.async(fn -> Req.post!("http://127.0.0.1:#{port}#{@path}", headers: headers, json: successor, retry: false, receive_timeout: @budget).status end)
 
       try do
-        retry_backend = await_relation_waiter(writer_backend, "attempts", System.monotonic_time(:millisecond) + @budget)
+        # Receipt reconciliation and retry both lock the session before the attempt.
+        retry_backend = await_relation_waiter(writer_backend, "codex_sessions", System.monotonic_time(:millisecond) + @budget)
         assert length(Enum.uniq([holder_backend, writer_backend, retry_backend])) == 3
         assert FakeUpstream.count(upstream) == 1
         assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 1
-        if context.expires?, do: await_retry_expired(first.id, System.monotonic_time(:millisecond) + @budget)
+        refute retry_expired?(first.id)
+        refute Repo.get_by!(Attempt, request_id: first.id).response_metadata["downstream_delivery"]
         send(holder.pid, :release)
         assert {:ok, :ok} = Task.await(holder, @budget)
         assert Task.await(contender, @budget) == if(context.expires?, do: 409, else: 200)
         assert FakeUpstream.count(upstream) == if(context.expires?, do: 1, else: 2)
+        assert retry_expired?(first.id) == context.expires?
+        assert Repo.get_by!(Attempt, request_id: first.id).response_metadata["downstream_delivery"]["outcome"] == "delivered"
+        assert Repo.aggregate(from(entry in LedgerEntry, where: entry.request_id == ^first.id and entry.entry_kind == "settlement"), :count) == 1
       after
         send(holder.pid, :release)
         Task.shutdown(holder, :brutal_kill)
@@ -95,20 +100,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexContentFilterRetryTest do
     end
   end
 
-  defp await_retry_expired(request_id, deadline) do
+  defp retry_expired?(request_id) do
     %{rows: [[expired?]]} = Repo.query!("SELECT clock_timestamp() > completed_at + interval '30 seconds' FROM requests WHERE id = $1", [Ecto.UUID.dump!(request_id)])
-
-    cond do
-      expired? ->
-        :ok
-
-      System.monotonic_time(:millisecond) > deadline ->
-        flunk("retry window did not expire")
-
-      true ->
-        Process.sleep(10)
-        await_retry_expired(request_id, deadline)
-    end
+    expired?
   end
 
   defp read_http_terminal(conn, reference, acc) do

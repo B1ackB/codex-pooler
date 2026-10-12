@@ -6,6 +6,7 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanup do
   alias CodexPooler.Gateway.Runtime.Finalization.Interruption
   alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
+  alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
   alias CodexPooler.Platform.ExecutionRegistry
 
   @task_receipt_key {__MODULE__, :task_receipt}
@@ -116,6 +117,11 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanup do
           replay_generation: attempt.replay_generation
         })
 
+      case DeliveryReceiptHandoff.enroll(context.parent, receipt, name: context.registry) do
+        {:ok, _token} -> :ok
+        {:error, reason} -> exit({:shutdown, reason})
+      end
+
       remember_task_receipt(context, receipt)
       ActivityRegistry.bind_direct_cleanup(context, receipt)
     end
@@ -189,8 +195,12 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanup do
   receipt, which must exist by the time a resend can be claimed, as soon as
   the executor's terminal proof landed (findings#270 row 270-364).
   """
-  @spec grant_upstream_stop(t()) :: :stop | :busy
+  @spec grant_upstream_stop(t()) :: :stop | :busy | {:error, :delivery_identity_unavailable}
   def grant_upstream_stop(context), do: ActivityRegistry.stop_direct_upstream_wait(context)
+
+  @doc false
+  @spec grant_upstream_stop(t(), {map(), map()} | nil) :: {:stop, DeliveryReceiptHandoff.envelope()} | :busy | {:error, atom()}
+  def grant_upstream_stop(context, packet), do: ActivityRegistry.stop_direct_upstream_wait(context, packet)
 
   @doc """
   Runs the direct task's upstream request inside the span `grant_upstream_stop/1`
@@ -207,6 +217,7 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanup do
       result
     else
       {:error, :stopped} -> exit_stopped()
+      {:error, {:stopped, _receipt_failure}} -> exit_stopped()
     end
   end
 

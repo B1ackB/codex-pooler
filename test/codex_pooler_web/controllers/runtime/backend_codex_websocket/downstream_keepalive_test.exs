@@ -17,21 +17,30 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.DownstreamKeepaliveTest d
   # shorter than that setup on a shared CI node (Drone 1809).
   use CodexPoolerWeb.ConnCase, async: false
 
+  import Ecto.Query
   import ExUnit.CaptureLog
-  import CodexPoolerWeb.Runtime.BackendCodexTestSupport, only: [gateway_setup: 1, start_upstream: 1]
+  import CodexPoolerWeb.Runtime.BackendCodexTestSupport, only: [gateway_setup: 1, register_unboxed_pool_cleanup!: 1, start_upstream: 1]
   import CodexPoolerWeb.Runtime.DownstreamKeepaliveScenario
 
-  alias CodexPooler.Accounting.RequestOutcome
+  alias CodexPooler.Accounting.{LedgerEntry, Request, RequestOutcome}
+  alias CodexPooler.Events
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Repo
   alias CodexPoolerWeb.Runtime.BackendCodexTestSupport
   alias CodexPoolerWeb.WebsocketConnectionLogger
+  alias Ecto.Adapters.SQL.Sandbox
 
   @moduletag capture_log: true
 
   @idle_timeout_ms 1_000
   @frame_interval_ms 100
 
-  setup %{forwarding: forwarding?} do
+  setup %{forwarding: forwarding?} = context do
+    # request_finalized is published after commit; a shared sandbox rolls its
+    # outer transaction back and cannot exercise this consumer.
+    CodexPooler.DataCase.stop_sandbox(context.sandbox_owner, context.sandbox_settings_cache)
+    on_exit(fn -> Sandbox.mode(Repo, :manual) end)
+    :ok = Sandbox.mode(Repo, :auto)
     put_settings!([websocket_idle_timeout_ms: @idle_timeout_ms], forwarding?)
   end
 
@@ -45,7 +54,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.DownstreamKeepaliveTest d
       # against a 1 s bound.
       deltas = 18
       upstream = start_upstream(FakeUpstream.delayed_sse_stream(stream_events("resp_keepalive_long", deltas), interval_ms: @frame_interval_ms))
-      setup = gateway_setup(upstream)
+      setup = committed_gateway_setup!(upstream)
 
       {turn, log} = with_log(fn -> setup |> start_turn!() |> read_turn!(answer_pings?: true) end)
 
@@ -53,7 +62,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.DownstreamKeepaliveTest d
       assert Enum.count(turn.events, &(&1["type"] == "response.output_text.delta")) == deltas
       assert turn.pings >= 1, "the turn " <> describe_turn(turn)
       assert turn.elapsed_ms >= 2 * @idle_timeout_ms, "the turn " <> describe_turn(turn)
-      request = assert_request_settled!(setup, "succeeded", nil)
+      request = assert_committed_request_settled!(setup, "succeeded", nil)
       refute Map.has_key?(request.request_metadata, "downstream_interruption")
       refute log =~ WebsocketConnectionLogger.downstream_idle_timeout_message()
       assert [%{method: "WEBSOCKET", path: "/backend-api/codex/responses"}] = FakeUpstream.requests(upstream)
@@ -64,13 +73,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.DownstreamKeepaliveTest d
     test "#{topology}: an ordinary peer close retains client cancellation without idle attribution" do
       hold = make_ref()
       upstream = start_upstream(FakeUpstream.strict_sequence([turn_request(FakeUpstream.barrier_websocket_frames(encoded_events("resp_peer_close", 1), notify: self(), release_ref: hold))]))
-      setup = gateway_setup(upstream)
+      setup = committed_gateway_setup!(upstream)
       client = start_turn!(setup)
       assert_receive {:fake_upstream_frame_barrier, 0, _handler, ^hold}, detection_timeout_ms()
       :ok = FakeUpstream.release_frame(upstream, hold)
       {conn, websocket, _frame} = BackendCodexTestSupport.public_websocket_receive_text!(client.conn, client.websocket, client.ref)
       :ok = close_client!(%{client | conn: conn, websocket: websocket})
-      request = assert_request_settled!(setup, "failed", "client_disconnected")
+      request = assert_committed_request_settled!(setup, "failed", "client_disconnected")
       assert RequestOutcome.client_cancelled?(request)
       refute Map.has_key?(request.request_metadata, "downstream_interruption")
       :ok = FakeUpstream.release_remaining_frames(upstream, hold)
@@ -81,14 +90,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.DownstreamKeepaliveTest d
     test "#{topology}: a client that never answers pings is still cut at the idle bound" do
       # Twenty-two frames 100 ms apart: the stream outlasts the 1 s bound.
       upstream = start_upstream(FakeUpstream.delayed_sse_stream(stream_events("resp_keepalive_silent_client", 18), interval_ms: @frame_interval_ms))
-      setup = gateway_setup(upstream)
+      setup = committed_gateway_setup!(upstream)
 
       {turn, log} = with_log(fn -> setup |> start_turn!() |> read_turn!(answer_pings?: false) end)
 
       assert turn.end in [{:close, 1002}, :socket_closed], "the turn " <> describe_turn(turn)
       refute Enum.any?(turn.events, &(&1["type"] in terminal_types()))
       assert turn.pings >= 1, "the turn " <> describe_turn(turn)
-      request = assert_request_settled!(setup, "failed", "client_disconnected")
+      request = assert_committed_request_settled!(setup, "failed", "client_disconnected")
       assert_idle_attribution!(request, "unknown")
       assert log =~ "#{WebsocketConnectionLogger.downstream_idle_timeout_message()} tracked_tasks=1 idle_timeout_ms=#{@idle_timeout_ms}"
       :ok = close_client!(turn.client)
@@ -100,7 +109,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.DownstreamKeepaliveTest d
       hold = make_ref()
       # provenance: synthetic_adversarial
       upstream = start_upstream(FakeUpstream.strict_sequence([turn_request(FakeUpstream.barrier_websocket_frames(encoded_events("resp_keepalive_stalled", 1), notify: self(), release_ref: hold))]))
-      setup = gateway_setup(upstream)
+      setup = committed_gateway_setup!(upstream)
 
       {turn, log} =
         with_log(fn ->
@@ -122,11 +131,25 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.DownstreamKeepaliveTest d
       assert turn.end in [{:close, 1002}, :socket_closed], "the turn " <> describe_turn(turn)
       assert Enum.map(turn.events, & &1["type"]) -- ["codex.response.metadata"] == ["response.created", "response.output_item.added"]
       assert turn.pings <= 2, "the turn " <> describe_turn(turn)
-      request = assert_request_settled!(setup, "failed", "client_disconnected")
+      request = assert_committed_request_settled!(setup, "failed", "client_disconnected")
       assert_idle_attribution!(request, if(turn.pings > 0, do: "pong_observed", else: "unknown"))
       assert log =~ "#{WebsocketConnectionLogger.downstream_idle_timeout_message()} tracked_tasks=1"
       :ok = FakeUpstream.release_remaining_frames(upstream, hold)
       :ok = close_client!(turn.client)
     end
+  end
+
+  defp committed_gateway_setup!(upstream) do
+    setup = gateway_setup(upstream)
+    register_unboxed_pool_cleanup!(setup)
+    setup
+  end
+
+  defp assert_committed_request_settled!(setup, status, last_error_code) do
+    assert_receive {Events, %{reason: "request_reserved", payload: %{"request_id" => request_id}}}, detection_timeout_ms()
+    assert_receive {Events, %{reason: "request_finalized", payload: %{"request_id" => ^request_id, "status" => ^status}}}, detection_timeout_ms()
+    assert [%Request{id: ^request_id, status: ^status, last_error_code: ^last_error_code, transport: "websocket"} = request] = Repo.all(from(request in Request, where: request.pool_id == ^setup.pool.id))
+    assert Repo.aggregate(from(entry in LedgerEntry, where: entry.request_id == ^request_id and entry.entry_kind == "settlement"), :count) == 1
+    request
   end
 end

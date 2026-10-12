@@ -5,6 +5,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ReceiptSettlementDrainTest do
 
   alias CodexPooler.Gateway.Transports.Websocket.{ActivityDrain, ActivityRegistry, RolloutDrain}
   alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport.VirtualDeadline
+  alias CodexPooler.Gateway.Websocket.DeliveryReceipt
+  alias CodexPooler.Gateway.Websocket.DirectCleanup
 
   @detection_ms 5_000
 
@@ -13,6 +15,213 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ReceiptSettlementDrainTest do
     start_supervised!({ActivityRegistry, name: registry})
     supervisor = start_supervised!({Task.Supervisor, []})
     %{registry: registry, supervisor: supervisor, identity: %{request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate(), replay_generation: 0}}
+  end
+
+  test "delivery metadata holds the producer barrier without counting another usage worker or turn", ctx do
+    {:ok, token} = ActivityRegistry.enroll_delivery_receipt(self(), ctx.identity, name: ctx.registry)
+    assert_receive {:downstream_receipt_enrolled, task, identity, ^token}
+    assert task == self() and identity == ctx.identity
+    assert {_epoch, []} = ActivityRegistry.begin_drain(name: ctx.registry)
+    assert %{closed?: false, entries: [], pending_producers: 1} = ActivityRegistry.receipt_cohort(name: ctx.registry)
+    assert ActivityRegistry.activities(name: ctx.registry) == []
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+    assert :ok = ActivityRegistry.publish_delivery_receipt(token, ctx.identity, receipt, {:native, self(), ctx.identity, :aborted}, name: ctx.registry)
+    assert_receive {:"$gen_cast", {:delivery_complete, ^identity, :aborted, envelope}}
+    assert Map.keys(envelope) |> Enum.sort() == [:context, :receipt, :registry, :token]
+    assert :ok = ActivityRegistry.claim_delivery_receipt(token, name: ctx.registry)
+    assert :ok = ActivityRegistry.finish_delivery_receipt(token, :ok, name: ctx.registry)
+    assert %{closed?: true, entries: [], pending_producers: 0, producers_failed?: false} = ActivityRegistry.receipt_cohort(name: ctx.registry)
+  end
+
+  test "delivery handoff rejects a foreign caller and a changed admitted generation", ctx do
+    {:ok, token} = ActivityRegistry.enroll_delivery_receipt(self(), ctx.identity, name: ctx.registry)
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+    assert {:error, :identity_mismatch} = ActivityRegistry.publish_delivery_receipt(token, %{ctx.identity | replay_generation: 1}, receipt, :fallback, name: ctx.registry)
+    caller = Task.async(fn -> ActivityRegistry.publish_delivery_receipt(token, ctx.identity, receipt, :fallback, name: ctx.registry) end)
+    assert Task.await(caller) == {:error, :unknown_delivery}
+    assert :ok = ActivityRegistry.abandon_delivery_receipt(token, name: ctx.registry)
+    assert {_epoch, []} = ActivityRegistry.begin_drain(name: ctx.registry)
+    assert %{closed?: true, producers_failed?: false} = ActivityRegistry.receipt_cohort(name: ctx.registry)
+  end
+
+  test "a receipt failure belongs to its current drain rather than a historical socket", ctx do
+    {:ok, token} = ActivityRegistry.enroll_delivery_receipt(self(), ctx.identity, name: ctx.registry)
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+    :ok = ActivityRegistry.publish_delivery_receipt(token, ctx.identity, receipt, {:native, self(), ctx.identity, :aborted}, name: ctx.registry)
+    assert :ok = ActivityRegistry.finish_delivery_receipt(token, {:error, :attempt_not_found}, name: ctx.registry)
+    {_epoch, []} = ActivityRegistry.begin_drain(name: ctx.registry)
+    assert %{closed?: true, producers_failed?: false} = ActivityRegistry.receipt_cohort(name: ctx.registry)
+  end
+
+  test "force closure aborts its assigned metadata actor without changing counters", ctx do
+    parent = self()
+
+    actor =
+      spawn(fn ->
+        {:ok, token} = ActivityRegistry.enroll_delivery_receipt(parent, ctx.identity, name: ctx.registry)
+        send(parent, {:enrolled_for_cut, token})
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    monitor = Process.monitor(actor)
+    assert_receive {:enrolled_for_cut, token}
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+    {_epoch, []} = ActivityRegistry.begin_drain(name: ctx.registry)
+    :ok = ActivityRegistry.publish_delivery_receipt(token, ctx.identity, receipt, {:native, actor, ctx.identity, :aborted}, name: ctx.registry)
+    assert :ok = ActivityRegistry.force_receipt_cohort(name: ctx.registry)
+    assert_receive {:DOWN, ^monitor, :process, ^actor, :killed}
+    assert %{closed?: true, entries: [], pending_producers: 0, producers_failed?: true} = ActivityRegistry.receipt_cohort(name: ctx.registry)
+    assert {:error, :stale_delivery} = ActivityRegistry.claim_delivery_receipt(token, name: ctx.registry)
+    assert {:error, :owner_drained} = ActivityRegistry.enroll_delivery_receipt(self(), ctx.identity, name: ctx.registry)
+    assert {:error, :unknown_delivery} = ActivityRegistry.publish_delivery_receipt(token, ctx.identity, receipt, :fallback, name: ctx.registry)
+  end
+
+  test "an assigned cleanup obligation survives socket death until its actor finishes", ctx do
+    parent = self()
+
+    socket =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    {:ok, token} = ActivityRegistry.enroll_delivery_receipt(socket, ctx.identity, name: ctx.registry)
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+
+    actor =
+      Task.async(fn ->
+        {:ok, envelope} = ActivityRegistry.take_delivery_cleanup(token, ctx.identity, receipt, name: ctx.registry)
+        send(parent, {:cleanup_assigned, self(), envelope.token})
+
+        receive do
+          :complete ->
+            assert [^envelope] = ActivityRegistry.assigned_delivery_receipts(name: ctx.registry)
+            forged = put_in(envelope.receipt["outcome"], "delivered")
+            assert {:error, :stale_delivery} = ActivityRegistry.claim_delivery_receipt(token, name: ctx.registry, envelope: forged)
+            assert {:ok, remaining_ms} = ActivityRegistry.claim_delivery_receipt(token, name: ctx.registry, envelope: envelope)
+            assert remaining_ms > 0
+        end
+
+        ActivityRegistry.finish_delivery_receipt(token, :ok, name: ctx.registry)
+      end)
+
+    assert_receive {:cleanup_assigned, actor_pid, ^token}
+    assert actor_pid == actor.pid
+    {_epoch, []} = ActivityRegistry.begin_drain(name: ctx.registry)
+    monitor = Process.monitor(socket)
+    send(socket, :stop)
+    assert_receive {:DOWN, ^monitor, :process, ^socket, :normal}
+    assert %{closed?: false, pending_producers: 1} = ActivityRegistry.receipt_cohort(name: ctx.registry)
+    assert {:error, :stale_delivery} = ActivityRegistry.claim_delivery_receipt(token, name: ctx.registry)
+    send(actor.pid, :complete)
+    assert Task.await(actor) == :ok
+    assert %{closed?: true, pending_producers: 0, producers_failed?: false} = ActivityRegistry.receipt_cohort(name: ctx.registry)
+  end
+
+  test "only an explicitly stopped executor shares its cleanup actor's settlement protection", ctx do
+    parent = self()
+
+    task =
+      spawn(fn ->
+        direct = %DirectCleanup{registry: ctx.registry, task: self(), parent: parent, ref: make_ref(), session_id: Ecto.UUID.generate()}
+        {:ok, activity} = ActivityRegistry.register(:direct, self(), name: ctx.registry, direct_cleanup_ref: direct.ref, direct_cleanup_parent: parent)
+        :ok = ActivityRegistry.admit(activity, name: ctx.registry)
+        :ok = ActivityRegistry.begin_direct_cleanup(direct)
+        :ok = ActivityRegistry.enter_direct_upstream_wait(direct)
+        {:ok, token} = ActivityRegistry.enroll_delivery_receipt(parent, ctx.identity, name: ctx.registry)
+        send(parent, {:stop_context, direct, token})
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn -> if Process.alive?(task), do: Process.exit(task, :kill) end)
+    assert_receive {:stop_context, direct, token}
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+
+    cleanup =
+      Task.async(fn ->
+        {:ok, _envelope} = ActivityRegistry.take_delivery_cleanup(token, ctx.identity, receipt, name: ctx.registry)
+        send(parent, :cleanup_has_receipt)
+
+        receive do
+          :complete -> :ok
+        end
+
+        ActivityRegistry.finish_delivery_receipt(token, :ok, name: ctx.registry)
+      end)
+
+    assert_receive :cleanup_has_receipt
+    refute ActivityRegistry.delivery_settling?(task, name: ctx.registry)
+    assert :stop = ActivityRegistry.stop_direct_upstream_wait(direct)
+    assert ActivityRegistry.delivery_settling?(task, name: ctx.registry)
+    send(cleanup.pid, :complete)
+    assert Task.await(cleanup) == :ok
+    refute ActivityRegistry.delivery_settling?(task, name: ctx.registry)
+    send(task, :stop)
+  end
+
+  test "only a privately registered admitted task can bind delivery after draining starts", ctx do
+    parent = self()
+    ref = make_ref()
+
+    actor =
+      spawn(fn ->
+        {:ok, activity} = ActivityRegistry.register(:direct, self(), name: ctx.registry, direct_cleanup_ref: ref, direct_cleanup_parent: parent)
+        :ok = ActivityRegistry.admit(activity, name: ctx.registry)
+        send(parent, :admitted_before_drain)
+
+        receive do
+          :bind -> :ok
+        end
+
+        assert {:error, :owner_drained} = ActivityRegistry.enroll_delivery_receipt(self(), ctx.identity, name: ctx.registry)
+        result = ActivityRegistry.enroll_delivery_receipt(parent, ctx.identity, name: ctx.registry)
+        send(parent, {:bound_during_drain, result})
+
+        receive do
+          :closed -> send(parent, {:binding_after_close, ActivityRegistry.enroll_delivery_receipt(parent, ctx.identity, name: ctx.registry)})
+        end
+      end)
+
+    on_exit(fn -> if Process.alive?(actor), do: Process.exit(actor, :kill) end)
+    assert_receive :admitted_before_drain
+    ActivityRegistry.begin_drain(name: ctx.registry)
+    assert {:error, :owner_drained} = ActivityRegistry.enroll_delivery_receipt(parent, ctx.identity, name: ctx.registry)
+    send(actor, :bind)
+    assert_receive {:bound_during_drain, {:ok, _token}}
+    assert %{closed?: false, pending_producers: 1} = ActivityRegistry.receipt_cohort(name: ctx.registry)
+    :ok = ActivityRegistry.force_receipt_cohort(name: ctx.registry)
+    assert %{closed?: true, producers_failed?: true} = ActivityRegistry.receipt_cohort(name: ctx.registry)
+    send(actor, :closed)
+    assert_receive {:binding_after_close, {:error, :owner_drained}}
+  end
+
+  test "a reused actor retires its completed delivery capability before exposing a successor", ctx do
+    {:ok, token} = ActivityRegistry.enroll_delivery_receipt(self(), ctx.identity, name: ctx.registry)
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+    :ok = ActivityRegistry.publish_delivery_receipt(token, ctx.identity, receipt, {:native, self(), ctx.identity, :aborted}, name: ctx.registry)
+    :ok = ActivityRegistry.finish_delivery_receipt(token, :ok, name: ctx.registry)
+    next_identity = %{ctx.identity | request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate()}
+    assert {:ok, next_token} = ActivityRegistry.enroll_delivery_receipt(self(), next_identity, name: ctx.registry)
+    assert next_token != token
+    assert map_size(:sys.get_state(ctx.registry).delivery_receipts) == 1
+    assert {:error, :unknown_delivery} = ActivityRegistry.publish_delivery_receipt(token, ctx.identity, receipt, :fallback, name: ctx.registry)
+    assert {:ok, ^next_token} = ActivityRegistry.delivery_receipt_token(next_identity, name: ctx.registry)
+    assert :ok = ActivityRegistry.abandon_delivery_receipt(next_token, name: ctx.registry)
+  end
+
+  test "failed receipt completion retains only a fixed bounded disposition", ctx do
+    {:ok, token} = ActivityRegistry.enroll_delivery_receipt(self(), ctx.identity, name: ctx.registry)
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+    :ok = ActivityRegistry.publish_delivery_receipt(token, ctx.identity, receipt, {:native, self(), ctx.identity, :aborted}, name: ctx.registry)
+    :ok = ActivityRegistry.finish_delivery_receipt(token, {:error, RuntimeError.exception("synthetic database failure")}, name: ctx.registry)
+    assert :sys.get_state(ctx.registry).delivery_receipts[token].result == {:error, :receipt_not_persisted}
   end
 
   test "an initially empty receipt cohort waits for the accepted producer handoff", ctx do

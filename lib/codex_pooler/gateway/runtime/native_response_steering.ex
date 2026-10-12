@@ -15,6 +15,7 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
   alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
   alias CodexPooler.Gateway.Transports.Websocket.{ActivityRegistry, DiagnosticTaxonomy, ResponseSteer, UpstreamWebsocketSession, WebsocketOwnerSession, WebsocketRequestCallbacks}
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Status
+  alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
   alias CodexPooler.Gateway.Websocket.DirectCleanup
   alias CodexPooler.Platform.ExecutionIdentity
 
@@ -83,6 +84,9 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
 
   @spec delivery_complete(pid(), identity(), delivery_outcome()) :: :ok
   def delivery_complete(lane, identity, outcome) when outcome in [:delivered, :aborted], do: GenServer.cast(lane, {:delivery_complete, identity, outcome})
+
+  @spec delivery_complete(pid(), identity(), delivery_outcome(), DeliveryReceiptHandoff.envelope()) :: :ok
+  def delivery_complete(lane, identity, outcome, envelope) when outcome in [:delivered, :aborted], do: GenServer.cast(lane, {:delivery_complete, identity, outcome, envelope})
 
   @spec closed(pid() | nil, request_identity(), term()) :: :ok
   def closed(nil, _identity, _reason), do: :ok
@@ -167,7 +171,7 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
     {:reply, :ok, state}
   end
 
-  def handle_call({:terminal, request_id, finalization}, _from, state) do
+  def handle_call({:terminal, request_id, finalization}, from, state) do
     cond do
       state.active && state.active.reserved.request.id == request_id ->
         context = state.active
@@ -177,9 +181,10 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
         result = put_acknowledgement(result, acknowledgement)
         state = retain_settlement(%{state | context: context, active: nil, original_result: result}, result, finalization)
         finish_delivery(state, identity(context), result)
+        producer_replied? = reply_settled_failed_producer(from, finalization, result, acknowledgement)
         {delivery, state} = await_delivery(state, identity(context))
         state = state |> complete_activity(delivery) |> fence_delivery(delivery)
-        reply_after_delivery({:ok, result, acknowledgement}, state)
+        if producer_replied?, do: noreply_after_delivery(state), else: reply_after_delivery({:ok, result, acknowledgement}, state)
 
       state.context && state.context.reserved.request.id == request_id ->
         result = state.original_result || finalize(state.context, Map.put(finalization, :native_response_steering_terminal?, true), state.callbacks)
@@ -214,6 +219,7 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
 
   @impl GenServer
   def handle_cast({:delivery_complete, _identity, _outcome}, state), do: {:noreply, state}
+  def handle_cast({:delivery_complete, _identity, _outcome, _envelope}, state), do: {:noreply, state}
 
   def handle_cast({:dispatch_complete, key}, state), do: {:noreply, release_prepared(state, key)}
 
@@ -288,9 +294,8 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
 
   defp open_admitted_successor(state, context) do
     with {:provider_credits_admission, {:ok, receipt}} <- {:provider_credits_admission, ProviderCreditsAdmission.admit(ProviderCreditsAdmission.from_selected(context))},
-         {:lifecycle, {:ok, state}} <- {:lifecycle, successor_lifecycle(state)},
-         {:owner_successor, :ok} <- {:owner_successor, begin_owner_successor(state, context)} do
-      reply_successor_open(state, context, receipt)
+         {:lifecycle, {:ok, state}} <- {:lifecycle, successor_lifecycle(state)} do
+      enroll_successor_delivery(state, context, receipt)
     else
       {:lifecycle, {:error, reason, state}} ->
         close_failed_successor(state, context, reason)
@@ -299,6 +304,26 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
         log_successor_failure(state, context, phase, reason)
         close_failed_successor(state, context, reason)
     end
+  end
+
+  defp enroll_successor_delivery(state, context, receipt) do
+    case DeliveryReceiptHandoff.enroll(state.socket, identity(context)) do
+      {:ok, token} ->
+        state = Map.put(state, :delivery_receipt_token, token)
+
+        case begin_owner_successor(state, context) do
+          :ok -> reply_successor_open(state, context, receipt)
+          {:error, reason} -> reject_successor_delivery(state, context, :owner_successor, reason)
+        end
+
+      {:error, reason} ->
+        reject_successor_delivery(state, context, :delivery_receipt, reason)
+    end
+  end
+
+  defp reject_successor_delivery(state, context, phase, reason) do
+    log_successor_failure(state, context, phase, reason)
+    close_failed_successor(state, context, reason)
   end
 
   defp reply_successor_open(state, context, receipt) do
@@ -310,6 +335,7 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
   end
 
   defp close_failed_successor(state, context, reason) do
+    state = abandon_delivery_receipt(state)
     state = compensate_open_failure(state, context, reason)
     send(state.socket, {:native_response_steering_close, self(), 1011, ""})
     reply_after_delivery({:error, reason}, state)
@@ -378,7 +404,13 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
 
   defp await_delivery(state, identity) do
     state = drain_lifecycle(state)
-    if state.socket_dead?, do: {:aborted, state}, else: receive_delivery(state, identity)
+
+    if state.socket_dead? do
+      _result = DeliveryReceiptHandoff.settle_pending()
+      {:aborted, state}
+    else
+      receive_delivery(state, identity)
+    end
   end
 
   defp receive_delivery(state, identity) do
@@ -391,10 +423,25 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
 
     receive do
       {:DOWN, ^socket_monitor, :process, _socket, _reason} ->
+        _result = DeliveryReceiptHandoff.settle_pending()
         {:aborted, %{state | socket_dead?: true} |> revoke_admission(:client_disconnected)}
 
+      {:"$gen_cast", {:delivery_complete, ^identity, outcome, %{registry: _registry, token: token, context: %{} = context, receipt: %{} = _receipt} = envelope}} when outcome in [:delivered, :aborted] and is_reference(token) ->
+        if token == Map.get(state, :delivery_receipt_token) and Map.take(context, [:request_id, :attempt_id, :replay_generation]) == identity do
+          case DeliveryReceiptHandoff.settle(envelope) do
+            {:error, :stale_delivery} ->
+              receive_delivery(state, identity, deadline)
+
+            result ->
+              outcome = if result == :ok, do: outcome, else: :aborted
+              {outcome, state |> Map.delete(:delivery_receipt_token) |> drain_lifecycle()}
+          end
+        else
+          receive_delivery(state, identity, deadline)
+        end
+
       {:"$gen_cast", {:delivery_complete, ^identity, outcome}} when outcome in [:delivered, :aborted] ->
-        {outcome, drain_lifecycle(state)}
+        {outcome, state |> abandon_delivery_receipt() |> drain_lifecycle()}
 
       {:"$gen_call", {^socket, _tag} = from, {:prepare, context, callbacks, dispatcher}} when is_pid(dispatcher) ->
         state = prepare_context(state, context, callbacks, dispatcher)
@@ -405,6 +452,11 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
         send(state.socket, {:native_response_steering_close, self(), 1011, ""})
         {:aborted, revoke_admission(state, :client_disconnected)}
     end
+  end
+
+  defp abandon_delivery_receipt(state) do
+    if token = Map.get(state, :delivery_receipt_token), do: DeliveryReceiptHandoff.abandon(token)
+    Map.delete(state, :delivery_receipt_token)
   end
 
   defp begin_owner_successor(%{owner: owner} = state, context) when is_pid(owner), do: owner_call(fn -> WebsocketOwnerSession.begin_steering_successor(owner, self(), state.socket, identity(context), context.reserved.codex_turn.id) end)
@@ -557,6 +609,16 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
 
   defp put_acknowledgement({:ok, result}, {:ok, _binding, _receipt} = acknowledgement), do: {:ok, Map.put(result, :native_response_steering_acknowledgement, acknowledgement)}
   defp put_acknowledgement(result, :none), do: result
+
+  # A failed producer must retire while the lane still owns the socket's delivery wait.
+  # Accounting failures and provider terminals keep their existing acknowledgement fence.
+  defp reply_settled_failed_producer(from, finalization, {:error, %{code: code}} = result, :none)
+       when code != "gateway_accounting_failed" and not is_map_key(finalization, :terminal) do
+    GenServer.reply(from, {:ok, result, :none})
+    true
+  end
+
+  defp reply_settled_failed_producer(_from, _finalization, _result, _acknowledgement), do: false
 
   defp retain_settlement(state, {:ok, %{stale_generation?: true}}, _finalization), do: revoke_admission(state, :stale_generation)
   defp retain_settlement(state, {:ok, %{}}, %{terminal: terminal}) when terminal in ["response.completed", "response.done", "response.incomplete"], do: state

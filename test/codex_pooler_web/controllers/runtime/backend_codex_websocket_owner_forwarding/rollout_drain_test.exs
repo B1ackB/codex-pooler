@@ -364,10 +364,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RolloutDra
 
       assert %{
                owners_seen: 1,
-               owners_drained: 0,
-               owners_failed: 1,
+               owners_drained: 1,
+               owners_failed: 0,
                turns_completed: 0,
-               turns_aborted: 0
+               turns_aborted: 1
              } = Task.await(drain_task, @detection_budget_ms)
 
       refute_received {:rollout_drain_deadline_wait, ^deadline, _wait_ms}

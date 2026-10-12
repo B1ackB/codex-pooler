@@ -131,6 +131,198 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFenceTest do
     refute Process.alive?(cleanup)
   end
 
+  describe "registered receipt ownership" do
+    setup tags do
+      CodexPooler.DataCase.setup_sandbox(tags)
+    end
+
+    test "the sandbox fence waits for real ResponseTask receipt SQL", %{sandbox_owner: owner} do
+      alias CodexPooler.Accounting.Attempt
+      alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
+      alias CodexPooler.Gateway.Websocket.{DeliveryReceipt, DeliveryReceiptHandoff, ResponseTask}
+      alias CodexPooler.Repo
+
+      setup = CodexPooler.AccountingTestSupport.accounting_setup()
+      {:ok, reserved} = CodexPooler.Accounting.reserve(setup.auth, setup.model, %{"model" => setup.model.exposed_model_id, "input" => []}, %{endpoint: "/backend-api/codex/responses", transport: "websocket", correlation_id: Ecto.UUID.generate()})
+      {:ok, attempt} = CodexPooler.Accounting.create_attempt(reserved.request, setup.assignment)
+      identity = %{request_id: reserved.request.id, attempt_id: attempt.id, replay_generation: 0}
+      parent = self()
+      handler = {__MODULE__, make_ref()}
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      {:ok, actor} =
+        ResponseTask.start(
+          parent,
+          :direct,
+          fn _ ->
+            {:ok, _} = DeliveryReceiptHandoff.enroll(parent, identity)
+            :ok
+          end,
+          fn _, _ -> :ok end
+        )
+
+      monitor = Process.monitor(actor)
+      on_exit(fn -> send(actor, {handler, :release}) end)
+      assert_receive {:downstream_receipt_enrolled, ^actor, ^identity, token}
+      assert_receive {:websocket_response_activity, ^actor, activity}
+      assert_receive {:codex_response_done, ^actor, :ok}
+      :ok = :telemetry.attach(handler, [:codex_pooler, :repo, :query], &__MODULE__.hold_receipt_query/4, %{actor: actor, parent: parent, tag: handler})
+      receipt = DeliveryReceipt.build(%{outcome: "delivered", terminal_class: "response.completed"})
+
+      try do
+        :ok = DeliveryReceiptHandoff.publish(token, identity, receipt, {:response_task, actor, activity, :completed})
+        assert_receive {^handler, :sql_held}, 5_000
+        assert Process.alive?(owner)
+        assert %{actor: ^actor, finished?: false} = :sys.get_state(ActivityRegistry).delivery_receipts[token]
+
+        assert_raise ExUnit.AssertionError, ~r/receipt.*still running/, fn ->
+          WebsocketCleanupFence.await_sandbox_cleanups!(owner, 100)
+        end
+      after
+        send(actor, {handler, :release})
+        assert_receive {:DOWN, ^monitor, :process, ^actor, :normal}, 5_000
+        :telemetry.detach(handler)
+      end
+
+      assert Repo.get!(Attempt, attempt.id).response_metadata["downstream_delivery"] == receipt
+    end
+
+    test "an unpublished receipt is fenced without waiting for a foreign owner's actor", %{sandbox_owner: owner} do
+      alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
+      alias CodexPooler.Repo
+      alias Ecto.Adapters.SQL.Sandbox
+
+      foreign = Sandbox.start_owner!(Repo, shared: false)
+      on_exit(fn -> if Process.alive?(foreign), do: Sandbox.stop_owner(foreign) end)
+      assert Repo.query!("SELECT pg_backend_pid()", [], caller: owner).rows != Repo.query!("SELECT pg_backend_pid()", [], caller: foreign).rows
+      receipt = start_owned_receipt!(foreign)
+
+      try do
+        assert :ok = WebsocketCleanupFence.await_sandbox_cleanups!(owner, 100)
+        assert Process.alive?(receipt.actor)
+
+        assert_raise ExUnit.AssertionError, ~r/receipt obligation.*still running/, fn ->
+          WebsocketCleanupFence.await_sandbox_cleanups!(foreign, 100)
+        end
+      after
+        :ok = DeliveryReceiptHandoff.publish(receipt.token, receipt.identity, receipt.receipt, {:response_task, receipt.actor, receipt.activity, :completed})
+        assert_receive {:DOWN, ref, :process, actor, :normal}, 5_000
+        assert ref == receipt.monitor and actor == receipt.actor
+      end
+
+      assert :ok = WebsocketCleanupFence.await_sandbox_cleanups!(foreign, 100)
+      assert Repo.get!(CodexPooler.Accounting.Attempt, receipt.identity.attempt_id, caller: foreign).response_metadata["downstream_delivery"] == receipt.receipt
+      Sandbox.stop_owner(foreign)
+      refute Process.alive?(foreign)
+    end
+
+    test "the sandbox owner survives receipt actor DOWN until fallback SQL completes", %{sandbox_owner: owner, sandbox_settings_cache: cache} do
+      alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
+      alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
+
+      receipt = start_owned_receipt!(owner)
+      owner_monitor = Process.monitor(owner)
+      waiter = Task.async(fn -> CodexPooler.DataCase.stop_sandbox(owner, cache) end)
+      assert await_fence_wait(waiter.pid, System.monotonic_time(:millisecond) + 5_000)
+      Process.exit(receipt.actor, :kill)
+      assert_receive {:DOWN, ref, :process, actor, :killed}
+      assert ref == receipt.monitor and actor == receipt.actor
+      handler = {__MODULE__, make_ref()}
+      on_exit(fn -> :telemetry.detach(handler) end)
+      :ok = :telemetry.attach(handler, [:codex_pooler, :repo, :query], &__MODULE__.hold_receipt_query/4, %{actor: :registered, token: receipt.token, parent: self(), tag: handler})
+      :ok = DeliveryReceiptHandoff.publish(receipt.token, receipt.identity, receipt.receipt, {:response_task, receipt.actor, receipt.activity, :completed})
+      assert_receive {^handler, :sql_held, fallback}, 5_000
+      fallback_monitor = Process.monitor(fallback)
+      on_exit(fn -> send(fallback, {handler, :release}) end)
+      assert %{actor: ^fallback, fallback?: true, finished?: false} = :sys.get_state(ActivityRegistry).delivery_receipts[receipt.token]
+
+      try do
+        assert await_fence_wait(waiter.pid, System.monotonic_time(:millisecond) + 5_000)
+        for _ <- 1..3, do: send(waiter.pid, :unrelated_interruption)
+        assert Process.alive?(owner)
+        assert Task.yield(waiter, 0) == nil
+        assert_raise ExUnit.AssertionError, ~r/receipt.*still running/, fn -> WebsocketCleanupFence.await_sandbox_cleanups!(owner, 100) end
+      after
+        send(fallback, {handler, :release})
+        assert :ok = Task.await(waiter, 5_000)
+        :telemetry.detach(handler)
+      end
+
+      assert_receive {:DOWN, ^fallback_monitor, :process, ^fallback, :normal}
+      assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :normal}
+      assert %{finished?: true, result: :ok} = :sys.get_state(ActivityRegistry).delivery_receipts[receipt.token]
+    end
+  end
+
+  defp start_owned_receipt!(owner) do
+    alias CodexPooler.Gateway.Websocket.{DeliveryReceipt, DeliveryReceiptHandoff, ResponseTask}
+    alias Ecto.Adapters.SQL.Sandbox
+    parent = self()
+
+    {:ok, actor} =
+      ResponseTask.start(
+        parent,
+        :direct,
+        fn _ ->
+          receive do
+            :create_fixture -> :ok
+          end
+
+          setup = CodexPooler.AccountingTestSupport.accounting_setup()
+          {:ok, reserved} = CodexPooler.Accounting.reserve(setup.auth, setup.model, %{"model" => setup.model.exposed_model_id, "input" => []}, %{endpoint: "/backend-api/codex/responses", transport: "websocket", correlation_id: Ecto.UUID.generate()})
+          {:ok, attempt} = CodexPooler.Accounting.create_attempt(reserved.request, setup.assignment)
+          identity = %{request_id: reserved.request.id, attempt_id: attempt.id, replay_generation: 0}
+          {:ok, _} = DeliveryReceiptHandoff.enroll(parent, identity)
+          send(parent, {:receipt_identity, self(), identity})
+          :ok
+        end,
+        fn _, _ -> :ok end
+      )
+
+    monitor = Process.monitor(actor)
+    on_exit(fn -> if Process.alive?(actor), do: Process.exit(actor, :kill) end)
+    :ok = Sandbox.allow(CodexPooler.Repo, owner, actor)
+    send(actor, :create_fixture)
+    assert_receive {:receipt_identity, ^actor, identity}
+    assert_receive {:downstream_receipt_enrolled, ^actor, ^identity, token}
+    assert_receive {:websocket_response_activity, ^actor, activity}
+    assert_receive {:codex_response_done, ^actor, :ok}
+    %{actor: actor, monitor: monitor, identity: identity, token: token, activity: activity, receipt: DeliveryReceipt.build(%{outcome: "delivered", terminal_class: "response.completed"})}
+  end
+
+  @doc false
+  def hold_receipt_query(_event, _measurements, %{query: "begin"}, config) do
+    registered? = config.actor == :registered and :sys.get_state(CodexPooler.Gateway.Transports.Websocket.ActivityRegistry).delivery_receipts[config.token].actor == self()
+
+    if config.actor == self() or registered? do
+      message = if registered?, do: {config.tag, :sql_held, self()}, else: {config.tag, :sql_held}
+      send(config.parent, message)
+
+      receive do
+        {tag, :release} when tag == config.tag -> :ok
+      after
+        5_000 -> raise "receipt SQL hold was not released"
+      end
+    end
+  end
+
+  def hold_receipt_query(_event, _measurements, _metadata, _config), do: :ok
+
+  defp await_fence_wait(pid, deadline) do
+    {:current_stacktrace, stack} = Process.info(pid, :current_stacktrace)
+
+    if Enum.any?(stack, fn {module, function, _, _} -> module == WebsocketCleanupFence and function == :await_receipts end) do
+      true
+    else
+      assert System.monotonic_time(:millisecond) < deadline, "fence did not observe the pending receipt"
+
+      receive do
+      after
+        1 -> await_fence_wait(pid, deadline)
+      end
+    end
+  end
+
   defp await_monitored_by(pid, monitor_pid, deadline) do
     monitored_by =
       case Process.info(pid, :monitored_by) do

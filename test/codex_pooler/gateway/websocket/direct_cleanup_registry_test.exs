@@ -2,7 +2,7 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanupRegistryTest do
   use ExUnit.Case, async: true
 
   alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
-  alias CodexPooler.Gateway.Websocket.DirectCleanup
+  alias CodexPooler.Gateway.Websocket.{DeliveryReceipt, DirectCleanup}
 
   test "cancellation before claim fences later mutation" do
     {context, task} = coordinator()
@@ -133,6 +133,148 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanupRegistryTest do
     send(task, :stop)
   end
 
+  for disposition <- [:ok, {:error, :database_failure}] do
+    test "a granted executor waits for exact receipt completion #{inspect(disposition)}" do
+      fixture = admitted_waiting_coordinator()
+      %{context: context, task: task, packet: packet, receipt_token: token} = fixture
+      assert {:stop, %{token: ^token}} = DirectCleanup.grant_upstream_stop(context, packet)
+      monitor = Process.monitor(task)
+      send(task, :upstream_answered)
+      await_executor_waiter(context.registry, token, task)
+      assert Process.alive?(task)
+      assert :ok = ActivityRegistry.finish_delivery_receipt(token, unquote(Macro.escape(disposition)), name: context.registry)
+      assert_receive {:DOWN, ^monitor, :process, ^task, {:shutdown, :client_disconnected}}
+      refute_received {:upstream_wait_result, _}
+    end
+  end
+
+  test "an already committed stopped receipt releases its exact executor immediately" do
+    %{context: context, task: task, packet: packet, receipt_token: token} = admitted_waiting_coordinator()
+    assert {:stop, %{token: ^token}} = DirectCleanup.grant_upstream_stop(context, packet)
+    assert :ok = ActivityRegistry.finish_delivery_receipt(token, :ok, name: context.registry)
+    monitor = Process.monitor(task)
+    send(task, :upstream_answered)
+    assert_receive {:DOWN, ^monitor, :process, ^task, {:shutdown, :client_disconnected}}
+  end
+
+  test "foreign caller and mismatched private scope cannot obtain or release a stop fence" do
+    %{context: context, task: task, packet: {identity, receipt}, receipt_token: token} = admitted_waiting_coordinator()
+
+    for field <- [:request_id, :attempt_id, :replay_generation, :codex_session_id] do
+      value = if field == :replay_generation, do: 1, else: Ecto.UUID.generate()
+      assert {:error, :delivery_identity_unavailable} = DirectCleanup.grant_upstream_stop(context, {Map.put(identity, field, value), receipt})
+    end
+
+    assert :busy = DirectCleanup.grant_upstream_stop(%{context | ref: make_ref()}, {identity, receipt})
+    assert :busy = DirectCleanup.grant_upstream_stop(%{context | parent: task}, {identity, receipt})
+    assert :busy = DirectCleanup.grant_upstream_stop(%{context | session_id: Ecto.UUID.generate()}, {identity, receipt})
+    assert {:error, :delivery_identity_unavailable} = DirectCleanup.grant_upstream_stop(context)
+    assert {:stop, _} = DirectCleanup.grant_upstream_stop(context, {identity, receipt})
+    assert {:error, :stale_direct_cleanup} = ActivityRegistry.leave_direct_upstream_wait(context)
+    assert :sys.get_state(context.registry).delivery_receipts[token].executor_waiters == []
+    assert Process.alive?(task)
+    assert :ok = ActivityRegistry.finish_delivery_receipt(token, :ok, name: context.registry)
+    send(task, :upstream_answered)
+  end
+
+  test "an admitted attempt with no enrolled receipt fails closed before granting stop" do
+    %{context: context, task: task, packet: packet} = admitted_waiting_coordinator(false)
+    assert {:error, :delivery_identity_unavailable} = DirectCleanup.grant_upstream_stop(context, packet)
+    assert {:error, :delivery_identity_unavailable} = DirectCleanup.grant_upstream_stop(context)
+    send(task, :upstream_answered)
+    assert_receive {:upstream_wait_result, :answered}
+    send(task, :stop)
+  end
+
+  test "socket death does not release the original executor before its assigned receipt" do
+    socket =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    %{context: context, task: task, packet: packet, receipt_token: token} = admitted_waiting_coordinator(true, socket)
+    assert {:stop, _} = DirectCleanup.grant_upstream_stop(context, packet)
+    monitor = Process.monitor(task)
+    socket_monitor = Process.monitor(socket)
+    send(task, :upstream_answered)
+    await_executor_waiter(context.registry, token, task)
+    send(socket, :stop)
+    assert_receive {:DOWN, ^socket_monitor, :process, ^socket, :normal}
+    assert Process.alive?(task)
+    assert :ok = ActivityRegistry.finish_delivery_receipt(token, :ok, name: context.registry)
+    assert_receive {:DOWN, ^monitor, :process, ^task, {:shutdown, :client_disconnected}}
+  end
+
+  test "repeated stop grants retain the first receipt deadline and private capability" do
+    %{context: context, task: task, packet: packet, receipt_token: token} = admitted_waiting_coordinator()
+    assert {:stop, envelope} = DirectCleanup.grant_upstream_stop(context, packet)
+    first = :sys.get_state(context.registry).delivery_receipts[token]
+    assert {:stop, ^envelope} = DirectCleanup.grant_upstream_stop(context, packet)
+    repeated = :sys.get_state(context.registry).delivery_receipts[token]
+    assert repeated.deadline_ms == first.deadline_ms
+    assert repeated.deadline_timer == first.deadline_timer
+    send(context.registry, {:delivery_receipt_deadline, token, first.deadline_ms})
+    assert :sys.get_state(context.registry).delivery_receipts[token].finished? == false
+    assert Process.alive?(task)
+    assert :ok = ActivityRegistry.finish_delivery_receipt(token, :ok, name: context.registry)
+    send(task, :upstream_answered)
+  end
+
+  test "force cut ends the assigned cleanup and releases its executor as failed" do
+    %{context: context, task: task, packet: packet, receipt_token: token} = admitted_waiting_coordinator()
+    parent = self()
+
+    cleanup =
+      spawn(fn ->
+        send(parent, {:forced_cleanup_grant, DirectCleanup.grant_upstream_stop(context, packet)})
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn -> if Process.alive?(cleanup), do: Process.exit(cleanup, :kill) end)
+    assert_receive {:forced_cleanup_grant, {:stop, _}}
+    cleanup_monitor = Process.monitor(cleanup)
+    task_monitor = Process.monitor(task)
+    send(task, :upstream_answered)
+    await_executor_waiter(context.registry, token, task)
+    assert Process.alive?(task)
+    ActivityRegistry.begin_drain(name: context.registry)
+    assert :ok = ActivityRegistry.force_receipt_cohort(name: context.registry)
+    assert_receive {:DOWN, ^cleanup_monitor, :process, ^cleanup, :killed}
+    assert_receive {:DOWN, ^task_monitor, :process, ^task, {:shutdown, :client_disconnected}}
+    assert %{closed?: true, producers_failed?: true, pending_producers: 0} = ActivityRegistry.receipt_cohort(name: context.registry)
+  end
+
+  defp admitted_waiting_coordinator(enroll? \\ true, socket \\ self()) do
+    {context, task} = coordinator(socket)
+    send(task, {:begin, self()})
+    assert_receive {:began, :ok}
+    bound = Map.merge(receipt(context), %{attempt_id: Ecto.UUID.generate(), replay_generation: 0})
+    send(task, {:bind_admitted, bound, enroll?, self()})
+    assert_receive {:admitted_bound, token}
+    send(task, {:upstream_wait, self()})
+    assert_receive {:upstream_waiting, ^task}
+    packet = {Map.take(bound, [:request_id, :attempt_id, :replay_generation]) |> Map.put(:codex_session_id, context.session_id), DeliveryReceipt.build(%{outcome: "aborted"})}
+    %{context: context, task: task, packet: packet, receipt_token: token}
+  end
+
+  defp await_executor_waiter(registry, token, task, deadline \\ System.monotonic_time(:millisecond) + 2_000) do
+    waiters = :sys.get_state(registry).delivery_receipts[token].executor_waiters
+
+    unless Enum.any?(waiters, fn {pid, _} -> pid == task end) do
+      assert System.monotonic_time(:millisecond) < deadline
+
+      receive do
+      after
+        1 -> await_executor_waiter(registry, token, task, deadline)
+      end
+    end
+  end
+
   defp coordinator(parent \\ self()) do
     name = Module.concat(__MODULE__, "Registry#{System.unique_integer([:positive])}")
     start_supervised!({ActivityRegistry, name: name})
@@ -171,6 +313,17 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanupRegistryTest do
     receive do
       {:begin, parent} ->
         send(parent, {:began, ActivityRegistry.begin_direct_cleanup(context)})
+        loop(context)
+
+      {:bind_admitted, receipt, enroll?, parent} ->
+        token =
+          if enroll? do
+            {:ok, token} = ActivityRegistry.enroll_delivery_receipt(context.parent, Map.take(receipt, [:request_id, :attempt_id, :replay_generation]), name: context.registry)
+            token
+          end
+
+        :ok = ActivityRegistry.bind_direct_cleanup(context, receipt)
+        send(parent, {:admitted_bound, token})
         loop(context)
 
       {:bind, receipt, parent} ->

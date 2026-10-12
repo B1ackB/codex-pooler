@@ -24,6 +24,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketDownstreamKeepalivePeerTes
   # before its end (Drone 1809, 1811).
   use CodexPoolerWeb.ConnCase, async: false
 
+  alias CodexPooler.Platform.ExecutionRegistry
+
+  import Ecto.Query, only: [from: 2]
+
   import ExUnit.CaptureLog
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport, only: [gateway_setup: 1, start_upstream: 1]
 
@@ -106,6 +110,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketDownstreamKeepalivePeerTes
       end)
     end
 
+    executor = capture_direct_executor(topology, setup)
     lock = hold_session_row!(state.codex_session.id)
 
     try do
@@ -113,9 +118,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketDownstreamKeepalivePeerTes
       assert turn.end == {:close, 1002}
       assert Process.alive?(lock.pid)
       assert_producer_retired!(upstream_pid)
+
+      assert_executor_receipt_pending(executor)
       refute log =~ "websocket downstream idle timeout attribution unavailable"
       send(lock.pid, :release)
       assert Task.await(lock, detection_timeout_ms()) == :ok
+
+      assert_executor_receipt_committed(executor)
       WebsocketCleanupFence.await_session_cleanups!()
       request = assert_request_settled!(setup, "failed", "client_disconnected")
       assert_idle_attribution!(CodexPooler.Repo.reload!(request), if(turn.pings > 0, do: "pong_observed", else: "unknown"))
@@ -124,6 +133,32 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketDownstreamKeepalivePeerTes
       send(lock.pid, :release)
       FakeUpstream.release_remaining_frames(upstream, hold)
     end
+  end
+
+  defp capture_direct_executor(:direct, setup) do
+    attempt = CodexPooler.Repo.one!(from a in CodexPooler.Accounting.Attempt, join: r in CodexPooler.Accounting.Request, on: a.request_id == r.id, where: r.pool_id == ^setup.pool.id)
+    pid = attempt.owner_process_id |> String.to_charlist() |> :erlang.list_to_pid()
+    assert ExecutionRegistry.status(attempt.owner_execution_id, pid) == :alive
+    %{pid: pid, monitor: Process.monitor(pid), attempt: attempt}
+  end
+
+  defp capture_direct_executor(_topology, _setup), do: nil
+
+  defp assert_executor_receipt_pending(nil), do: :ok
+
+  defp assert_executor_receipt_pending(executor) do
+    assert Process.alive?(executor.pid)
+    assert ExecutionRegistry.status(executor.attempt.owner_execution_id, executor.pid) == :alive
+    assert ExecutionRegistry.pending_proofs([executor.attempt.owner_execution_id]) == []
+    assert is_nil(CodexPooler.Repo.reload!(executor.attempt).response_metadata["downstream_delivery"])
+  end
+
+  defp assert_executor_receipt_committed(nil), do: :ok
+
+  defp assert_executor_receipt_committed(%{pid: pid, monitor: monitor, attempt: attempt}) do
+    assert_receive {:DOWN, ^monitor, :process, ^pid, _reason}, detection_timeout_ms()
+    assert is_map(CodexPooler.Repo.reload!(attempt).response_metadata["downstream_delivery"])
+    assert ExecutionRegistry.status(attempt.owner_execution_id, pid) == :dead
   end
 
   defp assert_producer_retired!(pid) do

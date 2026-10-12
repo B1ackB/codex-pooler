@@ -3,7 +3,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
 
   use GenServer
 
+  require Logger
+
   alias __MODULE__.{Drain, Entry}
+  alias CodexPooler.Gateway.Websocket.DeliveryReceipt
+  alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
   alias CodexPooler.Gateway.Websocket.DirectCleanup
   alias CodexPooler.Platform.ExecutionRegistry
 
@@ -41,17 +45,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   (`stop_direct_upstream_wait/1`). Leaving the span after a stop was granted
   answers `{:error, :stopped}`: the task must then exit without settling.
   """
-  @spec enter_direct_upstream_wait(DirectCleanup.t()) :: :ok | {:error, :stopped}
+  @spec enter_direct_upstream_wait(DirectCleanup.t()) :: :ok | {:error, :stopped | :stale_direct_cleanup}
   def enter_direct_upstream_wait(context),
     do: GenServer.call(context.registry, {:direct_upstream_wait, context, true})
 
-  @spec leave_direct_upstream_wait(DirectCleanup.t()) :: :ok | {:error, :stopped}
+  # A stopped admitted executor waits on the receipt's registry-owned finite deadline,
+  # not a fresh GenServer call timeout. Every success, failure, expiry and force cut replies.
+  @spec leave_direct_upstream_wait(DirectCleanup.t()) :: :ok | {:error, :stopped | :stale_direct_cleanup | {:stopped, atom()}}
   def leave_direct_upstream_wait(context),
-    do: GenServer.call(context.registry, {:direct_upstream_wait, context, false})
+    do: GenServer.call(context.registry, {:direct_upstream_wait, context, false}, :infinity)
 
-  @spec stop_direct_upstream_wait(DirectCleanup.t()) :: :stop | :busy
+  @spec stop_direct_upstream_wait(DirectCleanup.t()) :: :stop | :busy | {:error, :delivery_identity_unavailable}
   def stop_direct_upstream_wait(context),
     do: GenServer.call(context.registry, {:direct_stop_upstream_wait, context})
+
+  @spec stop_direct_upstream_wait(DirectCleanup.t(), {map(), map()} | nil) :: {:stop, DeliveryReceiptHandoff.envelope()} | :busy | {:error, atom()}
+  def stop_direct_upstream_wait(context, packet), do: GenServer.call(context.registry, {:direct_stop_upstream_wait, context, packet})
 
   @type activity_kind :: Entry.kind()
   @type outcome :: :completed | :aborted | :failed
@@ -84,6 +93,36 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
 
   @spec force_receipt_cohort(keyword()) :: :ok
   def force_receipt_cohort(opts \\ []), do: GenServer.call(server(opts), :force_receipt_cohort)
+
+  @spec enroll_delivery_receipt(pid(), receipt_identity(), keyword()) :: {:ok, token()} | {:error, atom()}
+  def enroll_delivery_receipt(socket, identity, opts \\ []), do: GenServer.call(server(opts), {:enroll_delivery_receipt, socket, identity})
+
+  @spec abandon_delivery_receipt(token(), keyword()) :: :ok
+  def abandon_delivery_receipt(token, opts \\ []), do: GenServer.call(server(opts), {:abandon_delivery_receipt, token})
+
+  @spec delivery_settling?(pid(), keyword()) :: boolean()
+  def delivery_settling?(pid, opts \\ []), do: GenServer.call(server(opts), {:delivery_settling, pid})
+
+  @spec acknowledge_retired_delivery(pid(), token(), keyword()) :: :ok | {:error, atom()}
+  def acknowledge_retired_delivery(task, activity, opts \\ []), do: GenServer.call(server(opts), {:acknowledge_retired_delivery, task, activity})
+
+  @spec delivery_receipt_token(receipt_identity(), keyword()) :: {:ok, token()} | :unknown
+  def delivery_receipt_token(identity, opts \\ []), do: GenServer.call(server(opts), {:delivery_receipt_token, identity})
+
+  @spec publish_delivery_receipt(token(), map(), map(), term(), keyword()) :: :ok | {:error, atom()}
+  def publish_delivery_receipt(token, context, receipt, recipient, opts \\ []), do: GenServer.call(server(opts), {:publish_delivery_receipt, token, context, receipt, recipient})
+
+  @spec take_delivery_cleanup(token(), map(), map(), keyword()) :: {:ok, DeliveryReceiptHandoff.envelope()} | {:settled, term()} | {:error, atom()}
+  def take_delivery_cleanup(token, context, receipt, opts \\ []), do: GenServer.call(server(opts), {:take_delivery_cleanup, token, context, receipt}, 30_000)
+
+  @spec assigned_delivery_receipts(keyword()) :: [DeliveryReceiptHandoff.envelope()]
+  def assigned_delivery_receipts(opts \\ []), do: GenServer.call(server(opts), :assigned_delivery_receipts)
+
+  @spec claim_delivery_receipt(token(), keyword()) :: :ok | {:ok, pos_integer()} | {:error, atom()}
+  def claim_delivery_receipt(token, opts \\ []), do: GenServer.call(server(opts), {:claim_delivery_receipt, token, Keyword.get(opts, :envelope)})
+
+  @spec finish_delivery_receipt(token(), term(), keyword()) :: :ok
+  def finish_delivery_receipt(token, result, opts \\ []), do: GenServer.call(server(opts), {:finish_delivery_receipt, token, result})
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -191,10 +230,142 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
 
   @impl GenServer
   def init(:ok) do
-    {:ok, %{activities: %{}, monitors: %{}, draining?: false, drain: nil, finished_direct: %{}, receipt_producers: %{}, receipt_producer_monitors: %{}}}
+    {:ok, %{activities: %{}, monitors: %{}, draining?: false, drain: nil, finished_direct: %{}, receipt_producers: %{}, receipt_producer_monitors: %{}, delivery_receipts: %{}, delivery_monitors: %{}, delivery_failed?: false}}
   end
 
   @impl GenServer
+  def handle_call({:enroll_delivery_receipt, socket, %{request_id: request, attempt_id: attempt, replay_generation: generation} = identity}, {task, _}, state)
+      when is_pid(socket) and is_binary(request) and is_binary(attempt) and is_integer(generation) and generation >= 0 and map_size(identity) == 3 do
+    if delivery_enrollment_allowed?(state, task, socket) do
+      enroll_delivery_receipt_state(state, task, socket, identity)
+    else
+      {:reply, {:error, :owner_drained}, state}
+    end
+  end
+
+  def handle_call({:enroll_delivery_receipt, _socket, _identity}, _from, state), do: {:reply, {:error, :invalid_identity}, state}
+
+  def handle_call({:abandon_delivery_receipt, token}, {task, _}, state) do
+    case Map.get(state.delivery_receipts, token) do
+      %{task: ^task, envelope: nil} -> {:reply, :ok, state |> remove_delivery_receipt(token) |> mark_delivery_failure()}
+      _ -> {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:delivery_settling, task}, _from, state) do
+    stopped? = match?({_token, %{direct_cleanup: %{upstream_stop?: true}}}, direct_entry(state, task))
+    pending? = Enum.any?(state.delivery_receipts, fn {_token, entry} -> (entry.actor == task or (entry.task == task and stopped?)) and not is_nil(entry.envelope) and not entry.finished? end)
+    {:reply, pending?, state}
+  end
+
+  def handle_call({:acknowledge_retired_delivery, task, activity}, {socket, _}, state) do
+    case Enum.find(state.delivery_receipts, fn {_token, entry} -> entry.socket == socket and entry.task == task and is_map(entry.envelope) end) do
+      {token, entry} -> {:reply, :ok, remember_delivery_ack(state, token, entry, {:response_task, task, activity, :aborted})}
+      nil -> {:reply, {:error, :unknown_delivery}, state}
+    end
+  end
+
+  def handle_call({:delivery_receipt_token, identity}, {socket, _}, state) do
+    result =
+      Enum.find_value(state.delivery_receipts, :unknown, fn
+        {token, %{socket: ^socket, identity: ^identity}} -> {:ok, token}
+        _ -> nil
+      end)
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:publish_delivery_receipt, token, context, receipt, recipient}, {socket, _}, state) do
+    case Map.get(state.delivery_receipts, token) do
+      %{socket: ^socket, identity: identity, envelope: nil} = entry ->
+        if Map.take(context, [:request_id, :attempt_id, :replay_generation]) == identity do
+          envelope = %{registry: self(), token: token, context: context, receipt: receipt}
+          entry = start_delivery_deadline(entry, envelope)
+          {result, state} = assign_delivery_receipt(state, token, entry, recipient)
+          {:reply, result, state}
+        else
+          {:reply, {:error, :identity_mismatch}, state}
+        end
+
+      %{socket: ^socket, envelope: %{context: ^context, receipt: ^receipt}} = entry ->
+        {:reply, :ok, remember_delivery_ack(state, token, entry, recipient)}
+
+      _ ->
+        {:reply, {:error, :unknown_delivery}, state}
+    end
+  end
+
+  def handle_call({:take_delivery_cleanup, token, context, receipt}, {actor, _} = from, state) do
+    case Map.get(state.delivery_receipts, token) do
+      %{identity: identity, envelope: nil} = entry ->
+        if Map.take(context, [:request_id, :attempt_id, :replay_generation]) == identity do
+          envelope = %{registry: self(), token: token, context: context, receipt: receipt}
+          monitor = Process.monitor(actor)
+          entry = entry |> start_delivery_deadline(envelope) |> Map.merge(%{actor: actor, actor_monitor: monitor})
+          state = %{state | delivery_receipts: Map.put(state.delivery_receipts, token, entry), delivery_monitors: Map.put(state.delivery_monitors, monitor, {token, :actor})}
+          {:reply, {:ok, envelope}, state}
+        else
+          {:reply, {:error, :identity_mismatch}, state}
+        end
+
+      %{envelope: %{context: ^context, receipt: ^receipt} = envelope, actor: ^actor, finished?: false} ->
+        {:reply, {:ok, envelope}, state}
+
+      %{envelope: %{context: ^context, receipt: ^receipt}, finished?: true, result: result} ->
+        {:reply, {:settled, result}, state}
+
+      %{envelope: %{context: ^context, receipt: ^receipt}} = entry ->
+        {:noreply, put_in(state.delivery_receipts[token].waiters, [from | entry.waiters])}
+
+      _ ->
+        {:reply, {:error, :unknown_delivery}, state}
+    end
+  end
+
+  def handle_call(:assigned_delivery_receipts, {actor, _}, state) do
+    envelopes =
+      Enum.flat_map(state.delivery_receipts, fn
+        {_token, %{actor: ^actor, finished?: false, envelope: envelope}} when is_map(envelope) -> [envelope]
+        _ -> []
+      end)
+
+    {:reply, envelopes, state}
+  end
+
+  def handle_call({:claim_delivery_receipt, token, envelope}, {actor, _}, state) do
+    result =
+      case Map.get(state.delivery_receipts, token) do
+        %{actor: ^actor, finished?: false, envelope: expected, deadline_ms: deadline} when is_nil(envelope) or envelope == expected ->
+          delivery_claim_result(envelope, deadline)
+
+        _ ->
+          {:error, :stale_delivery}
+      end
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:finish_delivery_receipt, token, result}, {actor, _}, state) do
+    result = if result == :ok, do: :ok, else: {:error, :receipt_not_persisted}
+
+    case Map.get(state.delivery_receipts, token) do
+      %{actor: ^actor, finished?: false} = entry ->
+        Process.demonitor(entry.actor_monitor, [:flush])
+        cancel_delivery_deadline(entry)
+        reply_executor_waiters(entry, result)
+        Enum.each(entry.waiters, &GenServer.reply(&1, {:settled, result}))
+        Enum.each(entry.acks, &send_delivery_ack(&1, result))
+        entry = %{entry | finished?: true, actor_monitor: nil, waiters: [], acks: [], executor_waiters: [], result: result}
+        state = %{state | delivery_monitors: Map.delete(state.delivery_monitors, Map.get(state.delivery_receipts[token], :actor_monitor)), delivery_failed?: state.delivery_failed? or (state.draining? and result != :ok)}
+        state = put_in(state.delivery_receipts[token], entry)
+        state = if Process.alive?(entry.socket), do: state, else: remove_delivery_receipt(state, token)
+        {:reply, :ok, state}
+
+      _ ->
+        {:reply, :ok, state}
+    end
+  end
+
   def handle_call({:direct_handoff, context}, _from, state) do
     case direct_entry(state, context.task) do
       {token, %{direct_cleanup: %{context: ^context} = cleanup}} ->
@@ -227,8 +398,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
     end
   end
 
-  def handle_call({:direct_upstream_wait, context, waiting?}, {caller, _}, state) do
+  def handle_call({:direct_upstream_wait, context, waiting?}, {caller, _} = from, state) do
     case direct_entry(state, context.task) do
+      {_token, %{direct_cleanup: %{context: ^context, upstream_stop?: true, delivery_token: receipt_token}}} when caller == context.task and not waiting? ->
+        wait_for_stopped_delivery(state, receipt_token, context, from)
+
       {_token, %{direct_cleanup: %{context: ^context, upstream_stop?: true}}} when caller == context.task ->
         {:reply, {:error, :stopped}, state}
 
@@ -236,12 +410,25 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
         {:reply, :ok, put_in(state.activities[token].direct_cleanup, Map.put(cleanup, :upstream_wait?, waiting?))}
 
       _ ->
-        {:reply, :ok, state}
+        {:reply, {:error, :stale_direct_cleanup}, state}
+    end
+  end
+
+  def handle_call({:direct_stop_upstream_wait, context, packet}, {actor, _}, state) do
+    case direct_entry(state, context.task) do
+      {activity, %{direct_cleanup: %{context: ^context, upstream_wait?: true} = cleanup}} ->
+        grant_stopped_delivery(state, activity, cleanup, context, packet, actor)
+
+      _ ->
+        {:reply, :busy, state}
     end
   end
 
   def handle_call({:direct_stop_upstream_wait, context}, _from, state) do
     case direct_entry(state, context.task) do
+      {_token, %{direct_cleanup: %{context: ^context, upstream_wait?: true, receipt: %{attempt_id: attempt}}}} when is_binary(attempt) ->
+        {:reply, {:error, :delivery_identity_unavailable}, state}
+
       {token, %{direct_cleanup: %{context: ^context, upstream_wait?: true} = cleanup}} ->
         {:reply, :stop, put_in(state.activities[token].direct_cleanup, Map.put(cleanup, :upstream_stop?, true))}
 
@@ -404,8 +591,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   end
 
   def handle_call(:receipt_cohort, _from, state) do
-    drain = Drain.close_receipts(state.drain, map_size(state.receipt_producers) == 0)
-    cohort = %{closed?: not is_nil(drain) and drain.receipts_closed?, entries: Drain.receipt_entries(drain, state.activities), pending_producers: map_size(state.receipt_producers), producers_failed?: not is_nil(drain) and drain.receipt_producers_failed?}
+    drain = Drain.close_receipts(state.drain, map_size(state.receipt_producers) == 0 and pending_deliveries(state) == 0)
+    cohort = %{closed?: not is_nil(drain) and drain.receipts_closed?, entries: Drain.receipt_entries(drain, state.activities), pending_producers: map_size(state.receipt_producers) + pending_deliveries(state), producers_failed?: state.delivery_failed? or (not is_nil(drain) and drain.receipt_producers_failed?)}
     {:reply, cohort, %{state | drain: drain}}
   end
 
@@ -419,6 +606,16 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
           finish_activity(acc, token, :aborted, true, true)
 
         _other, acc ->
+          acc
+      end)
+
+    state =
+      Enum.reduce(state.delivery_receipts, state, fn
+        {token, %{finished?: false} = entry}, acc ->
+          if is_pid(entry.actor), do: Process.exit(entry.actor, :kill)
+          acc |> remove_delivery_receipt(token) |> mark_delivery_failure()
+
+        _, acc ->
           acc
       end)
 
@@ -532,7 +729,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   end
 
   def handle_call({:complete_drain, epoch}, _from, %{drain: %{epoch: epoch}} = state) do
-    pending? = map_size(state.receipt_producers) > 0 or Enum.any?(Drain.receipt_entries(state.drain, state.activities), &(&1.status == :active))
+    pending? = pending_deliveries(state) > 0 or map_size(state.receipt_producers) > 0 or Enum.any?(Drain.receipt_entries(state.drain, state.activities), &(&1.status == :active))
 
     if pending?, do: {:reply, {:error, :receipt_work_pending}, state}, else: {:reply, :ok, %{state | drain: nil}}
   end
@@ -585,6 +782,43 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   def handle_call(:draining?, _from, state), do: {:reply, state.draining?, state}
 
   @impl GenServer
+  def handle_info({:delivery_receipt_deadline, token, deadline}, state) do
+    case Map.get(state.delivery_receipts, token) do
+      %{finished?: false, deadline_ms: ^deadline} = entry ->
+        {:noreply, expire_delivery_at_deadline(state, token, entry, deadline)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:DOWN, monitor, :process, _pid, _reason}, %{delivery_monitors: monitors} = state) when is_map_key(monitors, monitor) do
+    {token, role} = Map.fetch!(monitors, monitor)
+    entry = state.delivery_receipts[token]
+    state = %{state | delivery_monitors: Map.delete(monitors, monitor)}
+
+    case {role, entry} do
+      {:socket, %{finished?: true}} ->
+        {:noreply, remove_delivery_receipt(state, token)}
+
+      {:socket, %{envelope: nil}} ->
+        {:noreply, state |> remove_delivery_receipt(token) |> mark_delivery_failure()}
+
+      {:socket, _submitted} ->
+        {:noreply, state}
+
+      {:actor, %{finished?: false, fallback?: false}} ->
+        {_result, state} = assign_delivery_receipt(state, token, entry, :fallback)
+        {:noreply, state}
+
+      {:actor, %{finished?: false}} ->
+        {:noreply, state |> remove_delivery_receipt(token) |> mark_delivery_failure()}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:DOWN, monitor, :process, _pid, _reason}, %{receipt_producer_monitors: monitors} = state) when is_map_key(monitors, monitor) do
     token = Map.fetch!(monitors, monitor)
     failed? = is_nil(state.receipt_producers[token].worker)
@@ -652,6 +886,196 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   end
 
   defp retain_direct_cleanup(state, _cleanup), do: state
+
+  defp delivery_claim_result(envelope, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    cond do
+      remaining <= 0 -> {:error, :receipt_deadline_expired}
+      is_nil(envelope) -> :ok
+      true -> {:ok, remaining}
+    end
+  end
+
+  defp bound_receipt_matches?(%{session_id: session} = bound, %{codex_session_id: session} = context, %{session_id: session}) do
+    Map.take(bound, [:request_id, :attempt_id, :replay_generation]) == Map.take(context, [:request_id, :attempt_id, :replay_generation])
+  end
+
+  defp bound_receipt_matches?(_bound, _receipt, _context), do: false
+
+  defp grant_stopped_delivery(state, activity, cleanup, context, {receipt_context, receipt}, actor) when is_map(receipt_context) and is_map(receipt) do
+    identity = Map.take(receipt_context, [:request_id, :attempt_id, :replay_generation])
+    valid? = bound_receipt_matches?(cleanup.receipt, receipt_context, context)
+    found = if valid?, do: Enum.find(state.delivery_receipts, fn {_token, entry} -> entry.task == context.task and entry.socket == context.parent and entry.identity == identity end)
+
+    case found do
+      {token, %{envelope: nil} = entry} ->
+        envelope = %{registry: self(), token: token, context: receipt_context, receipt: receipt}
+        monitor = Process.monitor(actor)
+        entry = entry |> start_delivery_deadline(envelope) |> Map.merge(%{actor: actor, actor_monitor: monitor})
+        state = %{state | delivery_receipts: Map.put(state.delivery_receipts, token, entry), delivery_monitors: Map.put(state.delivery_monitors, monitor, {token, :actor})}
+        cleanup = Map.merge(cleanup, %{upstream_stop?: true, delivery_token: token})
+        {:reply, {:stop, envelope}, put_in(state.activities[activity].direct_cleanup, cleanup)}
+
+      {token, %{envelope: %{context: ^receipt_context, receipt: ^receipt} = envelope}} ->
+        cleanup = Map.merge(cleanup, %{upstream_stop?: true, delivery_token: token})
+        {:reply, {:stop, envelope}, put_in(state.activities[activity].direct_cleanup, cleanup)}
+
+      _ ->
+        {:reply, {:error, :delivery_identity_unavailable}, state}
+    end
+  end
+
+  defp grant_stopped_delivery(state, _activity, _cleanup, _context, _packet, _actor), do: {:reply, {:error, :delivery_identity_unavailable}, state}
+
+  defp wait_for_stopped_delivery(state, token, context, {caller, _} = from) do
+    case Map.get(state.delivery_receipts, token) do
+      %{task: ^caller, socket: socket, finished?: true, result: result} when socket == context.parent ->
+        {:reply, stopped_delivery_result(result), state}
+
+      %{task: ^caller, socket: socket, envelope: envelope, deadline_ms: deadline} = entry when socket == context.parent and is_map(envelope) and is_integer(deadline) ->
+        {:noreply, put_in(state.delivery_receipts[token].executor_waiters, [from | entry.executor_waiters])}
+
+      _ ->
+        {:reply, {:error, {:stopped, :delivery_identity_unavailable}}, state}
+    end
+  end
+
+  defp start_delivery_deadline(entry, envelope) do
+    timeout = DeliveryReceipt.persistence_timeout_ms(envelope.context)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    timer = Process.send_after(self(), {:delivery_receipt_deadline, envelope.token, deadline}, timeout)
+    %{entry | envelope: envelope, deadline_ms: deadline, deadline_timer: timer}
+  end
+
+  defp expire_delivery_at_deadline(state, token, entry, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      Logger.warning("websocket delivery receipt deadline expired outcome=aborted")
+      if is_pid(entry.actor), do: Process.exit(entry.actor, :kill)
+      state |> remove_delivery_receipt(token) |> mark_delivery_failure()
+    else
+      state
+    end
+  end
+
+  defp cancel_delivery_deadline(%{deadline_timer: timer}) when is_reference(timer), do: Process.cancel_timer(timer)
+  defp cancel_delivery_deadline(_entry), do: :ok
+  defp stopped_delivery_result(:ok), do: {:error, :stopped}
+  defp stopped_delivery_result({:error, reason}), do: {:error, {:stopped, reason}}
+  defp reply_executor_waiters(entry, result), do: Enum.each(entry.executor_waiters, &GenServer.reply(&1, stopped_delivery_result(result)))
+
+  defp delivery_enrollment_allowed?(%{draining?: false}, _task, _socket), do: true
+
+  defp delivery_enrollment_allowed?(%{drain: %{receipts_closed?: false}} = state, task, socket) do
+    case direct_entry(state, task) do
+      {_token, %{status: status, direct_parent: ^socket, direct_ref: ref}} when status in [:admitted, :cancelling] and is_reference(ref) -> true
+      _ -> false
+    end
+  end
+
+  defp delivery_enrollment_allowed?(_state, _task, _socket), do: false
+
+  defp enroll_delivery_receipt_state(state, task, socket, identity) do
+    case Enum.find(state.delivery_receipts, fn {_token, entry} -> entry.task == task and entry.identity == identity end) do
+      {token, _entry} ->
+        {:reply, {:ok, token}, state}
+
+      nil ->
+        state =
+          Enum.reduce(state.delivery_receipts, state, fn
+            {token, %{socket: ^socket, finished?: true, task: previous_task}}, acc -> prune_finished_delivery(acc, token, previous_task, task)
+            _, acc -> acc
+          end)
+
+        token = make_ref()
+        monitor = Process.monitor(socket)
+        entry = %{socket: socket, task: task, identity: identity, socket_monitor: monitor, actor: nil, actor_monitor: nil, envelope: nil, finished?: false, fallback?: false, waiters: [], acks: [], executor_waiters: [], result: nil, deadline_ms: nil, deadline_timer: nil}
+        state = %{state | delivery_receipts: Map.put(state.delivery_receipts, token, entry), delivery_monitors: Map.put(state.delivery_monitors, monitor, {token, :socket})}
+        send(socket, {:downstream_receipt_enrolled, task, identity, token})
+        {:reply, {:ok, token}, state}
+    end
+  end
+
+  defp prune_finished_delivery(state, token, previous_task, task) do
+    if previous_task == task or not Process.alive?(previous_task), do: remove_delivery_receipt(state, token), else: state
+  end
+
+  defp remember_delivery_ack(state, token, %{task: task} = entry, {:response_task, task, activity, outcome} = recipient) when is_reference(activity) do
+    if entry.finished? do
+      send_delivery_ack(recipient, entry.result)
+      state
+    else
+      put_in(state.delivery_receipts[token].acks, Enum.uniq([{:response_task, task, activity, outcome} | entry.acks]))
+    end
+  end
+
+  defp remember_delivery_ack(state, _token, _entry, _recipient), do: state
+
+  defp send_delivery_ack({:response_task, task, activity, outcome}, result) do
+    outcome = if result == :ok and outcome != :aborted, do: :completed, else: :aborted
+    send(task, {:websocket_response_delivery_ack, activity, outcome})
+  end
+
+  defp assign_delivery_receipt(state, token, entry, recipient) do
+    case delivery_actor(state, entry, recipient) do
+      {:ok, actor, message} ->
+        monitor = Process.monitor(actor)
+        entry = %{entry | actor: actor, actor_monitor: monitor}
+        state = %{state | delivery_receipts: Map.put(state.delivery_receipts, token, entry), delivery_monitors: Map.put(state.delivery_monitors, monitor, {token, :actor})}
+        send(actor, message.(entry.envelope))
+        {:ok, state}
+
+      :fallback ->
+        case DeliveryReceiptHandoff.start_fallback() do
+          {:ok, actor} ->
+            monitor = Process.monitor(actor)
+            entry = %{entry | actor: actor, actor_monitor: monitor, fallback?: true}
+            state = %{state | delivery_receipts: Map.put(state.delivery_receipts, token, entry), delivery_monitors: Map.put(state.delivery_monitors, monitor, {token, :actor})}
+            send(actor, {:settle_delivery_receipt, entry.envelope})
+            {:ok, state}
+
+          {:error, _reason} ->
+            {{:error, :worker_unavailable}, state |> mark_delivery_failure() |> remove_delivery_receipt(token)}
+        end
+    end
+  end
+
+  defp delivery_actor(state, entry, {:response_task, actor, activity, outcome}) do
+    case Map.get(state.activities, activity) do
+      %{pid: task, ack_pid: ^actor, status: status} when task == entry.task and (actor == task or status == :cancelling) ->
+        {:ok, actor, fn envelope -> {:websocket_response_delivery_ack, activity, outcome, envelope} end}
+
+      nil when actor == entry.task ->
+        {:ok, actor, fn envelope -> {:websocket_response_delivery_ack, activity, outcome, envelope} end}
+
+      _ ->
+        :fallback
+    end
+  end
+
+  defp delivery_actor(_state, %{task: lane, identity: identity}, {:native, lane, identity, outcome}),
+    do: {:ok, lane, fn envelope -> {:"$gen_cast", {:delivery_complete, identity, outcome, envelope}} end}
+
+  defp delivery_actor(_state, _entry, _recipient), do: :fallback
+
+  defp mark_delivery_failure(state), do: %{state | delivery_failed?: state.delivery_failed? or state.draining?}
+
+  defp pending_deliveries(state), do: Enum.count(state.delivery_receipts, fn {_token, entry} -> not entry.finished? end)
+
+  defp remove_delivery_receipt(state, token) do
+    case Map.pop(state.delivery_receipts, token) do
+      {nil, _} ->
+        state
+
+      {entry, entries} ->
+        cancel_delivery_deadline(entry)
+        reply_executor_waiters(entry, {:error, :receipt_aborted})
+        Enum.each(entry.waiters, &GenServer.reply(&1, {:settled, {:error, :delivery_aborted}}))
+        monitors = Enum.reject([entry.socket_monitor, entry.actor_monitor], &is_nil/1)
+        Enum.each(monitors, &Process.demonitor(&1, [:flush]))
+        %{state | delivery_receipts: entries, delivery_monitors: Map.drop(state.delivery_monitors, monitors)}
+    end
+  end
 
   defp server(opts), do: Keyword.get(opts, :name, __MODULE__)
 

@@ -14,10 +14,192 @@ defmodule CodexPooler.Gateway.Websocket.DeliveryReceiptTest do
   alias CodexPooler.Accounting.Attempt
   alias CodexPooler.Accounting.RequestLogs.DebugProjection.DownstreamDelivery
   alias CodexPooler.Gateway.Payloads.WebsocketTurnIdentity
+  alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
   alias CodexPooler.Gateway.Websocket.DeliveryReceipt
   alias CodexPooler.Repo
 
   @pushed_at ~U[2026-09-10 23:27:46.108000Z]
+
+  for kind <- [:direct, :proxy, :local_owner] do
+    test "#{kind} acknowledgement persists the real receipt before the task retires" do
+      alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
+      alias CodexPooler.Gateway.Websocket.{DeliveryReceiptHandoff, ResponseTask}
+      setup = CodexPooler.AccountingTestSupport.accounting_setup()
+      assert {:ok, reserved} = CodexPooler.Accounting.reserve(setup.auth, setup.model, %{"model" => setup.model.exposed_model_id, "input" => []}, %{endpoint: "/backend-api/codex/responses", transport: "websocket", correlation_id: Ecto.UUID.generate()})
+      request = reserved.request
+      assert {:ok, attempt} = CodexPooler.Accounting.create_attempt(request, setup.assignment)
+      registry = :"delivery-actor-#{System.unique_integer([:positive])}"
+      start_supervised!({ActivityRegistry, name: registry})
+      parent = self()
+      identity = %{request_id: request.id, attempt_id: attempt.id, replay_generation: 0}
+      result = if unquote(kind) == :local_owner, do: {:socket_response_result, :owner_completion_pending, :ok}, else: :ok
+
+      {:ok, actor} =
+        ResponseTask.start(
+          parent,
+          unquote(kind),
+          fn _ ->
+            {:ok, _token} = DeliveryReceiptHandoff.enroll(parent, identity, name: registry)
+            result
+          end,
+          fn _, _ -> :ok end,
+          activity_registry: registry
+        )
+
+      monitor = Process.monitor(actor)
+      assert_receive {:downstream_receipt_enrolled, ^actor, ^identity, obligation}
+      assert_receive {:websocket_response_activity, ^actor, activity}
+      assert_receive {:codex_response_done, ^actor, ^result}
+      receipt = DeliveryReceipt.build(%{outcome: "delivered", terminal_class: "response.completed", pushed_at: @pushed_at})
+      context = identity
+
+      log =
+        capture_log(fn ->
+          assert :ok = DeliveryReceiptHandoff.publish(obligation, context, receipt, {:response_task, actor, activity, :completed}, name: registry)
+          assert_receive {:DOWN, ^monitor, :process, ^actor, :normal}, 5_000
+        end)
+
+      refute log =~ "handoff failed"
+      stored = Repo.get!(Attempt, attempt.id).response_metadata
+      assert stored["downstream_delivery"] == receipt
+      assert ActivityRegistry.activities(name: registry) == []
+    end
+  end
+
+  test "the actual cancellation watcher persists its receipt before completing the activity" do
+    alias CodexPooler.Gateway.Websocket.{DeliveryReceiptHandoff, ResponseTask}
+    setup = CodexPooler.AccountingTestSupport.accounting_setup()
+    assert {:ok, reserved} = CodexPooler.Accounting.reserve(setup.auth, setup.model, %{"model" => setup.model.exposed_model_id, "input" => []}, %{endpoint: "/backend-api/codex/responses", transport: "websocket", correlation_id: Ecto.UUID.generate()})
+    assert {:ok, attempt} = CodexPooler.Accounting.create_attempt(reserved.request, setup.assignment)
+    registry = :"receipt-watcher-#{System.unique_integer([:positive])}"
+    start_supervised!({ActivityRegistry, name: registry})
+    parent = self()
+    identity = %{request_id: reserved.request.id, attempt_id: attempt.id, replay_generation: 0}
+
+    {:ok, task} =
+      ResponseTask.start(
+        parent,
+        :direct,
+        fn _ ->
+          {:ok, _} = DeliveryReceiptHandoff.enroll(parent, identity, name: registry)
+          send(parent, :running)
+
+          receive do
+            :finish -> :ok
+          end
+        end,
+        fn _, _ -> :ok end,
+        activity_registry: registry
+      )
+
+    monitor = Process.monitor(task)
+    assert_receive :running
+    assert_receive {:downstream_receipt_enrolled, ^task, ^identity, token}
+    [%{token: activity}] = ActivityRegistry.activities(name: registry)
+    :ok = ActivityRegistry.cancel(activity, :owner_drained, name: registry)
+    assert_receive {:websocket_response_activity_cancelled, ^task, ^activity, watcher, :owner_drained}
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+    assert :ok = DeliveryReceiptHandoff.publish(token, identity, receipt, {:response_task, watcher, activity, :aborted}, name: registry)
+    assert_receive {:DOWN, ^monitor, :process, ^task, :killed}, 5_000
+    assert Repo.get!(Attempt, attempt.id).response_metadata["downstream_delivery"] == receipt
+    assert ActivityRegistry.activities(name: registry) == []
+  end
+
+  for timing <- [:before_publish, :after_publish] do
+    test "a metadata-only fallback persists the original receipt when its actor dies #{timing}" do
+      alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
+      alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
+      setup = CodexPooler.AccountingTestSupport.accounting_setup()
+      assert {:ok, reserved} = CodexPooler.Accounting.reserve(setup.auth, setup.model, %{"model" => setup.model.exposed_model_id, "input" => []}, %{endpoint: "/backend-api/codex/responses", transport: "websocket", correlation_id: Ecto.UUID.generate()})
+      assert {:ok, attempt} = CodexPooler.Accounting.create_attempt(reserved.request, setup.assignment)
+      identity = %{request_id: reserved.request.id, attempt_id: attempt.id, replay_generation: 0}
+      registry = :"delivery-fallback-#{System.unique_integer([:positive])}"
+      start_supervised!({ActivityRegistry, name: registry})
+      parent = self()
+
+      actor =
+        spawn(fn ->
+          {:ok, token} = DeliveryReceiptHandoff.enroll(parent, identity, name: registry)
+          send(parent, {:actor_enrolled, token})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      monitor = Process.monitor(actor)
+      assert_receive {:actor_enrolled, token}
+      {_epoch, []} = ActivityRegistry.begin_drain(name: registry)
+      receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+
+      if unquote(timing) == :before_publish do
+        send(actor, :stop)
+        assert_receive {:DOWN, ^monitor, :process, ^actor, :normal}
+      end
+
+      log =
+        capture_log(fn ->
+          assert :ok = DeliveryReceiptHandoff.publish(token, identity, receipt, {:native, actor, identity, :aborted}, name: registry)
+
+          if unquote(timing) == :after_publish do
+            send(actor, :stop)
+            assert_receive {:DOWN, ^monitor, :process, ^actor, :normal}
+          end
+
+          await_delivery_barrier(registry, System.monotonic_time(:millisecond) + 5_000)
+        end)
+
+      refute log =~ "not persisted"
+      assert Repo.get!(Attempt, attempt.id).response_metadata["downstream_delivery"] == receipt
+      assert %{closed?: true, entries: [], pending_producers: 0, producers_failed?: false} = ActivityRegistry.receipt_cohort(name: registry)
+      assert ActivityRegistry.activities(name: registry) == []
+    end
+  end
+
+  defp await_delivery_barrier(registry, deadline) do
+    case ActivityRegistry.receipt_cohort(name: registry) do
+      %{closed?: true, pending_producers: 0} ->
+        :ok
+
+      _pending ->
+        assert System.monotonic_time(:millisecond) < deadline
+
+        receive do
+        after
+          1 -> await_delivery_barrier(registry, deadline)
+        end
+    end
+  end
+
+  test "an outer transaction cannot report receipt persistence before its actual commit" do
+    alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
+    %{request: request, attempt: attempt} = fixture()
+    registry = start_supervised!({ActivityRegistry, name: nil})
+    identity = %{request_id: request.id, attempt_id: attempt.id, replay_generation: 0}
+    {:ok, token} = DeliveryReceiptHandoff.enroll(self(), identity, name: registry)
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+    {:ok, envelope} = ActivityRegistry.take_delivery_cleanup(token, identity, receipt, name: registry)
+
+    assert {:ok, :ok} =
+             Repo.transaction(fn ->
+               assert {:error, :receipt_uncommitted_transaction} = DeliveryReceiptHandoff.settle(envelope)
+               assert is_nil(Repo.reload!(attempt).response_metadata["downstream_delivery"])
+               :ok
+             end)
+
+    assert :sys.get_state(registry).delivery_receipts[token].result == {:error, :receipt_not_persisted}
+    assert is_nil(Repo.reload!(attempt).response_metadata["downstream_delivery"])
+  end
+
+  test "record_result reports persistence failure while record retains the legacy ok contract" do
+    missing = %{request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate()}
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+
+    capture_log(fn ->
+      assert {:error, :attempt_not_found} = DeliveryReceipt.record_result(missing, receipt)
+      assert :ok = DeliveryReceipt.record(missing, receipt)
+    end)
+  end
 
   test "build keeps the receipt bounded to the fixed vocabulary" do
     receipt =

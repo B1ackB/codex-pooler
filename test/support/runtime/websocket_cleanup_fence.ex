@@ -23,8 +23,9 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFence do
 
   `await_session_cleanups!/0` is the barrier behind it: it waits for every
   session cleanup task running when it is called, whoever started it, and
-  `DataCase.stop_sandbox/2` calls it in every test before the sandbox owner
-  stops, so these cleanups still finish under a live owner. The fence is still needed for the order of teardown and for its log
+  `await_sandbox_cleanups!/1` calls it before waiting for that sandbox owner's
+  registered receipt obligations and metadata writers. `DataCase.stop_sandbox/2`
+  uses that combined barrier before stopping the owner. The fence is still needed for the order of teardown and for its log
   handling, which are described below.
 
   `CodexResponsesSocket.terminate/2` runs its owner or direct cleanup in a
@@ -426,6 +427,96 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFence do
         case result do
           :ok -> :ok
           {:unfinished, count} -> flunk("#{count} websocket session cleanup(s) still running #{timeout} ms before the sandbox owner stops")
+        end
+    end
+  end
+
+  @doc "Waits for this sandbox owner's registered receipt writers as well as session cleanup."
+  @spec await_sandbox_cleanups!(pid(), non_neg_integer()) :: :ok
+  def await_sandbox_cleanups!(owner, timeout \\ @budget_ms) when is_pid(owner) and is_integer(timeout) and timeout >= 0 do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    await_session_cleanups!(timeout)
+    await_receipts(owner, MapSet.new(), MapSet.new(), deadline, timeout)
+  end
+
+  defp await_receipts(owner, tokens, actors, deadline, timeout) do
+    # Test-only, read-only snapshots: receipt_cohort/0 would close the producer
+    # barrier. Sensitive ResponseTasks cannot be classified by their dictionary.
+    %{delivery_receipts: receipts} = cleanup_snapshot!(CodexPooler.Gateway.Transports.Websocket.ActivityRegistry, deadline)
+    {checkouts, mode} = sandbox_ownership_snapshot!(deadline)
+
+    tokens =
+      Enum.reduce(receipts, tokens, fn {token, entry}, selected ->
+        if receipt_owner(entry, checkouts, mode) == owner, do: MapSet.put(selected, token), else: selected
+      end)
+
+    selected = Map.take(receipts, MapSet.to_list(tokens))
+    actors = Enum.reduce(selected, actors, fn {_token, entry}, seen -> if is_pid(entry.actor), do: MapSet.put(seen, entry.actor), else: seen end)
+    # Native receipt actors can be long-lived owners. Their acknowledged SQL
+    # completion releases the obligation without requiring that owner to exit.
+    completed = for {_token, %{finished?: true, result: :ok, actor: actor}} <- selected, do: actor
+    actors = MapSet.difference(actors, MapSet.new(completed))
+    live = Enum.filter(actors, &Process.alive?/1)
+    pending = Enum.count(selected, fn {_token, entry} -> not entry.finished? end)
+
+    cond do
+      pending == 0 and live == [] ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("#{pending} receipt obligation(s) and #{length(live)} receipt actor(s) still running #{timeout} ms before the sandbox owner stops")
+
+      true ->
+        # Re-read the same tokens after actor DOWN: the registry may assign a
+        # fallback writer. A frame, result, or executor DOWN is not SQL completion.
+        receive do
+        after
+          min(@poll_ms, max(deadline - System.monotonic_time(:millisecond), 0)) ->
+            if System.monotonic_time(:millisecond) >= deadline do
+              flunk("#{pending} receipt obligation(s) and #{length(live)} receipt actor(s) still running #{timeout} ms before the sandbox owner stops")
+            else
+              await_receipts(owner, tokens, actors, deadline, timeout)
+            end
+        end
+    end
+  end
+
+  defp sandbox_ownership_snapshot!(deadline) do
+    %{pid: manager, opts: opts} = Ecto.Adapter.lookup_meta(CodexPooler.Repo)
+    true = opts[:pool] == DBConnection.Ownership
+    %{checkouts: checkouts, mode: mode} = cleanup_snapshot!(manager, deadline)
+    true = is_map(checkouts)
+    true = mode in [:manual, :auto] or match?({:shared, pid} when is_pid(pid), mode)
+
+    {checkouts, mode}
+  end
+
+  defp cleanup_snapshot!(server, deadline) do
+    :sys.get_state(server, max(deadline - System.monotonic_time(:millisecond), 0))
+  catch
+    :exit, reason -> flunk("receipt cleanup snapshot failed before the sandbox owner stops: #{inspect(reason)}")
+  end
+
+  defp receipt_owner(entry, checkouts, mode) do
+    explicit =
+      Enum.find_value([entry.actor, entry.task, entry.socket], fn pid ->
+        case Map.get(checkouts, pid) do
+          nil -> nil
+          {kind, ref, proxy} when kind in [:owner, :allowed] and is_reference(ref) and is_pid(proxy) -> {ref, proxy}
+        end
+      end)
+
+    case explicit do
+      {ref, proxy} ->
+        Enum.find_value(checkouts, fn
+          {pid, {:owner, ^ref, ^proxy}} -> pid
+          _ -> nil
+        end)
+
+      nil ->
+        case mode do
+          {:shared, owner} -> owner
+          mode when mode in [:manual, :auto] -> nil
         end
     end
   end

@@ -328,6 +328,25 @@ defmodule CodexPooler.Gateway.Websocket.DeliveryReceipt do
   """
   @spec record(context(), receipt()) :: :ok
   def record(context, receipt) when is_map(context) and is_map(receipt) do
+    _result = record_result(context, receipt)
+    :ok
+  end
+
+  @doc false
+  @spec persistence_timeout_ms(context()) :: pos_integer()
+  def persistence_timeout_ms(%{request_id: request, replay_generation: generation}) when is_binary(request) and is_integer(generation) do
+    # Ecto SQL and DBConnection use this timeout when the Repo has no override.
+    case Keyword.get(Repo.config(), :timeout, 15_000) do
+      timeout when is_integer(timeout) and timeout > 0 -> timeout
+      _unbounded_or_invalid -> @persist_timeout_ms
+    end
+  end
+
+  def persistence_timeout_ms(_context), do: @persist_timeout_ms
+
+  @doc false
+  @spec record_result(context(), receipt()) :: :ok | {:error, term()}
+  def record_result(context, receipt) when is_map(context) and is_map(receipt) do
     request_id = DiagnosticTaxonomy.safe_correlator(Map.get(context, :request_id))
     session_id = DiagnosticTaxonomy.safe_correlator(Map.get(context, :codex_session_id))
     transport = vocabulary(receipt["transport"], @transports, @default_transport)
@@ -346,9 +365,9 @@ defmodule CodexPooler.Gateway.Websocket.DeliveryReceipt do
 
     case Map.get(context, :attempt_id) do
       attempt_id when is_binary(attempt_id) ->
-        attempt_id
-        |> persist(receipt, context)
-        |> log_persist_failure(transport, request_id, session_id)
+        result = persist(attempt_id, receipt, context)
+        log_persist_failure(result, transport, request_id, session_id)
+        result
 
       _missing ->
         :ok

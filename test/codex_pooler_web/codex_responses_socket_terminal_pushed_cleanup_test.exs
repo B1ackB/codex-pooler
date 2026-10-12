@@ -22,6 +22,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTerminalPushedCleanupTest do
   alias CodexPooler.Gateway.Persistence.{CodexSession, SessionContinuity}
   alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
   alias CodexPooler.Gateway.Websocket, as: Gateway
+  alias CodexPooler.Gateway.Websocket.DeliveryReceiptHandoff
   alias CodexPooler.Gateway.Websocket.DirectCleanup
   alias CodexPoolerWeb.CodexResponsesSocket
 
@@ -61,6 +62,39 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTerminalPushedCleanupTest do
     end
   end
 
+  test "a retired native task cannot replace a later task's state or emit its terminal" do
+    fixture = fixture()
+
+    old_task =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    current_task =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn ->
+      send(old_task, :stop)
+      send(current_task, :stop)
+    end)
+
+    registry = start_supervised!({ActivityRegistry, name: nil})
+    state = %{opts: RequestOptions.for_websocket(%{}), codex_session: fixture.session, tasks: MapSet.new([current_task]), task_monitors: %{}, queued_response_payloads: :queue.new(), response_task_activities: %{}, response_task_activity_registry: registry, direct_cleanup_receipts: %{}, downstream_delivery_evidence: %{current_task => %{frames: 1, terminal_class: nil, pushed_at: nil, skipped?: false}}}
+    before_request = Repo.reload!(fixture.request)
+    before_attempt = Repo.reload!(fixture.attempt)
+    result = {:response_task_failure, {:error, %{status: 499, code: :client_disconnected, message: "request failed", param: nil}}}
+    assert {:ok, ^state} = CodexResponsesSocket.handle_info({:codex_response_done, old_task, result}, state)
+    assert Repo.reload!(fixture.request) == before_request
+    assert Repo.reload!(fixture.attempt) == before_attempt
+    assert Process.alive?(current_task)
+  end
+
   defp cleanup_fixture(fixture) do
     registry = start_supervised!({ActivityRegistry, name: nil})
     parent = self()
@@ -86,6 +120,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTerminalPushedCleanupTest do
          send(parent, {:codex_response_done, self(), {:response_task_failure, {:error, error}}})
 
          receive do
+           {:websocket_response_delivery_ack, ^token, _outcome, envelope} -> :ok = DeliveryReceiptHandoff.settle(envelope)
            {:websocket_response_delivery_ack, ^token, _outcome} -> :ok
          after
            @timeout_ms -> :ok

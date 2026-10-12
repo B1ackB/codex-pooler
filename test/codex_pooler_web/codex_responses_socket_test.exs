@@ -2836,13 +2836,15 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTest do
                 "internal_reason" => "quota_exhausted"
               })
             ] do
-          state = %{tasks: MapSet.new(), task_monitors: %{}}
+          state = %{tasks: MapSet.new([self()]), task_monitors: %{}}
 
-          assert {:push, {:text, payload}, ^state} =
+          assert {:push, {:text, payload}, resulting_state} =
                    CodexResponsesSocket.handle_info(
                      {:codex_response_done, self(), {:error, error}},
                      state
                    )
+
+          assert resulting_state.tasks == MapSet.new()
 
           assert %{
                    "type" => "error",
@@ -2903,7 +2905,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTest do
           assert {:push, {:text, payload}, _state} =
                    CodexResponsesSocket.handle_info(
                      {:codex_response_done, self(), {:error, reason}},
-                     %{tasks: MapSet.new(), task_monitors: %{}}
+                     %{tasks: MapSet.new([self()]), task_monitors: %{}}
                    )
 
           decoded = CodexPooler.JSON.decode!(payload)
@@ -2936,16 +2938,17 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTest do
       token: "Bearer websocket-secret-token"
     }
 
-    state = %{tasks: MapSet.new(), task_monitors: %{}}
+    state = %{tasks: MapSet.new([self()]), task_monitors: %{}}
 
     {_result, logs} =
       with_native_turn_log(:warning, fn ->
-        assert {:push, {:text, payload}, ^state} =
+        assert {:push, {:text, payload}, resulting_state} =
                  CodexResponsesSocket.handle_info(
                    {:codex_response_done, self(), {:error, secret_reason}},
                    state
                  )
 
+        assert resulting_state.tasks == MapSet.new()
         decoded = CodexPooler.JSON.decode!(payload)
         assert decoded["type"] == "error"
         assert decoded["status"] == 500

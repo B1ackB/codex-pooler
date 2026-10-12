@@ -514,7 +514,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
 
       case wait_or_owner_down(owner, owner_ref, drain_policy, wait_ms) do
         {:drained, reply} ->
-          {:drained, reply, :completed}
+          # Exact shutdown proves the owner drained; only :settled proves its active turn completed.
+          {:drained, reply, :aborted}
 
         :owner_down ->
           :failed
@@ -531,7 +532,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
   defp poll_owner_status(owner, owner_ref, deadline_ms, drain_policy) do
     case owner_status(owner, owner_ref, deadline_ms, drain_policy) do
       {:drained, reply} ->
-        {:drained, reply, :completed}
+        {:drained, reply, :aborted}
 
       {:ok, %{active_turn?: false, compact_delivery_status: status}} when status in [:terminal_error, :aborted, :skipped] ->
         :aborted

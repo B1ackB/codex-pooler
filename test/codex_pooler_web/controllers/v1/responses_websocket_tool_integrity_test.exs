@@ -73,7 +73,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketToolIntegrityTest do
       payload = %{"type" => "response.create", "model" => setup.model.exposed_model_id, "input" => [%{"type" => "message", "role" => "user", "content" => [%{"type" => "input_text", "text" => "synthetic tool integrity turn"}]}], "stream" => true}
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, CodexPooler.JSON.encode!(payload))
       {conn, websocket, ["response.completed"], _prior} = receive_terminal!(conn, websocket, ref, [])
-      assert_receive {Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @timeout
+      assert await_request_finalized!(setup, []) == "succeeded"
       await_registration!(registration)
       prior_alias = Repo.one!(response_alias_query(setup, "resp_prior_tool_fixture"))
       assert prior_alias.status == "active"
@@ -81,7 +81,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketToolIntegrityTest do
       assert %{"lifecycle_id" => prior_lifecycle, "generation" => prior_generation} = prior_attempt.response_metadata["upstream_websocket_connection"]
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, CodexPooler.JSON.encode!(payload))
       {conn, websocket, types, terminal} = receive_terminal!(conn, websocket, ref, [])
-      assert_receive {Events, %{reason: "request_finalized", payload: %{"status" => status}}}, @timeout
+      status = await_request_finalized!(setup, [prior_attempt.request_id])
       observed = Repo.one!(from r in Request, where: r.pool_id == ^setup.pool.id and r.id != ^prior_attempt.request_id)
       observed_settlement = Repo.one!(from l in LedgerEntry, where: l.request_id == ^observed.id and l.entry_kind == "settlement")
       TestDiagnostics.puts("F4_LEGACY topology=#{topology} kind=#{kind} defect=#{defect} shape=#{terminal_shape} terminal=#{List.last(types)} status=#{status} request_id=#{observed.id} input=#{observed_settlement.input_tokens} output=#{observed_settlement.output_tokens} cache_write=#{observed_settlement.cache_write_tokens} provider_requests=#{length(FakeUpstream.requests(upstream))} invalid_alias=#{Repo.exists?(response_alias_query(setup, "resp_invalid_tool_fixture"))}")
@@ -124,10 +124,11 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketToolIntegrityTest do
       assert length(FakeUpstream.requests(upstream)) == 2
       prior_after_lookup = Repo.get!(BridgeSessionAlias, prior_alias.id)
       assert Map.drop(Map.from_struct(prior_after_lookup), [:last_seen_at, :expires_at, :updated_at]) == Map.drop(Map.from_struct(prior_alias), [:last_seen_at, :expires_at, :updated_at])
+      prior_request_ids = Repo.all(from request in Request, where: request.pool_id == ^setup.pool.id, select: request.id)
       :atomics.put(registration_gate, 1, 1)
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, CodexPooler.JSON.encode!(payload))
       {conn, _websocket, ["response.completed"], _healthy} = receive_terminal!(conn, websocket, ref, [])
-      assert_receive {Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @timeout
+      assert await_request_finalized!(setup, prior_request_ids) == "succeeded"
       await_registration!(registration)
       assert length(FakeUpstream.requests(upstream)) == 3
       healthy_alias = Repo.one!(response_alias_query(setup, "resp_healthy_tool_fixture"))
@@ -176,7 +177,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketToolIntegrityTest do
       payload = %{"type" => "response.create", "model" => setup.model.exposed_model_id, "input" => [%{"type" => "message", "role" => "user", "content" => [%{"type" => "input_text", "text" => "synthetic tool status turn"}]}], "stream" => true}
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, CodexPooler.JSON.encode!(payload))
       {conn, _websocket, types, terminal} = receive_terminal!(conn, websocket, ref, [])
-      assert_receive {Events, %{reason: "request_finalized", payload: %{"status" => finalized}}}, @timeout
+      finalized = await_request_finalized!(setup, [])
       assert "response.output_item.done" in types
       request = Repo.one!(from r in Request, where: r.pool_id == ^setup.pool.id)
 
@@ -248,6 +249,12 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketToolIntegrityTest do
     assert Enum.all?(FakeUpstream.requests(upstream), &(&1.method == "WEBSOCKET"))
     assert :ok = FakeUpstream.verify!(upstream)
     TestDiagnostics.puts("F4_BRIDGE request_id=#{request.id} terminal=error settlement=failed input=5457 output=2 cache_write=5454 release=1 provider_requests=2 healthy_legacy=completed")
+  end
+
+  defp await_request_finalized!(setup, prior_request_ids) do
+    request_id = Repo.one!(from request in Request, where: request.pool_id == ^setup.pool.id and request.id not in ^prior_request_ids, select: request.id)
+    assert_receive {Events, %{reason: "request_finalized", payload: %{"request_id" => ^request_id, "status" => status}}}, @timeout
+    status
   end
 
   defp response_alias_query(setup, response_id) do

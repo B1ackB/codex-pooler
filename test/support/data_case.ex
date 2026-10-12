@@ -95,7 +95,7 @@ defmodule CodexPooler.DataCase do
   finds the owner already stopped and does nothing more.
 
   Before the owner stops it waits for every websocket session cleanup still
-  running (`WebsocketCleanupFence.await_session_cleanups!/0`), in every test,
+  running (`WebsocketCleanupFence.await_sandbox_cleanups!/1`), in every test,
   whether or not the test installed the websocket cleanup fence.
   """
   @spec stop_sandbox(pid(), term()) :: :ok
@@ -103,7 +103,7 @@ defmodule CodexPooler.DataCase do
     # A websocket session cleanup deferred past `terminate/2` and still running
     # would otherwise reach its next query after the owner stopped and lose its
     # writes on an `OwnershipError` (findings#206 row 206-405).
-    if Process.alive?(pid), do: WebsocketCleanupFence.await_session_cleanups!()
+    if Process.alive?(pid), do: WebsocketCleanupFence.await_sandbox_cleanups!(pid)
 
     TouchDebounce.reset()
 

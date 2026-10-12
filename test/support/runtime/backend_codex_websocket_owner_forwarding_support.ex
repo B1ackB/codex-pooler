@@ -542,14 +542,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport do
     end
   end
 
-  def assert_forwarding_cardinality!(request, codex_session_id, status) do
+  def assert_forwarding_cardinality!(request, codex_session_id, status, expected_turn_status \\ nil) do
+    expected_turn_status = expected_turn_status || status
+
     {request, attempt, turn, settlement, fact} =
-      await_forwarding_persistence!(request.id, codex_session_id, status)
+      await_forwarding_persistence!(request.id, codex_session_id, status, 1_000, expected_turn_status)
 
     assert Repo.aggregate(from(r in Request, where: r.id == ^request.id), :count) == 1
     assert attempt.status == status
     assert settlement.attempt_id == attempt.id
-    assert turn.status == status
+    assert turn.status == expected_turn_status
     assert turn.final_attempt_id == attempt.id
     assert fact.latest_attempt_id == attempt.id
     assert fact.latest_attempt_number == 1
@@ -564,13 +566,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport do
     {request, attempt, turn, settlement, fact}
   end
 
-  def await_forwarding_persistence!(request_id, codex_session_id, status, attempts \\ 1_000)
+  def await_forwarding_persistence!(request_id, codex_session_id, status, attempts \\ 1_000, expected_turn_status \\ nil)
 
-  def await_forwarding_persistence!(_request_id, _codex_session_id, _status, 0) do
+  def await_forwarding_persistence!(_request_id, _codex_session_id, _status, 0, _expected_turn_status) do
     flunk("expected finalized forwarding persistence")
   end
 
-  def await_forwarding_persistence!(request_id, codex_session_id, status, attempts) do
+  def await_forwarding_persistence!(request_id, codex_session_id, status, attempts, expected_turn_status) do
+    expected_turn_status = expected_turn_status || status
     request = Repo.get(Request, request_id)
     request_attempts = Repo.all(from(a in Attempt, where: a.request_id == ^request_id))
 
@@ -585,7 +588,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport do
     fact = Repo.get(RequestLogFact, request_id)
 
     case {request, request_attempts, turns, settlements, fact} do
-      {%Request{status: ^status, completed_at: %DateTime{}} = request, [%Attempt{status: ^status, completed_at: %DateTime{}} = attempt], [%CodexTurn{status: ^status, completed_at: %DateTime{}} = turn], [%LedgerEntry{} = settlement], %RequestLogFact{} = fact}
+      {%Request{status: ^status, completed_at: %DateTime{}} = request, [%Attempt{status: ^status, completed_at: %DateTime{}} = attempt], [%CodexTurn{status: ^expected_turn_status, completed_at: %DateTime{}} = turn], [%LedgerEntry{} = settlement], %RequestLogFact{} = fact}
       when settlement.attempt_id == attempt.id and turn.final_attempt_id == attempt.id and
              fact.latest_attempt_id == attempt.id and
              fact.latest_settlement_entry_id == settlement.id ->
@@ -593,7 +596,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport do
 
       _not_finalized ->
         yield_once({:await_forwarding_persistence, request_id, attempts})
-        await_forwarding_persistence!(request_id, codex_session_id, status, attempts - 1)
+        await_forwarding_persistence!(request_id, codex_session_id, status, attempts - 1, expected_turn_status)
     end
   end
 

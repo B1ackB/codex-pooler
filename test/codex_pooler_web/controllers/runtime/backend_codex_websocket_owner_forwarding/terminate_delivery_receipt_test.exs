@@ -47,7 +47,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.TerminateD
     {:ok, owner_pid} = WebsocketOwnerSession.lookup(state.codex_session.id)
     Sandbox.allow(Repo, self(), owner_pid)
 
-    {result, log} = with_info_log(fn -> CodexResponsesSocket.terminate(:closed, state) end)
+    {result, log} =
+      with_info_log(fn ->
+        result = CodexResponsesSocket.terminate(:closed, state)
+        [request] = request_logs(setup.pool.id)
+        await_delivery_receipt!(request.id, System.monotonic_time(:millisecond) + 15_000)
+        result
+      end)
+
     assert result == :ok
 
     [request] = request_logs(setup.pool.id)
@@ -68,6 +75,21 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.TerminateD
     assert Repo.all(from entry in LedgerEntry, where: entry.request_id == ^request.id, select: entry.entry_kind) == ["reservation"]
 
     await_owner_cleanup!(state.codex_session.id)
+  end
+
+  defp await_delivery_receipt!(request_id, deadline) do
+    attempt = Repo.one(from a in Attempt, where: a.request_id == ^request_id)
+
+    if attempt && is_map(attempt.response_metadata["downstream_delivery"]) do
+      :ok
+    else
+      assert System.monotonic_time(:millisecond) < deadline
+
+      receive do
+      after
+        1 -> await_delivery_receipt!(request_id, deadline)
+      end
+    end
   end
 
   @detection_timeout_ms 15_000
