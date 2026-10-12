@@ -3626,7 +3626,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     state =
       state
       |> clear_compaction_retry_submit_hold()
-      |> cancel_pending_admissions("owner_drained")
       |> drop_deferred_upstream_close(:draining)
 
     state = %{
@@ -3639,17 +3638,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     state =
       if DownstreamState.active_turn?(state) do
         terminate_predecessor_task(state.active_turn)
-        state = record_drain_interruption(state)
-        settle_active_turn(state, {:error, :owner_drained})
+        state = put_in(state.active_turn[:receipt_failure], %{receipt_failure(:owner_drained) | response_status_code: 499})
+
+        case retain_interrupted_receipt(state, {:error, :owner_drained}) do
+          {:started, next} -> next
+          :none -> state |> record_drain_interruption() |> settle_active_turn({:error, :owner_drained})
+        end
       else
         :ok = notify_drained_downstream(state, how)
         state
       end
 
+    state = if match?(%{receipt_settlement: receipt} when is_map(receipt), state.active_turn), do: state, else: cancel_pending_admissions(state, "owner_drained")
     %{state | draining?: true, owner_exit_cause: :drain_cut}
   end
-
-  defp record_drain_interruption(%{active_turn: %{receipt_settlement: receipt}} = state) when is_map(receipt), do: state
 
   defp record_drain_interruption(state) do
     case Persistence.interrupt_codex_session(state, :owner_drained) do
@@ -3752,10 +3754,23 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
     case forwarded_turn_settlement(state) do
       :pending -> {:noreply, await_forwarded_turn_settlement(state, from)}
-      :settled -> {:stop, :normal, drain_reply(:settled), drain_now(state, :settled)}
-      :none -> {:stop, :normal, drain_reply(:cut), drain_now(state, :cut)}
+      :settled -> finish_or_defer_owner_drain(state, from, :settled)
+      :none -> finish_or_defer_owner_drain(state, from, :cut)
     end
   end
+
+  defp finish_or_defer_owner_drain(state, from, how) do
+    state = drain_now(state, how)
+
+    if match?(%{receipt_settlement: receipt} when is_map(receipt), state.active_turn) do
+      {:noreply, append_receipt_drain_waiter(state, from, how)}
+    else
+      {:stop, :normal, drain_reply(how), state}
+    end
+  end
+
+  defp append_receipt_drain_waiter(%{drain_replies: {waiters, reply}} = state, from, _how), do: %{state | drain_replies: {[from | waiters], reply}}
+  defp append_receipt_drain_waiter(state, from, how), do: %{state | drain_replies: {[from], drain_reply(how)}}
 
   # A waiting drain is answered once the owner's exit is persisted
   # (`terminate/2`), as `{:stop, _, reply, _}` answers a drain that does not
@@ -3763,7 +3778,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   # what follows the owner's exit.
   defp finish_drain_settlement(%{drain_settlement: %{waiters: waiters}} = state, how) do
     state = drain_now(%{state | drain_settlement: nil}, how)
-    {:stop, :normal, %{state | drain_replies: {Enum.reverse(waiters), drain_reply(how)}}}
+    state = %{state | drain_replies: {Enum.reverse(waiters), drain_reply(how)}}
+    if match?(%{receipt_settlement: receipt} when is_map(receipt), state.active_turn), do: {:noreply, state}, else: {:stop, :normal, state}
   end
 
   defp answer_drain_waiters(%{drain_replies: {waiters, reply}}), do: Enum.each(waiters, &GenServer.reply(&1, reply))
@@ -4450,8 +4466,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
         reply = {:error, %{body: "", headers: []} |> Map.merge(if(is_map(error), do: error, else: %{reason: error})) |> Map.put(:response_usage, snapshot.usage)}
         active = state.active_turn |> cancel_predecessor_delivery_timers() |> Map.put(:receipt_producer, nil) |> Map.put(:receipt_settlement, %{ref: ref, pid: worker, monitor: monitor, token: token, cancellation_reply: reply})
         state = %{state | active_turn: active}
-        state = if state.retire_after_active_turn?, do: state, else: reply_receipt_cancellation(state, reply)
-        send(worker, {:initialize_receipt, token, snapshot})
+        interruption = if state.draining? and snapshot.failure.error_code == "owner_drained", do: {state.active_turn.cleanup_witness, state.persistence.interrupt_codex_session}
+        state = if state.retire_after_active_turn? or interruption, do: state, else: reply_receipt_cancellation(state, reply)
+        send(worker, {:initialize_receipt, token, snapshot, interruption})
         {:started, state}
 
       {:error, _reason} ->
@@ -4465,20 +4482,28 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     owner_monitor = Process.monitor(owner)
 
     receive do
-      {:initialize_receipt, token, snapshot} ->
+      {:initialize_receipt, token, snapshot, interruption} ->
         Process.demonitor(owner_monitor, [:flush])
+        interrupted = interrupt_retained_drain(interruption)
         disposition = receipt_disposition(finalizer.(snapshot))
         :ok = ActivityRegistry.complete_receipt_settlement(token, disposition, name: registry)
-        send(owner, {:websocket_owner_receipt_settled, turn_ref, ref, token, disposition})
+        send(owner, {:websocket_owner_receipt_settled, turn_ref, ref, token, {disposition, interrupted}})
 
       {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
         :ok
     end
   end
 
+  defp interrupt_retained_drain(nil), do: false
+  defp interrupt_retained_drain({witness, callback}), do: Persistence.interrupt_owner_receipt(witness, :owner_drained, callback) == :ok
+
   defp receipt_disposition({:ok, %{finalization_disposition: disposition}}) when disposition in [:inserted, :reused, :replaced], do: disposition
   defp receipt_disposition({:stale_generation, _result}), do: :superseded
   defp receipt_disposition(_result), do: :failed
+
+  defp complete_owner_receipt(state, {disposition, interrupted}) do
+    complete_owner_receipt(%{state | exit_interrupted?: state.exit_interrupted? or interrupted}, disposition)
+  end
 
   defp complete_owner_receipt(state, disposition) do
     result = state.active_turn.receipt_settlement.cancellation_reply
@@ -4588,6 +4613,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
       settle_active_turn(state, result)
     end
   end
+
+  defp continue_or_retire(%{drain_replies: {_waiters, _reply}, active_turn: nil} = state), do: {:stop, :normal, state}
 
   defp continue_or_retire(%{retire_after_active_turn?: true, active_turn: nil} = state),
     do: {:stop, :owner_crashed, state}

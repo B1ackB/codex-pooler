@@ -10,8 +10,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RetainedUs
   alias CodexPooler.Access
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.FakeUpstream
-  alias CodexPooler.Gateway.Persistence.CodexTurn
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
+  alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, CodexTurn}
+  alias CodexPooler.Gateway.Transports.Websocket.{ActivityRegistry, RolloutDrain, WebsocketOwnerSession}
+  alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport
+  alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport.VirtualDeadline
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Platform.InstancePresence.Identity
   alias CodexPooler.Repo
@@ -77,6 +79,107 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RetainedUs
       assert FakeUpstream.count(upstream) == 1
       record_evidence(%{scenario: "admitted_legacy_caller_dropped_usage", fixture_port: URI.parse(FakeUpstream.url(upstream)).port, topology: :peer, mode: mode, owner_node: Atom.to_string(peer.node), caller_node: Atom.to_string(node()), request_id: request_id, attempt_id: attempt_id, replay_generation: Repo.get!(Attempt, attempt_id).replay_generation, settlement_id: settlement.id, total_tokens: 120, request_status: request.status, error_code: request.last_error_code, actual_additive_field_dropped: true, provider_generations: 1})
     end
+  end
+
+  for force_cut <- [false, true] do
+    @tag retained_sql_drain: true
+    test "known receipt registers before blocked interruption SQL (force_cut=#{force_cut})", do: run_sql_drain(unquote(force_cut))
+  end
+
+  defp run_sql_drain(force_cut) do
+    OwnerCrashAfterSendScenario.per_process_connections!()
+    assert_namespace!()
+    harness = WebsocketRolloutDrainSupport.start_rollout_drain_harness(self())
+    hold = make_ref()
+    upstream = start_upstream(FakeUpstream.websocket_text_frames([encode(completed())]))
+    setup = gateway_setup(upstream)
+    register_unboxed_pool_cleanup!(setup)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {session, owner} = start_remote_session_owner!(auth, %{session_header: @window, session_header_source: "x-codex-window-id"}, node(), :real, upstream: held_terminal_writer_boundary(self(), hold), receipt_registry: harness.activity_registry, terminal_delivery_timeout_ms: 30_000)
+    port = start_public_endpoint!()
+    {conn, ws, ref, _} = public_websocket_connect_with_request_headers!(port, setup, Ecto.UUID.generate(), "/backend-api/codex/responses", socket_headers("full"))
+    {conn, _ws} = public_websocket_send_text!(conn, ws, ref, encode(%{"type" => "response.create", "model" => setup.model.exposed_model_id, "instructions" => "synthetic instructions", "input" => [%{"role" => "user", "content" => "synthetic question"}], "tools" => [], "stream" => true}))
+    on_exit(fn -> Mint.HTTP.close(conn) end)
+    assert_receive {:held_terminal_writer, writer, ^hold}, @timeout
+    on_exit(fn -> send(writer, {:discard_terminal_writer, hold}) end)
+    pending = await_pending!(owner, deadline())
+    request_id = pending.active_turn.admission_request_id
+    assert {:ok, %{response_usage: %{total_tokens: 120}}} = pending.active_turn.pending_result
+    {:ok, lock} = Postgrex.start_link(Keyword.take(Repo.config(), [:hostname, :port, :username, :password, :database]))
+    Process.unlink(lock)
+    on_exit(fn -> if Process.alive?(lock), do: GenServer.stop(lock) end)
+    Postgrex.query!(lock, "BEGIN", [])
+    %{rows: [[backend]]} = Postgrex.query!(lock, "SELECT pg_backend_pid() FROM requests WHERE id=$1 FOR UPDATE", [Ecto.UUID.dump!(request_id)])
+    drain = Task.async(fn -> RolloutDrain.start_drain([name: harness.name, timeout_ms: 5_000] ++ WebsocketRolloutDrainSupport.deadline_options(harness.deadline)) end)
+    clock = harness.deadline
+    assert_receive {:rollout_drain_deadline_wait, ^clock, _}, @timeout
+    assert %{pending_producers: 1, entries: []} = ActivityRegistry.receipt_cohort(name: harness.activity_registry)
+    VirtualDeadline.advance(clock, :sys.get_state(harness.name).deadline_ms)
+
+    try do
+      worker = await_sql_receipt_worker!(harness.activity_registry, System.monotonic_time(:millisecond) + 2_000)
+      assert {:ok, %{active_turn?: true}} = WebsocketOwnerSession.owner_status(owner)
+      assert worker != owner
+      assert_sql_blocker!(backend, deadline())
+      assert :ok = WebsocketOwnerSession.detach_downstream(owner, pending.downstream)
+      assert [%{pid: ^worker, kind: :receipt_settlement}] = ActivityRegistry.activities(name: harness.activity_registry)
+      state = :sys.get_state(owner)
+      receipt = state.active_turn.receipt_settlement
+      send(owner, {:websocket_owner_receipt_settled, make_ref(), receipt.ref, receipt.token, :inserted})
+      WebsocketOwnerSession.detach_downstream(owner, pending.downstream)
+      assert :sys.get_state(owner).active_turn.receipt_settlement == receipt
+
+      if force_cut do
+        worker_monitor = Process.monitor(worker)
+        VirtualDeadline.advance(clock, 1_000)
+        assert_receive {:DOWN, ^worker_monitor, :process, ^worker, :killed}, @timeout
+        assert %{entries: [%{status: {:finished, :aborted}}]} = ActivityRegistry.receipt_cohort(name: harness.activity_registry)
+      end
+    after
+      Postgrex.query!(lock, "ROLLBACK", [])
+      GenServer.stop(lock)
+    end
+
+    if not force_cut do
+      settlement = await_settlement!(request_id, deadline())
+      assert settlement.total_tokens == 120
+      assert {Repo.get!(Request, request_id).last_error_code, Repo.get!(Request, request_id).response_status_code} == {"owner_drained", 499}
+      assert Repo.one!(from(t in CodexTurn, where: t.request_id == ^request_id)).status == "interrupted"
+      assert Repo.aggregate(from(e in LedgerEntry, where: e.request_id == ^request_id and e.entry_kind == "settlement" and e.amount_status == "recorded"), :count) == 1
+    end
+
+    VirtualDeadline.advance(clock, 200)
+    summary = Task.await(drain, @timeout)
+    assert_sql_drain_outcome(summary, force_cut)
+    assert %DateTime{} = Repo.get!(CodexSession, session.id).disconnected_at
+    lease = Repo.get_by!(BridgeOwnerLease, codex_session_id: session.id, lease_token: session.owner_lease_token)
+    assert lease.status == "released"
+    assert lease.metadata["owner_exit_cause"] == "drain_cut"
+    send(writer, {:discard_terminal_writer, hold})
+    Mint.HTTP.close(conn)
+    WebsocketCleanupFence.await_session_cleanups!()
+    assert :ok = WebsocketRolloutDrainSupport.await_rollout_drain_harness(harness)
+    record_evidence(%{scenario: "sql_held_actual_drain", force_cut: force_cut, request_id: request_id, blocker_backend: backend, total_tokens: 120, receipt_seen: summary.receipt_settlements_seen, receipt_completed: summary.receipt_settlements_completed, actual_sql_blocker_observed: true})
+  end
+
+  defp assert_sql_drain_outcome(summary, false) do
+    assert %{result: :ok, receipt_settlements_seen: 1, receipt_settlements_completed: 1, receipt_settlements_aborted: 0, receipt_producers_failed?: false} = summary
+  end
+
+  defp assert_sql_drain_outcome(summary, true) do
+    assert %{result: :error, receipt_settlements_seen: 1, receipt_settlements_completed: 0, receipt_settlements_aborted: 1, receipt_producers_failed?: false} = summary
+  end
+
+  defp await_sql_receipt_worker!(registry, limit) do
+    case ActivityRegistry.activities(name: registry) do
+      [%{kind: :receipt_settlement, pid: worker}] -> worker
+      _ -> retry!(fn -> await_sql_receipt_worker!(registry, limit) end, limit, "held known receipt was not registered before blocked drain persistence")
+    end
+  end
+
+  defp assert_sql_blocker!(backend, limit) do
+    %{rows: [[count]]} = Repo.query!("SELECT count(*) FROM pg_stat_activity WHERE $1::integer = ANY(pg_blocking_pids(pid))", [backend])
+    if count > 0, do: :ok, else: retry!(fn -> assert_sql_blocker!(backend, limit) end, limit, "no blocked SQL backend observed")
   end
 
   defp run_scenario(topology, mode, interruption) do

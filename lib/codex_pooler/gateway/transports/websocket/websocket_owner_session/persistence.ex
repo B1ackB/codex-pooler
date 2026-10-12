@@ -92,6 +92,21 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Persist
     _kind, failure -> persist_interruption_failure(state, reason, failure)
   end
 
+  @doc "Runs the original owner interruption in an independently registered receipt worker."
+  @spec interrupt_owner_receipt(OwnerCleanup.t(), atom(), function()) :: :ok | {:error, term()}
+  def interrupt_owner_receipt(%OwnerCleanup{} = witness, reason, callback) do
+    opts = owner_interrupt_options(reason, witness.owner_lease_token, witness)
+
+    case callback.(witness.session_id, opts) do
+      {:error, failure} -> {:error, failure}
+      _result -> :ok
+    end
+  rescue
+    exception -> {:error, exception}
+  catch
+    _kind, failure -> {:error, failure}
+  end
+
   defp persist_session_interruption(state, reason) do
     opts = interrupt_options(reason, state)
 
@@ -153,10 +168,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Persist
   defp interrupt_options(reason, state) do
     witness = OwnerCleanup.from_owner_state(state)
 
+    owner_interrupt_options(reason, state.owner_lease_token, witness)
+  end
+
+  defp owner_interrupt_options(reason, lease_token, witness) do
     %{
       interrupt_reason: Atom.to_string(reason),
       reconnect_window_seconds: 300,
-      websocket_owner_lease_token: state.owner_lease_token
+      websocket_owner_lease_token: lease_token
     }
     |> RequestOptions.for_websocket()
     |> OwnerCleanup.put_options(witness)

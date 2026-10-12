@@ -3461,6 +3461,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
       owner_monitor = Process.monitor(owner)
 
+      drain_task = if interruption == :drain, do: Task.async(fn -> WebsocketOwnerSession.drain_owner(owner) end)
+
       case interruption do
         :submitter_down ->
           Process.unlink(submitter.pid)
@@ -3474,7 +3476,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
           Process.exit(:sys.get_state(owner).upstream_pid, :kill)
 
         :drain ->
-          assert :ok = WebsocketOwnerSession.drain_owner(owner)
+          :ok
 
         _ ->
           assert :ok = WebsocketOwnerSession.detach_downstream(owner, downstream)
@@ -3496,7 +3498,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
       assert snapshot.failure.response_status_code == if(interruption in [:timeout, :invalidation_failure], do: 502, else: 499)
       assert worker != owner and worker != active.task_pid
       on_exit(fn -> send(worker, :release_receipt) end)
-      if interruption not in [:submitter_down, :retirement], do: assert({:error, %{body: "", response_usage: %{total_tokens: 120}}} = Task.await(submitter, @detection_timeout_ms))
+      if interruption not in [:submitter_down, :retirement, :drain], do: assert({:error, %{body: "", response_usage: %{total_tokens: 120}}} = Task.await(submitter, @detection_timeout_ms))
       assert %{pending_producers: 0} = registry_module.receipt_cohort(name: registry)
       assert [%{pid: ^worker, kind: :receipt_settlement}] = registry_module.activities(name: registry)
 
@@ -3526,7 +3528,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
       if interruption == :worker_failure, do: Process.exit(worker, :kill), else: send(worker, :release_receipt)
       assert_receive {:DOWN, ^monitor, :process, ^worker, worker_reason}, @detection_timeout_ms
       assert worker_reason == if(interruption == :worker_failure, do: :killed, else: :normal)
-      if interruption == :retirement, do: assert({:error, %{body: "", response_usage: %{total_tokens: 120}}} = Task.await(submitter, @detection_timeout_ms))
+      if interruption in [:retirement, :drain], do: assert({:error, %{body: "", response_usage: %{total_tokens: 120}}} = Task.await(submitter, @detection_timeout_ms))
+      if drain_task, do: assert(:ok = Task.await(drain_task, @detection_timeout_ms))
       if interruption not in [:owner_death, :drain, :retirement], do: assert(%{active_turn: nil} = await_active_turn_cleared(owner))
       if interruption in [:drain, :retirement], do: assert_receive({:DOWN, ^owner_monitor, :process, ^owner, _}, @detection_timeout_ms)
       expected_outcome = if interruption == :worker_failure, do: :failed, else: :completed
