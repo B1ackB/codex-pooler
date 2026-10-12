@@ -114,6 +114,16 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement do
     |> accounting_result(:finalize_partial_stream_failure, request, attempt)
   end
 
+  @doc false
+  @spec reconcile(Request.t(), Attempt.t(), attrs(), OwnerWitness.t(), [SettlementRetry.option()]) :: finalization_result()
+  def reconcile(request, attempt, attrs, owner_witness, retry_options \\ []) do
+    attrs = complete_turn_before_commit(Map.new(attrs), nil, nil, attempt, owner_witness)
+
+    :reconcile_retained_usage
+    |> SettlementRetry.run(request, attempt, fn -> Accounting.reconcile_request_with_disposition(request, attempt, attrs) end, retry_options)
+    |> accounting_result(:reconcile_retained_usage, request, attempt)
+  end
+
   @spec record_retryable_failure(Request.t(), Attempt.t(), attrs()) :: settlement_result()
   def record_retryable_failure(request, attempt, attrs) do
     attrs = Map.put_new(attrs, :now, DateTime.utc_now() |> DateTime.truncate(:microsecond))
