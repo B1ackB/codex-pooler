@@ -894,7 +894,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
 
   defp matching_consumed_replay?(_attempt, nil), do: false
 
-  @delivery_failure_codes ~w(client_disconnected owner_drained owner_forward_timeout downstream_delivery_timeout stream_interrupted owner_unavailable downstream_stream_error stream_idle_timeout upstream_stream_error)
+  @delivery_failure_codes ~w(client_disconnected owner_drained owner_crashed owner_forward_timeout downstream_delivery_timeout stream_interrupted owner_unavailable downstream_stream_error stream_idle_timeout upstream_stream_error)
 
   defp delivery_failure(%{status: status, response_status_code: response_status_code, error_code: code})
        when status in ["failed", "cancelled"] and code in @delivery_failure_codes and is_integer(response_status_code) and response_status_code >= 100 and response_status_code <= 599,

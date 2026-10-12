@@ -17,7 +17,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.RetainedUsage do
   @type t :: %__MODULE__{session_id: Ecto.UUID.t(), pool_id: Ecto.UUID.t(), api_key_id: Ecto.UUID.t(), request_id: Ecto.UUID.t(), attempt_id: Ecto.UUID.t(), replay_generation: non_neg_integer(), owner_witness: OwnerWitness.t(), usage: ResponseUsage.usage(), failure: failure()}
   @type failure_evidence :: %{request_id: Ecto.UUID.t(), attempt_id: Ecto.UUID.t(), replay_generation: non_neg_integer(), counters: map(), reason_class: atom()}
   @type result :: AttemptSettlement.finalization_result() | {:noop, :identity_mismatch} | {:error, failure_evidence()}
-  @failure_codes ~w(client_disconnected owner_drained owner_forward_timeout downstream_delivery_timeout stream_interrupted owner_unavailable downstream_stream_error stream_idle_timeout upstream_stream_error)
+  @failure_codes ~w(client_disconnected owner_drained owner_crashed owner_forward_timeout downstream_delivery_timeout stream_interrupted owner_unavailable downstream_stream_error stream_idle_timeout upstream_stream_error)
   @counters [:input_tokens, :cached_input_tokens, :cache_write_tokens, :output_tokens, :reasoning_tokens, :total_tokens]
 
   @doc "Pure capture from internal owner authority. No owner state, frames or schema structs cross to the worker."

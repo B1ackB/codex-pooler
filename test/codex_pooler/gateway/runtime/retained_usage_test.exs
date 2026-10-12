@@ -239,6 +239,60 @@ defmodule CodexPooler.Gateway.Runtime.RetainedUsageTest do
     end
   end
 
+  @tag :owner_crashed_boundary
+  test "owner_crashed witness corrects an existing charge without new usage", %{fixture: fixture} do
+    first = Sandbox.unboxed_run(Repo, fn -> settle_first(fixture, :known_first) end)
+    failure = %{@failure | error_code: "owner_crashed"}
+
+    assert {:ok, corrected} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Accounting.reconcile_request_with_disposition(fixture.request, fixture.attempt, %{delivery_failure: failure})
+             end)
+
+    assert corrected.request.status == "failed"
+    assert corrected.request.last_error_code == "owner_crashed"
+    assert corrected.attempt.response_metadata["delivery_failure"]["error_code"] == "owner_crashed"
+    assert corrected.settlement == first.settlement
+  end
+
+  for order <- [:receipt_first, :known_first, :delivered] do
+    @tag owner_crashed_boundary: true, owner_crashed_order: order
+    test "captured owner_crashed receipt #{order} preserves exact charge and delivery authority", %{fixture: fixture, owner_crashed_order: order} do
+      first = Sandbox.unboxed_run(Repo, fn -> settle_first(fixture, order) end)
+      failure = %{@failure | error_code: "owner_crashed"}
+      assert {:ok, snapshot} = RetainedUsage.capture(fixture.witness, fixture.principal, @usage, failure)
+      assert snapshot.failure.error_code == "owner_crashed"
+      assert {:ok, corrected} = Sandbox.unboxed_run(Repo, fn -> RetainedUsage.finalize(snapshot) end)
+      assert {:ok, duplicate} = Sandbox.unboxed_run(Repo, fn -> RetainedUsage.finalize(snapshot) end)
+      assert duplicate.settlement == corrected.settlement
+      if first, do: assert(corrected.settlement == first.settlement)
+      state = projection(fixture)
+      assert state.recorded == 1
+      assert state.window.known_total_tokens == 12
+      assert state.request_status == if(order == :delivered, do: "succeeded", else: "failed")
+      assert state.turn_status == if(order == :delivered, do: "succeeded", else: "failed")
+      assert corrected.request.last_error_code == if(order == :delivered, do: nil, else: "owner_crashed")
+      assert Decimal.equal?(corrected.settlement.settled_cost_micros, Decimal.new(140))
+      CodexPooler.TestDiagnostics.puts("owner_crashed order=#{order} original=#{fixture.request.id}/#{fixture.attempt.id} database=#{Repo.config()[:database]} charge_reused=true committed_projection=#{inspect(state)} outcome=passed")
+    end
+  end
+
+  @tag :owner_crashed_boundary
+  test "owner crash addition does not accept unsupported or malformed failure codes", %{fixture: fixture} do
+    first = Sandbox.unboxed_run(Repo, fn -> settle_first(fixture, :known_first) end)
+    before_state = projection(fixture)
+
+    for code <- ["owner_crashed_untrusted", "owner_crashed\n", String.duplicate("owner_crashed", 100)] do
+      failure = %{@failure | error_code: code}
+      assert {:error, :invalid_receipt} = RetainedUsage.capture(fixture.witness, fixture.principal, @usage, failure)
+      assert {:ok, ignored} = Sandbox.unboxed_run(Repo, fn -> Accounting.reconcile_request_with_disposition(fixture.request, fixture.attempt, %{delivery_failure: failure}) end)
+      assert ignored.settlement == first.settlement
+      refute Map.has_key?(ignored.attempt.response_metadata, "delivery_failure")
+    end
+
+    assert projection(fixture) == before_state
+  end
+
   defp settle_first(_fixture, :receipt_first), do: nil
 
   defp settle_first(fixture, :unknown_first) do
