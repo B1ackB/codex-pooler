@@ -11,6 +11,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.Admin.PoolFilterComponents
+  alias CodexPoolerWeb.Admin.PoolForm
   alias CodexPoolerWeb.Admin.PoolWizardComponents
   alias CodexPoolerWeb.Admin.ProviderCreditsWorkflow
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
@@ -303,6 +304,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   def handle_event("cancel_edit", _params, socket) do
     {:noreply, push_patch(socket, to: upstreams_path(socket))}
   end
+
+  def handle_event("save_pool", %{"wizard_step" => step, "pool_edit" => attrs}, socket) when is_map(attrs) do
+    with %{id: pool_id} <- socket.assigns.editing_pool,
+         {:ok, pool} <- PoolEditorWorkflow.find_editable_pool(socket.assigns.current_scope, pool_id) do
+      form = PoolForm.edit_form(pool, Map.put(attrs, "id", pool_id))
+      socket = assign(socket, :pool_edit_form, form)
+      handle_event("pool_wizard_step", %{"step" => step}, socket)
+    else
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("save_pool", %{"wizard_step" => _step}, socket), do: {:noreply, socket}
 
   def handle_event("save_pool", %{"pool_edit" => pool_params}, socket) do
     {:noreply,

@@ -8244,6 +8244,70 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     refute html =~ second_refresh
   end
 
+  test "embedded Pool wizard retains unsaved fields across steps without persistence", %{conn: conn} do
+    pool = pool_fixture(%{name: "Embedded step state"})
+    other_pool = pool_fixture(%{name: "Other editor target"})
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    %{api_key: api_key} = api_key_fixture(pool)
+    %{assignment: other_assignment} = upstream_assignment_fixture(other_pool)
+    %{api_key: other_key} = api_key_fixture(other_pool)
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams?edit_pool_id=#{pool.id}&step=details")
+    _ = render_async(view)
+
+    snapshot = fn ->
+      {Repo.reload!(pool), Repo.reload!(other_pool), Pools.get_routing_settings(pool), Repo.aggregate(CodexPooler.Pools.Pool, :count), Repo.aggregate(AuditEvent, :count), Repo.all(PoolUpstreamAssignment), Repo.all(CodexPooler.Access.APIKey)}
+    end
+
+    before = snapshot.()
+    attrs = %{"name" => "Unsaved embedded name", "routing_strategy" => "quota_first", "bridge_ring_size" => "7", "v1_compatibility_enabled" => "false", "allow_image_generation" => "false", "allow_audio_transcription" => "false", "upstream_identity_ids" => [assignment.upstream_identity_id, other_assignment.upstream_identity_id], "api_key_ids" => [api_key.id, other_key.id]}
+
+    view |> form("#pool-edit-form", %{"pool_edit" => attrs}) |> put_submitter("#pool-edit-dialog-tab-upstreams") |> render_submit()
+    assert snapshot.() == before
+    assert_patch(view, ~p"/admin/upstreams?edit_pool_id=#{pool.id}&step=upstreams")
+
+    for step <- ["api-keys", "routing", "models", "details"] do
+      view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-#{step}") |> render_submit()
+      assert_patch(view, ~p"/admin/upstreams?edit_pool_id=#{pool.id}&step=#{step}")
+      assert has_element?(view, "#pool-edit-dialog-tab-#{step}[aria-selected='true'][formnovalidate]")
+      assert has_element?(view, "#pool_edit_name[value='Unsaved embedded name']")
+      assert has_element?(view, "#pool_edit_bridge_ring_size[value='7']")
+      assert has_element?(view, "#pool_edit_routing_strategy_quota_first[checked]")
+
+      for field <- ~w(v1_compatibility_enabled allow_image_generation allow_audio_transcription) do
+        refute has_element?(view, "#pool_edit_#{field}[checked]")
+      end
+
+      assert has_element?(view, "input[name='pool_edit[upstream_identity_ids][]'][value='#{assignment.upstream_identity_id}'][checked]")
+      assert has_element?(view, "input[name='pool_edit[api_key_ids][]'][value='#{api_key.id}'][checked]")
+      assert has_element?(view, "input[name='pool_edit[upstream_identity_ids][]'][value='#{other_assignment.upstream_identity_id}'][checked]")
+      assert has_element?(view, "input[name='pool_edit[api_key_ids][]'][value='#{other_key.id}'][checked]")
+      assert snapshot.() == before
+    end
+
+    for params <- [%{"wizard_step" => "upstreams"} | Enum.map([nil, [], 7], &%{"wizard_step" => "upstreams", "pool_edit" => &1})] do
+      render_submit(view, "save_pool", params)
+      assert has_element?(view, "#pool-edit-dialog-tab-details[aria-selected='true']")
+      assert snapshot.() == before
+    end
+
+    render_submit(view, "save_pool", %{"wizard_step" => "routing", "pool_edit" => Map.put(attrs, "id", other_pool.id)})
+    assert_patch(view, ~p"/admin/upstreams?edit_pool_id=#{pool.id}&step=routing")
+    assert has_element?(view, "#pool_edit_id[value='#{pool.id}']")
+    assert snapshot.() == before
+    refute has_element?(view, "#flash-error")
+
+    view |> form("#pool-edit-form") |> render_submit()
+    assert Repo.reload!(pool).name == "Unsaved embedded name"
+    assert Repo.reload!(other_pool).name == "Other editor target"
+    settings = Pools.get_routing_settings(pool)
+    assert settings.routing_strategy == "quota_first"
+    assert settings.bridge_ring_size == 7
+    refute settings.v1_compatibility_enabled
+    assert Repo.get_by!(PoolUpstreamAssignment, pool_id: pool.id, upstream_identity_id: other_assignment.upstream_identity_id).status == "active"
+    assert Repo.reload!(other_key).pool_id == pool.id
+    assert Repo.aggregate(AuditEvent, :count) > elem(before, 4)
+  end
+
   test "renders one upstream account card with Pool assignments from two Pools", %{
     conn: conn,
     scope: scope
@@ -8334,14 +8398,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, "#pool_edit_id[value='#{source_pool.id}']")
 
     _ = render_async(view)
-    view |> element("#pool-edit-dialog-tab-models") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-models") |> render_submit()
 
     assert_patch(view, ~p"/admin/upstreams?edit_pool_id=#{source_pool.id}&step=models")
     assert has_element?(view, "#pool-edit-dialog-tab-models[aria-selected='true']")
     _ = render_async(view)
     refute has_element?(view, "#pool-model-serving-panel[data-state='loading']")
 
-    view |> element("#pool-edit-dialog-tab-upstreams") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-upstreams") |> render_submit()
 
     assert_patch(
       view,
@@ -8427,6 +8491,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       )
 
     refute has_element?(permalink_view, "#pool-edit-dialog")
+
+    before = {Repo.reload!(pool), Repo.aggregate(AuditEvent, :count)}
+    render_submit(permalink_view, "save_pool", %{"wizard_step" => "routing", "pool_edit" => %{"id" => pool.id, "name" => "Unauthorized change"}})
+    refute has_element?(permalink_view, "#pool-edit-dialog")
+    assert {Repo.reload!(pool), Repo.aggregate(AuditEvent, :count)} == before
   end
 
   test "invalid Codex auth.json keeps submitted content out of the rendered form", %{
