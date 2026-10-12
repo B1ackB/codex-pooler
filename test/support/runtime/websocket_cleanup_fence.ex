@@ -436,9 +436,12 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFence do
   def await_sandbox_cleanups!(owner, timeout \\ @budget_ms) when is_pid(owner) and is_integer(timeout) and timeout >= 0 do
     deadline = System.monotonic_time(:millisecond) + timeout
     await_session_cleanups!(timeout)
-    await_receipts(owner, MapSet.new(), MapSet.new(), deadline, timeout)
+    await_receipts(owner, [], [], deadline, timeout)
   end
 
+  # Carry semantic identities across polls; keep the opaque set representation
+  # inside each poll behind MapSet's public conversions.
+  @spec await_receipts(pid(), [reference()], [pid()], integer(), non_neg_integer()) :: :ok
   defp await_receipts(owner, tokens, actors, deadline, timeout) do
     # Test-only, read-only snapshots: receipt_cohort/0 would close the producer
     # barrier. Sensitive ResponseTasks cannot be classified by their dictionary.
@@ -446,12 +449,12 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFence do
     {checkouts, mode} = sandbox_ownership_snapshot!(deadline)
 
     tokens =
-      Enum.reduce(receipts, tokens, fn {token, entry}, selected ->
+      Enum.reduce(receipts, MapSet.new(tokens), fn {token, entry}, selected ->
         if receipt_owner(entry, checkouts, mode) == owner, do: MapSet.put(selected, token), else: selected
       end)
 
     selected = Map.take(receipts, MapSet.to_list(tokens))
-    actors = Enum.reduce(selected, actors, fn {_token, entry}, seen -> if is_pid(entry.actor), do: MapSet.put(seen, entry.actor), else: seen end)
+    actors = Enum.reduce(selected, MapSet.new(actors), fn {_token, entry}, seen -> if is_pid(entry.actor), do: MapSet.put(seen, entry.actor), else: seen end)
     # Native receipt actors can be long-lived owners. Their acknowledged SQL
     # completion releases the obligation without requiring that owner to exit.
     completed = for {_token, %{finished?: true, result: :ok, actor: actor}} <- selected, do: actor
@@ -475,7 +478,7 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFence do
             if System.monotonic_time(:millisecond) >= deadline do
               flunk("#{pending} receipt obligation(s) and #{length(live)} receipt actor(s) still running #{timeout} ms before the sandbox owner stops")
             else
-              await_receipts(owner, tokens, actors, deadline, timeout)
+              await_receipts(owner, MapSet.to_list(tokens), MapSet.to_list(actors), deadline, timeout)
             end
         end
     end
