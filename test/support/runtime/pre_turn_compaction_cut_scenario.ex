@@ -67,6 +67,9 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   def expected(:unobserved_cut, topology), do: expected_unobserved(topology)
   def expected(cut, _topology) when cut in [:observed_cut, :observed_cut_exited], do: expected(:before_output)
 
+  def expected(:observed_cut_claim_held, :direct_committed),
+    do: %{expected(:before_output) | retries: [{409, "duplicate_turn"}, :served]}
+
   # The cut predecessor's settlement is held past the socket's take-over wait
   # (findings#206 row 206-580): the first retry takes the compaction over but
   # cannot see it settle within the bound (`inherited_turn_unsettled`), meets
@@ -923,6 +926,15 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     assert {:pending, elapsed} = Task.await(reader, @detection_timeout_ms)
     assert elapsed < 1_000
     assert_receive {:DOWN, ^reader_monitor, :process, _, :normal}, @detection_timeout_ms
+
+    await!(
+      fn ->
+        Repo.query!("SELECT pg_stat_clear_snapshot()")
+        Repo.query!("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)", [reader_backend]).rows == [[false]]
+      end,
+      "the timed-out receipt reader backend remained connected before the lock release"
+    )
+
     send(holder.pid, {:release_compact_read_lock, ref})
     assert {:ok, :ok} = Task.await(holder, @detection_timeout_ms)
     assert_receive {:DOWN, ^holder_monitor, :process, _, :normal}, @detection_timeout_ms
@@ -949,27 +961,29 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
       {:skipped, %{delivered | "outcome" => "skipped"}, :skipped}
     ]
 
+    # Classification reads use the test detection budget. The separate
+    # blocked-reader and owner-deadline scenarios retain their runtime bounds.
     try do
-      assert :pending = Interruption.compact_delivery_status(witness, 100)
+      assert :pending = Interruption.compact_delivery_status(witness, @detection_timeout_ms)
 
       for {name, receipt, expected} <- cases do
         assert :ok = DeliveryReceipt.persist(witness.attempt_id, receipt)
-        assert Interruption.compact_delivery_status(witness, 100) == expected, "receipt classification #{name}"
+        assert Interruption.compact_delivery_status(witness, @detection_timeout_ms) == expected, "receipt classification #{name}"
       end
 
       assert :ok = DeliveryReceipt.persist(witness.attempt_id, delivered)
 
       for key <- [:session_id, :request_id, :attempt_id, :owner_lease_token] do
-        assert :pending = Interruption.compact_delivery_status(Map.put(witness, key, Ecto.UUID.generate()), 100)
+        assert :pending = Interruption.compact_delivery_status(Map.put(witness, key, Ecto.UUID.generate()), @detection_timeout_ms)
       end
 
-      assert :pending = Interruption.compact_delivery_status(%{witness | replay_generation: 2}, 100)
-      assert :pending = Interruption.compact_delivery_status(%{witness | downstream_epoch: witness.downstream_epoch + 1}, 100)
+      assert :pending = Interruption.compact_delivery_status(%{witness | replay_generation: 2}, @detection_timeout_ms)
+      assert :pending = Interruption.compact_delivery_status(%{witness | downstream_epoch: witness.downstream_epoch + 1}, @detection_timeout_ms)
 
       assert {:error, :matrix_complete} =
                Repo.transaction(fn ->
                  Repo.update_all(from(a in Attempt, where: a.id == ^witness.attempt_id), set: [status: "in_progress"])
-                 assert :pending = Interruption.compact_delivery_status(witness, 100)
+                 assert :pending = Interruption.compact_delivery_status(witness, @detection_timeout_ms)
                  Repo.rollback(:matrix_complete)
                end)
     after
@@ -1290,7 +1304,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     retries
   end
 
-  defp cut_and_resend(cut, ctx, client, port, upstream, release_ref) when cut in [:observed_cut, :observed_cut_exited, :observed_cut_settlement_held] do
+  defp cut_and_resend(cut, ctx, client, port, upstream, release_ref) when cut in [:observed_cut, :observed_cut_exited, :observed_cut_settlement_held, :observed_cut_claim_held] do
     await_barrier!(0, release_ref)
     closing_socket = if cut == :observed_cut_settlement_held, do: attached_socket!(ctx)
     # The connection closes before the provider produced anything and the
@@ -1307,11 +1321,9 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
       await_compaction_settled!(ctx.setup.pool.id, ["succeeded", "failed"])
     end
 
-    ctx = if cut == :observed_cut_settlement_held, do: hold_predecessor_settlement!(ctx, closing_socket), else: ctx
-    retries = released_client_retries!(ctx, port, release)
-    if List.last(retries) == :served, do: release.()
+    retries = resend_after_observed_cut(cut, ctx, port, release, closing_socket)
     release_held_compaction!(upstream, release_ref, 1)
-    if cut == :observed_cut_settlement_held, do: retries, else: within_settlement_bound(retries, ctx)
+    retries
   end
 
   defp cut_and_resend(cut, ctx, client, port, upstream, release_ref) do
@@ -1611,6 +1623,40 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
 
   defp within_settlement_bound(retries, _ctx), do: retries
 
+  defp resend_after_observed_cut(:observed_cut, %{topology: :direct_committed} = ctx, port, release, _socket) do
+    # A direct retry cannot take over an owner. First-service success requires
+    # its actual closing cleanup and all original terminal rows to be ready.
+    release.()
+    await_cut_compaction_settled!(ctx.setup.pool.id)
+    released_client_retries!(ctx, port, release)
+  end
+
+  defp resend_after_observed_cut(:observed_cut_claim_held, ctx, port, release, _socket) do
+    ctx |> hold_direct_claim_settlement!(release) |> released_client_retries!(port, release)
+  end
+
+  defp resend_after_observed_cut(cut, ctx, port, release, closing_socket) do
+    ctx = if cut == :observed_cut_settlement_held, do: hold_predecessor_settlement!(ctx, closing_socket), else: ctx
+    retries = released_client_retries!(ctx, port, release)
+    if List.last(retries) == :served, do: release.()
+    if cut == :observed_cut_settlement_held, do: retries, else: within_settlement_bound(retries, ctx)
+  end
+
+  defp hold_direct_claim_settlement!(ctx, release) do
+    [predecessor] = Enum.filter(pool_requests(ctx.setup.pool.id), &compaction_row?/1)
+
+    Map.put(ctx, :after_first_retry, fn started_at, finished_at ->
+      assert finished_at - started_at >= 1_000, "the live compact claim did not receive its original one-second wait"
+      assert Repo.get!(Request, predecessor.id).status == "in_progress"
+      assert Repo.get_by!(CodexTurn, request_id: predecessor.id).status == "in_progress"
+      assert length(pool_requests(ctx.setup.pool.id)) == 2
+      assert FakeUpstream.physical_counts(ctx.upstream).websocket_generation == 2
+      assert charges(predecessor) == 0
+      release.()
+      await_cut_compaction_settled!(ctx.setup.pool.id)
+    end)
+  end
+
   # Holds the cut request's settlement: the first query the closing socket's
   # own processes (its response task, which settles the request the owner
   # cancelled at the take-over) make once the retries start, other than its
@@ -1650,11 +1696,16 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
           from(request in Request,
             join: turn in CodexTurn,
             on: turn.request_id == request.id,
+            join: attempt in Attempt,
+            on: attempt.id == turn.final_attempt_id and attempt.request_id == request.id,
             where: request.pool_id == ^pool_id and request.endpoint == @compact_endpoint,
-            select: {request.status, turn.status}
+            select: {request.status, attempt.status, turn.status}
           )
         )
-        |> Enum.all?(fn {request_status, turn_status} -> request_status not in ["accepted", "in_progress"] and turn_status != "in_progress" end)
+        |> case do
+          [{request_status, attempt_status, turn_status}] -> request_status not in ["accepted", "in_progress"] and attempt_status not in ["queued", "in_progress"] and turn_status != "in_progress"
+          _missing_or_ambiguous -> false
+        end
       end,
       "the cut compaction's settlement never finished after its hold was released"
     )
@@ -1967,39 +2018,23 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   #
   # With owner forwarding off the cleanup's first query opens the transaction
   # that stops the direct task, so there it is held at that query (committed
-  # rows: the held connection stalls nobody else) and released as soon as a
-  # claim starts waiting for the running request (the claim's
-  # `live_predecessor_wait` event); nothing else releases it before the HTTPS
-  # fallback.
+  # rows: the held connection stalls nobody else). Each scenario releases it
+  # explicitly before its positive retry or after its held-live refusal.
   defp hold_session_cleanups!(count, topology) do
     hold = make_ref()
-    held = :ets.new(:held_session_cleanups, [:public, :set])
     handler_id = {__MODULE__, :session_cleanup_hold, hold}
     on_exit(fn -> :telemetry.detach(handler_id) end)
-    config = %{hold: hold, test: self(), count: count, claimed: :atomics.new(1, []), held: held, any_query?: topology == :direct_committed}
+    config = %{hold: hold, test: self(), count: count, claimed: :atomics.new(1, []), any_query?: topology == :direct_committed}
     :ok = :telemetry.attach(handler_id, [:codex_pooler, :repo, :query], &__MODULE__.hold_session_cleanup_query/4, config)
-
-    if topology == :direct_committed do
-      wait_handler_id = {__MODULE__, :claim_wait_release, hold}
-      on_exit(fn -> :telemetry.detach(wait_handler_id) end)
-      :ok = :telemetry.attach(wait_handler_id, [:codex_pooler, :accounting, :websocket_turn_claim, :live_predecessor_wait], &__MODULE__.release_on_claim_wait/4, config)
-    end
 
     hold
   end
 
   @doc false
-  def release_on_claim_wait(_event, _measurements, _metadata, %{hold: hold, held: held}) do
-    for {cleanup} <- :ets.tab2list(held), do: send(cleanup, {hold, :release})
-    :ok
-  end
-
-  @doc false
-  def hold_session_cleanup_query(_event, _measurements, metadata, %{hold: hold, test: test, count: count, claimed: claimed, held: held, any_query?: any_query?}) do
+  def hold_session_cleanup_query(_event, _measurements, metadata, %{hold: hold, test: test, count: count, claimed: claimed, any_query?: any_query?}) do
     if match?({CodexPoolerWeb.WebsocketControlPath, _function, _arity}, Process.get(:"$initial_call")) and (any_query? or (metadata[:query] not in ["begin", "commit"] and not Repo.in_transaction?())) and
          is_nil(Process.get({__MODULE__, hold})) and :atomics.add_get(claimed, 1, 1) <= count do
       Process.put({__MODULE__, hold}, :held)
-      :ets.insert(held, {self()})
       send(test, {hold, :held, self()})
 
       receive do
@@ -2014,7 +2049,6 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
 
   defp release_session_cleanups!(hold, cleanups) do
     :telemetry.detach({__MODULE__, :session_cleanup_hold, hold})
-    :telemetry.detach({__MODULE__, :claim_wait_release, hold})
 
     for cleanup <- cleanups do
       monitor = Process.monitor(cleanup)

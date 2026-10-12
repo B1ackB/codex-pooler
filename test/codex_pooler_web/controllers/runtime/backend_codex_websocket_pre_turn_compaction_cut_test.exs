@@ -188,4 +188,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketPreTurnCompactionCutTest d
       assert Scenario.run_scenario(mode, shape, topology, cut, :queued) == Scenario.expected(cut, topology)
     end
   end
+
+  @tag slow: "holds the real direct compact predecessor through the unchanged one-second claim wait"
+  test "a queued Lite compact retry is refused while its direct cleanup is held and served after settlement" do
+    assert Scenario.run_scenario("lite", :pre_turn, :direct_committed, :observed_cut_claim_held, :queued) == Scenario.expected(:observed_cut_claim_held, :direct_committed)
+  end
 end
