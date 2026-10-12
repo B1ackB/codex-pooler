@@ -147,6 +147,65 @@ defmodule CodexPooler.Accounting.AttemptFinalizationDeliveryReceiptTest do
     end
   end
 
+  for order <- [:receipt_first, :accounting_first] do
+    test "authoritative failed delivery #{order} preserves measured charge and interrupted outcome" do
+      %{attempt: attempt, request: request} = websocket_attempt!()
+      context = %{request_id: request.id, attempt_id: attempt.id, replay_generation: 0, delivery_failure: %{status: "failed", response_status_code: 499, error_code: "client_disconnected"}}
+      receipt = aborted_partial_receipt()
+      usage = %{status: "usage_known", input_tokens: 10, output_tokens: 2, total_tokens: 12}
+      if unquote(order) == :receipt_first, do: assert(:ok = DeliveryReceipt.persist(attempt.id, receipt, context))
+      assert {:ok, settled} = Accounting.finalize_success(request, attempt, usage)
+      if unquote(order) == :accounting_first, do: assert(:ok = DeliveryReceipt.persist(attempt.id, receipt, context))
+      assert :ok = DeliveryReceipt.persist(attempt.id, receipt, context)
+      assert Repo.reload!(settled.settlement) == settled.settlement
+      assert Repo.reload!(request).status == "failed"
+      assert Repo.reload!(attempt).network_error_code == "client_disconnected"
+      assert Repo.reload!(attempt).usage_status == "usage_known"
+    end
+  end
+
+  test "legacy aborted receipt alone does not infer cancellation" do
+    %{attempt: attempt, request: request} = websocket_attempt!()
+    assert :ok = DeliveryReceipt.persist(attempt.id, aborted_partial_receipt())
+    assert {:ok, settled} = Accounting.finalize_success(request, attempt, %{status: "usage_known", input_tokens: 0, output_tokens: 0, total_tokens: 0})
+    assert settled.request.status == "succeeded"
+    assert settled.settlement.usage_status == "usage_known"
+  end
+
+  test "reconciliation rejects mismatched request and generation without metadata writes" do
+    %{attempt: attempt, request: request} = websocket_attempt!()
+    other = websocket_attempt!()
+    receipt = aborted_partial_receipt()
+    context = %{request_id: request.id, replay_generation: 9, delivery_failure: %{status: "failed", response_status_code: 499, error_code: "client_disconnected"}}
+    before_attempt = Repo.reload!(attempt)
+    assert :ok = DeliveryReceipt.persist(attempt.id, receipt, context)
+    assert Repo.reload!(attempt) == before_attempt
+    assert :ok = DeliveryReceipt.persist(attempt.id, receipt, %{context | request_id: other.request.id, replay_generation: 0})
+    assert Repo.reload!(attempt) == before_attempt
+    assert {:ok, %{stale_generation?: true}} = Accounting.reconcile_request_with_disposition(other.request, attempt, %{usage: %{status: "usage_known", input_tokens: 1, output_tokens: 0, total_tokens: 1}})
+    assert Repo.reload!(attempt) == before_attempt
+  end
+
+  test "failed before-commit correction rolls back charge outcome witness and projections" do
+    %{attempt: attempt, request: request} = websocket_attempt!()
+    assert {:ok, settled} = Accounting.finalize_success(request, attempt, %{status: "usage_known", input_tokens: 10, output_tokens: 2, total_tokens: 12})
+    before_request = Repo.reload!(request)
+    before_attempt = Repo.reload!(attempt)
+    assert {:error, :rollback_correction} = Accounting.reconcile_request_with_disposition(request, attempt, %{delivery_failure: %{status: "failed", response_status_code: 499, error_code: "client_disconnected"}, before_commit: fn _ -> {:error, :rollback_correction} end})
+    assert Repo.reload!(request) == before_request
+    assert Repo.reload!(attempt) == before_attempt
+    assert Repo.reload!(settled.settlement) == settled.settlement
+  end
+
+  test "unbounded or unknown failure witness cannot change a delivered disposition" do
+    %{attempt: attempt, request: request} = websocket_attempt!()
+    assert {:ok, settled} = Accounting.finalize_success(request, attempt, %{status: "usage_known", input_tokens: 0, output_tokens: 0, total_tokens: 0})
+    assert {:ok, corrected} = Accounting.reconcile_request_with_disposition(request, attempt, %{delivery_failure: %{status: "failed", response_status_code: 499, error_code: String.duplicate("invalid", 100)}})
+    assert corrected.request.status == "succeeded"
+    assert Repo.reload!(settled.settlement) == settled.settlement
+    refute Map.has_key?(Repo.reload!(attempt).response_metadata, "delivery_failure")
+  end
+
   defp start_ordered_writer(supervisor, fixture, receipt, kind, parent, release, hold?) do
     context = %{fixture: fixture, receipt: receipt, kind: kind, parent: parent, release: release, hold?: hold?}
 

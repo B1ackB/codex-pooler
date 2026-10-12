@@ -308,7 +308,7 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.TurnLifecycle do
     :ok
   end
 
-  defp legacy_completion_query(request_id, status) do
+  defp legacy_completion_query(request_id, _status) do
     CodexTurn
     |> where(
       [turn],
@@ -317,24 +317,43 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.TurnLifecycle do
           "NOT EXISTS (SELECT 1 FROM request_replay_entitlements e WHERE e.request_id = ?)",
           turn.request_id
         ) and
-        (turn.status == ^@turn_in_progress or
-           (turn.status == ^@turn_interrupted and ^status == ^@turn_succeeded))
+        turn.status == ^@turn_in_progress
     )
   end
 
   defp generation_completion_query(request_id, attempt_id, generation, status) do
+    completion = completion_disposition(attempt_id, status)
+
     CodexTurn
     |> join(:inner, [turn], attempt in Attempt, on: attempt.id == ^attempt_id and attempt.request_id == turn.request_id)
     |> where(
       [turn, attempt],
       turn.request_id == ^request_id and attempt.replay_generation == ^generation and
-        fragment(
-          "NOT EXISTS (SELECT 1 FROM request_replay_entitlements e WHERE e.request_id = ? AND e.replay_generation <> ?)",
-          turn.request_id,
-          ^generation
-        ) and
-        (turn.status == ^@turn_in_progress or
-           (turn.status == ^@turn_interrupted and ^status == ^@turn_succeeded))
+        fragment("NOT EXISTS (SELECT 1 FROM request_replay_entitlements e WHERE e.request_id = ? AND e.replay_generation <> ?)", turn.request_id, ^generation)
+    )
+    |> where(^completion)
+  end
+
+  defp completion_disposition(attempt_id, status) do
+    delivered = delivered_completion(status)
+    interrupted = interrupted_completion(attempt_id, status)
+    dynamic([turn, _attempt], turn.status == ^@turn_in_progress or ^delivered or ^interrupted)
+  end
+
+  defp delivered_completion(status) do
+    dynamic(
+      [turn, attempt],
+      turn.status == ^@turn_interrupted and ^status == ^@turn_succeeded and
+        fragment("?->'downstream_delivery'->>'outcome' = 'delivered' AND ?->'downstream_delivery'->>'terminal_class' = 'response.completed'", attempt.response_metadata, attempt.response_metadata)
+    )
+  end
+
+  defp interrupted_completion(attempt_id, status) do
+    dynamic(
+      [turn, attempt],
+      turn.status == ^@turn_succeeded and ^status != ^@turn_succeeded and turn.final_attempt_id == ^attempt_id and
+        attempt.status in ["failed", "cancelled"] and fragment("?->'delivery_failure' IS NOT NULL", attempt.response_metadata) and
+        not fragment("COALESCE(?->'downstream_delivery'->>'outcome' = 'delivered' AND ?->'downstream_delivery'->>'terminal_class' = 'response.completed', false)", attempt.response_metadata, attempt.response_metadata)
     )
   end
 

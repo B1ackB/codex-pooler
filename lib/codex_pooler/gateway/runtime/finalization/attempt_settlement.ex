@@ -221,9 +221,11 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement do
   # turn is still in progress (findings#288). Accounting runs the callback
   # only for the current generation: a stale generation writes nothing, and
   # its turn belongs to the generation that replaced it.
-  defp complete_turn_before_commit(attrs, status, error_code, attempt, owner_witness) do
+  defp complete_turn_before_commit(attrs, _status, _error_code, attempt, owner_witness) do
     Map.put(attrs, :before_commit, fn result ->
-      SessionContinuity.complete_codex_turn({:ok, result}, status, error_code, attempt, owner_witness)
+      request = result.request
+      status = if request.status == "succeeded", do: CodexTurn.succeeded_status(), else: partial_stream_turn_status(request.last_error_code)
+      SessionContinuity.complete_codex_turn({:ok, result}, status, request.last_error_code, attempt, owner_witness)
       :ok
     end)
   end

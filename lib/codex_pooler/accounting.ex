@@ -286,6 +286,14 @@ defmodule CodexPooler.Accounting do
   defdelegate finalize_request_with_disposition(request, attempt, attrs \\ %{}),
     to: RequestLifecycle
 
+  @doc false
+  @spec reconcile_request_with_disposition(Request.t(), Attempt.t(), map()) :: internal_request_result()
+  defdelegate reconcile_request_with_disposition(request, attempt, attrs), to: RequestLifecycle
+
+  @doc false
+  @spec record_delivery_receipt(map(), map(), map()) :: internal_request_result()
+  defdelegate record_delivery_receipt(context, receipt, attrs), to: RequestLifecycle
+
   @spec finalize_success(Request.t(), Attempt.t(), map(), map()) :: request_result()
   def finalize_success(%Request{} = request, %Attempt{} = attempt, usage, opts \\ %{}) do
     opts =

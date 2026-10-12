@@ -21,6 +21,7 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
     SessionContinuity
   }
 
+  alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
   alias CodexPooler.Gateway.Transports.Websocket.RemoteReconnectControlV2
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Jobs.RequestReplayCleanupWorker
@@ -1031,6 +1032,58 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
              ),
              :count
            ) == 1
+  end
+
+  for order <- [:unknown_first, :known_first] do
+    @tag :replay_lifecycle
+    test "closed consumed replay reconciles #{order} without reopening or changing its successor" do
+      fixture = replay_fixture(owner?: true, reservation?: true)
+      assert {:ok, armed} = RequestReplay.arm(arm_input(fixture))
+      assert {:ok, consumed} = RequestReplay.consume(consume_input(fixture, armed, :crypto.strong_rand_bytes(32)))
+      assert {:ok, _started} = RequestReplay.mark_started(consumed.consume_binding)
+      usage = %{status: "usage_known", input_tokens: 3, output_tokens: 2, total_tokens: 5}
+      failure = %{status: "failed", error_code: "client_disconnected", response_status_code: 499}
+
+      if unquote(order) == :unknown_first do
+        assert {:ok, _} = AttemptSettlement.finalize_partial_stream_failure(consumed.request, consumed.attempt, %{status: "usage_unknown"}, %{last_error_code: "client_disconnected", response_status_code: 499})
+      else
+        assert {:ok, _} = AttemptSettlement.finalize_success(consumed.request, consumed.attempt, usage, %{response_status_code: 200})
+      end
+
+      closed = Repo.reload!(consumed.entitlement)
+      assert closed.closed_at
+      settlement = Repo.one!(from l in LedgerEntry, where: l.request_id == ^fixture.request.id and l.entry_kind == "settlement" and l.amount_status == "recorded")
+      session = Repo.reload!(fixture.session)
+      successor_token = Ecto.UUID.generate()
+      session = session |> Ecto.Changeset.change(owner_lease_token: successor_token) |> Repo.update!()
+      fixture.api_key |> Ecto.Changeset.change(status: "revoked", runtime_revocation_epoch: fixture.api_key.runtime_revocation_epoch + 1) |> Repo.update!()
+
+      attrs = %{
+        usage: usage,
+        delivery_failure: failure,
+        before_commit: fn result ->
+          SessionContinuity.complete_codex_turn({:ok, result}, "interrupted", result.request.last_error_code)
+          :ok
+        end
+      }
+
+      assert {:ok, corrected} = CodexPooler.Accounting.reconcile_request_with_disposition(consumed.request, consumed.attempt, attrs)
+      assert corrected.request.status == "failed"
+      assert corrected.request.last_error_code == "client_disconnected"
+      assert corrected.settlement.usage_status == "usage_known"
+      assert corrected.settlement.total_tokens == 5
+      assert Repo.reload!(fixture.turn).status == "interrupted"
+      assert Repo.reload!(closed) == closed
+      assert Repo.reload!(session) == session
+      assert {:ok, repeated} = CodexPooler.Accounting.reconcile_request_with_disposition(consumed.request, consumed.attempt, attrs)
+      assert repeated.settlement.id == corrected.settlement.id
+      assert Repo.reload!(closed) == closed
+      if unquote(order) == :known_first, do: assert(Repo.reload!(settlement) == settlement)
+      assert Repo.aggregate(from(l in LedgerEntry, where: l.request_id == ^fixture.request.id and l.entry_kind == "settlement" and l.amount_status == "recorded"), :count) == 1
+      assert {:ok, %{stale_generation?: true}} = CodexPooler.Accounting.reconcile_request_with_disposition(consumed.request, fixture.attempt, attrs)
+      assert Repo.reload!(closed) == closed
+      assert Repo.reload!(session) == session
+    end
   end
 
   @tag :replay_cleanup

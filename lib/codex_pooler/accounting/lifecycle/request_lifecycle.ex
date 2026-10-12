@@ -713,6 +713,18 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         %Attempt{} = attempt,
         attrs \\ %{}
       ) do
+    finalize_request_transaction(request, attempt, attrs, false)
+  end
+
+  @doc false
+  @spec reconcile_request_with_disposition(Request.t(), Attempt.t(), map()) :: internal_request_result()
+  def reconcile_request_with_disposition(%Request{} = request, %Attempt{} = attempt, attrs) do
+    finalize_request_transaction(request, attempt, attrs, true)
+  end
+
+  defp finalize_request_transaction(original_request, original_attempt, attrs, reconcile?) do
+    request = original_request
+    attempt = original_attempt
     request_status = Map.get(attrs, :request_status, Map.get(attrs, :status, "succeeded"))
 
     attempt_status =
@@ -748,7 +760,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         |> ExpiredOwnerGenerationCleanup.finalization(request, attempt)
 
       replay_entitlement =
-        replay_finalization_authority(attempt, replay_entitlement, attrs)
+        reconciliation_authority(original_request, original_attempt, request, attempt, replay_entitlement, attrs, reconcile?)
 
       if replay_entitlement == :stale_generation do
         # A stale generation writes nothing, so its `:before_commit` callback
@@ -760,6 +772,9 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
           stale_generation?: true
         }
       else
+        attempt = persist_delivery_failure(attempt, attrs, reconcile?)
+        finalization = effective_finalization(request, attempt, finalization)
+
         request
         |> finalize_current_generation(
           attempt,
@@ -797,6 +812,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
             source_event_id: LedgerEntries.release_source_event_id(request.id)
           )
 
+        {request, attempt} = reconcile_outcome(request, attempt, settlement, finalization)
         close_replay_entitlement(replay_entitlement, timestamp, attrs)
 
         %{
@@ -850,6 +866,136 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         }
     end
   end
+
+  # Reconciliation is authority for the original admitted work, not new dispatch.
+  # In particular, revoking a key or closing its consumed replay does not erase it.
+  defp reconciliation_authority(original_request, original_attempt, request, attempt, entitlement, attrs, reconcile?) do
+    matching? = matching_admitted_attempt?(original_request, original_attempt, request, attempt)
+
+    cond do
+      not matching? -> :stale_generation
+      reconcile? and newer_attempt?(attempt) -> :stale_generation
+      reconcile? and matching_consumed_replay?(attempt, entitlement) -> entitlement
+      true -> replay_finalization_authority(attempt, entitlement, attrs)
+    end
+  end
+
+  defp matching_admitted_attempt?(original_request, original_attempt, request, attempt) do
+    original_request.id == attempt.request_id and original_attempt.request_id == request.id and
+      original_attempt.replay_generation == attempt.replay_generation and
+      original_request.pool_id == request.pool_id and original_request.api_key_id == request.api_key_id
+  end
+
+  defp newer_attempt?(attempt),
+    do: Repo.exists?(from row in Attempt, where: row.request_id == ^attempt.request_id and row.attempt_number > ^attempt.attempt_number)
+
+  defp matching_consumed_replay?(attempt, %RequestReplayEntitlement{} = entitlement),
+    do: attempt.replay_generation == entitlement.replay_generation and entitlement.status == "consumed" and entitlement.replay_attempt_id == attempt.id
+
+  defp matching_consumed_replay?(_attempt, nil), do: false
+
+  @delivery_failure_codes ~w(client_disconnected owner_drained owner_forward_timeout downstream_delivery_timeout stream_interrupted owner_unavailable downstream_stream_error stream_idle_timeout upstream_stream_error)
+
+  defp delivery_failure(%{status: status, response_status_code: response_status_code, error_code: code})
+       when status in ["failed", "cancelled"] and code in @delivery_failure_codes and is_integer(response_status_code) and response_status_code >= 100 and response_status_code <= 599,
+       do: %{"status" => status, "response_status_code" => response_status_code, "error_code" => code}
+
+  defp delivery_failure(_attrs), do: nil
+
+  defp delivered_success?(attempt),
+    do: match?(%{"outcome" => "delivered", "terminal_class" => "response.completed"}, attempt.response_metadata["downstream_delivery"])
+
+  defp persist_delivery_failure(attempt, attrs, true) do
+    case {delivered_success?(attempt), delivery_failure(Map.get(attrs, :delivery_failure))} do
+      {false, %{} = witness} ->
+        attempt |> Ecto.Changeset.change(response_metadata: Map.put(attempt.response_metadata || %{}, "delivery_failure", witness)) |> Repo.update!()
+
+      _other ->
+        attempt
+    end
+  end
+
+  defp persist_delivery_failure(attempt, _attrs, false), do: attempt
+
+  defp effective_finalization(request, attempt, finalization) do
+    cond do
+      delivered_success?(attempt) and request.status == "succeeded" ->
+        recorded_finalization(request, attempt, finalization)
+
+      request.status in ["failed", "cancelled"] ->
+        recorded_finalization(request, attempt, finalization)
+
+      is_map(attempt.response_metadata["delivery_failure"]) ->
+        witness = attempt.response_metadata["delivery_failure"]
+        %{finalization | request_status: witness["status"], attempt_status: witness["status"], last_error_code: witness["error_code"], response_status_code: witness["response_status_code"], error_message: nil, timestamp: request.completed_at || finalization.timestamp}
+
+      true ->
+        finalization
+    end
+  end
+
+  defp recorded_finalization(request, attempt, finalization),
+    do: %{finalization | request_status: request.status, attempt_status: attempt.status, last_error_code: request.last_error_code, error_message: attempt.error_message, response_status_code: request.response_status_code, retry_count: request.retry_count, timestamp: request.completed_at || finalization.timestamp}
+
+  defp reconcile_outcome(request, attempt, settlement, finalization) do
+    # Reusing a charge does not authorize an ordinary late caller to change delivery.
+    # Only the bounded witness written by the reconciliation boundary does that.
+    if is_map(attempt.response_metadata["delivery_failure"]) and request.status != finalization.request_status do
+      previous_request = request
+      request = request |> Ecto.Changeset.change(status: finalization.request_status, last_error_code: finalization.last_error_code, response_status_code: finalization.response_status_code) |> Repo.update!()
+      attempt = attempt |> Ecto.Changeset.change(status: finalization.attempt_status, network_error_code: finalization.last_error_code, error_message: finalization.error_message, retryable: false) |> Repo.update!()
+      RequestLogFacts.record_attempt_written!(attempt)
+      Rollups.reconcile_outcome!(previous_request, request, settlement)
+      {request, attempt}
+    else
+      {request, attempt}
+    end
+  end
+
+  @doc false
+  @spec record_delivery_receipt(map(), map(), map()) :: internal_request_result() | {:ok, map()}
+  def record_delivery_receipt(context, receipt, attrs) do
+    Repo.transaction(fn ->
+      original_request = Repo.get!(Request, Map.fetch!(context, :request_id))
+      original_attempt = Repo.get!(Attempt, Map.fetch!(context, :attempt_id))
+      {request, attempt, _reservation, settlement, entitlement} = lock_finalization_rows(original_request, original_attempt)
+      original_attempt = %{original_attempt | replay_generation: Map.fetch!(context, :replay_generation)}
+      authority = reconciliation_authority(original_request, original_attempt, request, attempt, entitlement, %{}, true)
+
+      if authority == :stale_generation or not receipt_session_matches?(request, context) do
+        %{request: request, attempt: attempt, finalization_disposition: :reused, stale_generation?: true}
+      else
+        attempt = persist_authoritative_receipt(attempt, receipt, context)
+
+        reconcile_recorded_receipt(request, attempt, settlement, attrs)
+      end
+    end)
+    |> unwrap_transaction()
+  end
+
+  defp persist_authoritative_receipt(attempt, receipt, context) do
+    # A terminal positively written first wins over a later connection close.
+    receipt = if delivered_success?(attempt), do: attempt.response_metadata["downstream_delivery"], else: receipt
+
+    attempt
+    |> Ecto.Changeset.change(response_metadata: Map.put(attempt.response_metadata || %{}, "downstream_delivery", receipt))
+    |> Repo.update!()
+    |> persist_delivery_failure(context, true)
+  end
+
+  defp reconcile_recorded_receipt(request, attempt, nil, _attrs),
+    do: %{request: request, attempt: attempt, finalization_disposition: :reused}
+
+  defp reconcile_recorded_receipt(request, attempt, _settlement, attrs) do
+    {:ok, result} = reconcile_request_with_disposition(request, attempt, attrs)
+    result
+  end
+
+  defp receipt_session_matches?(request, %{codex_session_id: session_id}) when is_binary(session_id) do
+    Repo.exists?(from turn in CodexPooler.Gateway.Persistence.CodexTurn, where: turn.request_id == ^request.id and turn.codex_session_id == ^session_id)
+  end
+
+  defp receipt_session_matches?(_request, _context), do: true
 
   defp replay_finalization_authority(attempt, nil, _attrs) do
     if attempt.replay_generation == 0, do: nil, else: :stale_generation
@@ -977,6 +1123,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
   end
 
   defp close_replay_entitlement(nil, _timestamp, _attrs), do: :ok
+  defp close_replay_entitlement(%RequestReplayEntitlement{closed_at: %DateTime{}}, _timestamp, _attrs), do: :ok
 
   defp close_replay_entitlement(%RequestReplayEntitlement{} = entitlement, timestamp, attrs) do
     closed_at =
@@ -1158,6 +1305,13 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         }
       end
 
+    attempt_attrs =
+      if attempt.status in ["failed", "cancelled"] and finalization.attempt_status == attempt.status do
+        Map.merge(attempt_attrs, Map.take(attempt, [:status, :completed_at, :upstream_status_code, :retryable, :network_error_code, :error_message, :latency_ms]))
+      else
+        attempt_attrs
+      end
+
     attempt =
       attempt
       |> Ecto.Changeset.change(attempt_attrs)
@@ -1188,7 +1342,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
       )
 
     case recorded do
-      %{} = recorded -> Map.merge(Map.take(recorded, [@downstream_delivery_key, "downstream_interruption"]), metadata)
+      %{} = recorded -> Map.merge(Map.take(recorded, [@downstream_delivery_key, "downstream_interruption", "delivery_failure"]), metadata)
       _none -> metadata
     end
   end

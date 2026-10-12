@@ -509,6 +509,32 @@ defmodule CodexPooler.Accounting.Rollups do
     accumulate!(request, settlement)
   end
 
+  @doc false
+  @spec reconcile_outcome!(Request.t(), Request.t(), LedgerEntry.t()) :: :ok
+  def reconcile_outcome!(%Request{} = previous_request, %Request{} = request, %LedgerEntry{} = settlement) do
+    delta = [success_count: success_count(request) - success_count(previous_request), failure_count: failure_count(request) - failure_count(previous_request)]
+    timestamp = settlement.occurred_at || now()
+    date = DateTime.to_date(timestamp)
+
+    request
+    |> daily_rollup_identities(settlement)
+    |> Enum.each(fn identity -> update_outcome!(DailyRollup, rollup_lookup(identity, date), delta) end)
+
+    case hourly_model_identity(request) do
+      nil -> :ok
+      identity -> update_outcome!(HourlyModelUsageRollup, %{bucket_started_at: hour_bucket(timestamp), pool_id: request.pool_id, model_code: identity.model_code}, delta)
+    end
+  end
+
+  defp update_outcome!(schema, lookup, delta) do
+    query = from row in schema, where: ^Enum.to_list(lookup)
+
+    case Repo.update_all(query, inc: delta, set: [updated_at: now()]) do
+      {1, _rows} -> :ok
+      {0, _rows} -> raise Ecto.NoResultsError, queryable: schema
+    end
+  end
+
   defp subtract!(%Request{} = request, %LedgerEntry{} = settlement) do
     delta = rollup_delta(request, settlement)
     date = DateTime.to_date(settlement.occurred_at || now())

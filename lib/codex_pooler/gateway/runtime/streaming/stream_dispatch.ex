@@ -11,6 +11,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
+  alias CodexPooler.Gateway.Runtime.Finalization.Streaming
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector
   alias CodexPooler.Gateway.Runtime.Streaming.DownstreamDeliveryEvidence
@@ -205,7 +206,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
       handlers
       | finalize_success: fn body, state ->
           result = finalize_success.(body, state)
-          record_http_delivery_receipt(state, response_context)
+          record_http_delivery_receipt(state, response_context, nil)
           result
         end,
         finalize_failure: fn body, reason, state ->
@@ -213,19 +214,31 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
 
           state
           |> mark_http_write_failure(reason)
-          |> record_http_delivery_receipt(response_context)
+          |> record_http_delivery_receipt(response_context, delivery_failure(reason, response_context, result))
 
           result
         end
     }
   end
 
-  defp record_http_delivery_receipt(state, %ResponseContext{context: context}) do
+  defp record_http_delivery_receipt(state, %ResponseContext{context: context}, failure) do
     DownstreamDeliveryEvidence.record(state, %{
       request_id: context.reserved.request.id,
       attempt_id: attempt_id(context.attempt),
+      replay_generation: context.attempt && context.attempt.replay_generation,
+      delivery_failure: failure,
       codex_session_id: codex_session_id(context.request_options)
     })
+  end
+
+  defp delivery_failure(reason, response_context, result) do
+    status =
+      case result do
+        {:ok, %{request: request}} -> request.response_status_code
+        _other -> response_context.client_response_status || response_context.response.status
+      end
+
+    %{status: "failed", response_status_code: status, error_code: Streaming.error_code(reason)}
   end
 
   defp attempt_id(%{id: id}) when is_binary(id), do: id
@@ -1058,20 +1071,20 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
   defp write_final_first_event(response_context, conn, data) do
     case write_stream_data(response_context, conn, data) do
       {:ok, conn} ->
-        record_http_delivery_receipt(conn, response_context)
+        record_http_delivery_receipt(conn, response_context, nil)
         {:ok, conn}
 
       {:error, reason, advanced} ->
         advanced
         |> DownstreamDeliveryEvidence.record_write_failure()
-        |> record_http_delivery_receipt(response_context)
+        |> record_http_delivery_receipt(response_context, delivery_failure({:chunk, reason}, response_context, nil))
 
         {:error, reason}
 
-      {:error, _reason} = error ->
+      {:error, reason} = error ->
         conn
         |> DownstreamDeliveryEvidence.record_write_failure()
-        |> record_http_delivery_receipt(response_context)
+        |> record_http_delivery_receipt(response_context, delivery_failure({:chunk, reason}, response_context, nil))
 
         error
     end

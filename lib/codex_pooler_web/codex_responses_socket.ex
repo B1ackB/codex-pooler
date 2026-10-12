@@ -5147,6 +5147,8 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
       %{
         request_id: request_id,
         attempt_id: Map.get(cleanup, :attempt_id),
+        replay_generation: Map.get(cleanup, :replay_generation),
+        delivery_failure: Map.get(cleanup, :delivery_failure),
         codex_session_id: codex_session_id(state)
       },
       %{

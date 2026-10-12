@@ -166,8 +166,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.PrevisibleDirectLateAnswe
     assert %CodexTurn{first_visible_output_at: %DateTime{}} = Repo.get_by!(CodexTurn, request_id: request_id)
 
     :ok = FakeUpstream.release_frame(upstream, release_ref)
-    request = await_request_status!(request_id, "succeeded", System.monotonic_time(:millisecond) + @detection_timeout_ms)
-    assert {request.usage_status, request.response_status_code} == {"usage_known", 200}
+    request = await_request_usage!(request_id, "usage_known", System.monotonic_time(:millisecond) + @detection_timeout_ms)
+    assert {request.status, request.last_error_code, request.usage_status, request.response_status_code} == {"failed", "client_disconnected", "usage_known", interrupted.response_status_code}
+    assert Repo.get_by!(CodexTurn, request_id: request_id).status == "interrupted"
 
     settlements =
       Repo.all(from(l in LedgerEntry, where: l.request_id == ^request_id and l.entry_kind == "settlement", order_by: l.created_at, select: %{id: l.id, amount_status: l.amount_status, usage_status: l.usage_status, correction_of_entry_id: l.correction_of_entry_id}))
@@ -175,7 +176,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.PrevisibleDirectLateAnswe
     assert [%{amount_status: "voided", usage_status: "usage_unknown", id: voided_id}, %{amount_status: "recorded", usage_status: "usage_known", correction_of_entry_id: voided_id}] = settlements
 
     rollups = Repo.all(from(d in DailyRollup, where: d.pool_id == ^setup.pool.id and d.dimension_kind == "pool", select: {d.request_count, d.success_count, d.failure_count, d.total_tokens}))
-    assert rollups == [{1, 1, 0, 5}]
+    assert rollups == [{1, 0, 1, 5}]
   end
 
   defp await_client_frame!(conn, websocket, ref, type) do
@@ -183,13 +184,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.PrevisibleDirectLateAnswe
     if match?(%{"type" => ^type}, CodexPooler.JSON.decode!(text)), do: conn, else: await_client_frame!(conn, websocket, ref, type)
   end
 
-  defp await_request_status!(request_id, status, deadline_ms) do
+  defp await_request_usage!(request_id, status, deadline_ms) do
     request = Repo.get!(Request, request_id)
 
     cond do
-      request.status == status -> request
+      request.usage_status == status -> request
       System.monotonic_time(:millisecond) >= deadline_ms -> flunk("request did not reach #{status}")
-      true -> Process.sleep(10) && await_request_status!(request_id, status, deadline_ms)
+      true -> Process.sleep(10) && await_request_usage!(request_id, status, deadline_ms)
     end
   end
 

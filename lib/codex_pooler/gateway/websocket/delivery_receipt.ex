@@ -13,8 +13,10 @@ defmodule CodexPooler.Gateway.Websocket.DeliveryReceipt do
 
   require Logger
 
+  alias CodexPooler.Accounting
   alias CodexPooler.Accounting.Attempt
   alias CodexPooler.Gateway.Payloads.WebsocketTurnIdentity
+  alias CodexPooler.Gateway.Persistence.SessionContinuity
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser
   alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
@@ -342,7 +344,7 @@ defmodule CodexPooler.Gateway.Websocket.DeliveryReceipt do
     case Map.get(context, :attempt_id) do
       attempt_id when is_binary(attempt_id) ->
         attempt_id
-        |> persist(receipt)
+        |> persist(receipt, context)
         |> log_persist_failure(transport, request_id, session_id)
 
       _missing ->
@@ -365,6 +367,38 @@ defmodule CodexPooler.Gateway.Websocket.DeliveryReceipt do
   catch
     :exit, reason -> {:error, {:exit, reason}}
   end
+
+  @doc false
+  @spec persist(Ecto.UUID.t(), receipt(), map()) :: :ok | {:error, term()}
+  def persist(attempt_id, receipt, %{request_id: request_id, replay_generation: generation} = context)
+      when is_binary(request_id) and is_integer(generation) and generation >= 0 do
+    attrs = %{
+      before_commit: fn result ->
+        request = result.request
+
+        status =
+          cond do
+            request.status == "succeeded" -> "succeeded"
+            request.last_error_code in ["client_disconnected", "owner_drained"] -> "interrupted"
+            true -> "failed"
+          end
+
+        SessionContinuity.complete_codex_turn({:ok, result}, status, request.last_error_code)
+        :ok
+      end
+    }
+
+    case Accounting.record_delivery_receipt(Map.put(context, :attempt_id, attempt_id), receipt, attrs) do
+      {:ok, _result} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    exception -> {:error, exception}
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
+  end
+
+  def persist(attempt_id, receipt, _context), do: persist(attempt_id, receipt)
 
   defp persist_receipt(attempt_id, receipt) do
     patch = %{@metadata_key => receipt}
