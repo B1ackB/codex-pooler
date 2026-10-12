@@ -289,7 +289,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
         [proof] = ExecutionRegistry.pending_proofs([execution_id])
         assert {:ok, _published} = ExecutionTerminalProofs.publish([proof])
         assert :ok = ExecutionRegistry.acknowledge([execution_id])
-        assert {:ok, summary} = DeadExecutionRecovery.recover_execution_ids([attempt.owner_execution_id], db_now())
+        # This case proves actor-death recovery, not the production sweep's 500ms latency budget.
+        assert {:ok, summary} = DeadExecutionRecovery.recover_execution_ids([attempt.owner_execution_id], db_now(), timeout: @budget)
         assert summary.dead_execution_attempts_recovered == 1
         [terminal] = await_settled!(fixture.setup, 1)
         assert_expired_stop_after_executor_down!(fixture, terminal)
