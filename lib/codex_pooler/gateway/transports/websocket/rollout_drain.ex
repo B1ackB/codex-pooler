@@ -40,6 +40,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
           required(:proxy_turns_completed) => non_neg_integer(),
           required(:proxy_turns_aborted) => non_neg_integer(),
           required(:proxy_turns_failed) => non_neg_integer(),
+          required(:receipt_settlements_seen) => non_neg_integer(),
+          required(:receipt_settlements_completed) => non_neg_integer(),
+          required(:receipt_settlements_superseded) => non_neg_integer(),
+          required(:receipt_settlements_aborted) => non_neg_integer(),
+          required(:receipt_settlements_failed) => non_neg_integer(),
+          required(:receipt_producers_failed?) => boolean(),
           required(:http_streams_seen) => non_neg_integer(),
           required(:http_streams_completed) => non_neg_integer(),
           required(:http_streams_aborted) => non_neg_integer(),
@@ -331,7 +337,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
       Enum.map(owners, fn {key, owner} = entry ->
         if Registry.lookup(owner_registry, key) == [{owner, :starting}], do: {:starting_owner, entry}, else: {:owner, entry}
       end) ++
-        Enum.map(activities, &{:activity, &1}) ++ [{:http_streams, snapshot}]
+        Enum.map(activities, &{:activity, &1}) ++ [{:http_streams, snapshot}, {:receipt_settlements, snapshot}]
 
     counters = empty_counters(activities, [])
     :ok = GenServer.call(caller, {:rollout_drain_progress, ref, counters, work, length(owners)})
@@ -373,6 +379,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
   defp drain_work_item({:activity, activity}, deadline, policy, _streams, activities), do: {:activity, activity.kind, ActivityDrain.drain(activity, deadline, policy, activities)}
   defp drain_work_item({:http_streams, snapshot}, deadline, policy, streams, _activities), do: drain_http_cohort(deadline, policy, streams, snapshot)
 
+  defp drain_work_item({:receipt_settlements, snapshot}, deadline, policy, _streams, activities) do
+    {:receipt_settlements, ActivityDrain.drain_receipts(deadline, policy, activities, fn cohort -> :ets.insert(snapshot, {:receipts, cohort}) end)}
+  end
+
   defp complete_registry_drain(fun) do
     fun.() == :ok
   catch
@@ -398,6 +408,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
       proxy_turns_completed: counters.proxy_turns_completed,
       proxy_turns_aborted: counters.proxy_turns_aborted,
       proxy_turns_failed: counters.proxy_turns_failed,
+      receipt_settlements_seen: counters.receipt_settlements_seen,
+      receipt_settlements_completed: counters.receipt_settlements_completed,
+      receipt_settlements_superseded: counters.receipt_settlements_superseded,
+      receipt_settlements_aborted: counters.receipt_settlements_aborted,
+      receipt_settlements_failed: counters.receipt_settlements_failed,
+      receipt_producers_failed?: counters.receipt_producers_failed?,
       http_streams_seen: counters.http_streams_seen,
       http_streams_completed: counters.http_streams_completed,
       http_streams_aborted: counters.http_streams_aborted,
@@ -622,6 +638,31 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
     count_work_result({{:http_streams, snapshot}, {:ok, {:http_streams, entries}}}, %{counters | http_stream_cohort_failed?: true})
   end
 
+  defp count_work_result({{:receipt_settlements, _snapshot}, {:ok, {:receipt_settlements, cohort}}}, counters) do
+    counters = %{counters | receipt_producers_failed?: cohort.producers_failed?, receipt_cohort_failed?: not cohort.closed?}
+
+    Enum.reduce(cohort.entries, counters, fn entry, acc ->
+      outcome =
+        case entry.status do
+          {:finished, outcome} -> outcome
+          :active -> :failed
+        end
+
+      counter = if Map.get(entry, :receipt_disposition) == :superseded, do: :receipt_settlements_superseded, else: receipt_counter(outcome)
+      acc |> Map.update!(:receipt_settlements_seen, &(&1 + 1)) |> Map.update!(counter, &(&1 + 1))
+    end)
+  end
+
+  defp count_work_result({{:receipt_settlements, snapshot}, _result}, counters) do
+    [{:receipts, cohort}] = :ets.lookup(snapshot, :receipts)
+    counters = count_work_result({{:receipt_settlements, snapshot}, {:ok, {:receipt_settlements, cohort}}}, counters)
+    %{counters | receipt_cohort_failed?: true}
+  end
+
+  defp receipt_counter(:completed), do: :receipt_settlements_completed
+  defp receipt_counter(:aborted), do: :receipt_settlements_aborted
+  defp receipt_counter(:failed), do: :receipt_settlements_failed
+
   defp count_outcome(counters, :idle), do: Map.update!(counters, :owners_idle, &(&1 + 1))
 
   defp count_outcome(counters, :completed),
@@ -664,6 +705,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
       proxy_turns_completed: 0,
       proxy_turns_aborted: 0,
       proxy_turns_failed: 0,
+      receipt_settlements_seen: 0,
+      receipt_settlements_completed: 0,
+      receipt_settlements_superseded: 0,
+      receipt_settlements_aborted: 0,
+      receipt_settlements_failed: 0,
+      receipt_producers_failed?: false,
+      receipt_cohort_failed?: false,
       http_streams_seen: length(streams),
       http_streams_completed: 0,
       http_streams_aborted: 0,
@@ -674,7 +722,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
 
   defp drain_result(counters) do
     if counters.owners_failed + counters.direct_turns_failed + counters.proxy_turns_failed +
-         counters.http_streams_failed == 0 and not counters.http_stream_cohort_failed?,
+         counters.http_streams_failed + counters.receipt_settlements_failed + counters.receipt_settlements_aborted == 0 and not counters.http_stream_cohort_failed? and not counters.receipt_cohort_failed? and not counters.receipt_producers_failed?,
        do: :ok,
        else: :error
   end
@@ -706,7 +754,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
       state.deadline_ms || poll_deadline_ms(timeout_ms, drain_policy.now_ms.(), drain_policy)
 
     snapshot = :ets.new(__MODULE__, [:set, :public])
-    :ets.insert(snapshot, {:entries, []})
+    :ets.insert(snapshot, [{:entries, []}, {:receipts, %{entries: [], closed?: false, producers_failed?: false}}])
     log_drain_started(timeout_ms, already_draining?, max(0, deadline_ms - drain_policy.now_ms.()))
 
     {pid, monitor} =
@@ -716,7 +764,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
       end)
 
     timer = Process.send_after(self(), {:rollout_drain_timeout, ref}, owner_task_timeout_ms(timeout_ms, drain_policy))
-    active_drain = %{ref: ref, timer: timer, pid: pid, monitor: monitor, waiters: [from], workers: %{}, coordinator_down?: false, summary: nil, snapshot: snapshot, counters: empty_counters([], []), pending: [{:http_streams, snapshot}], owners_seen: 0, timeout_ms: timeout_ms, started_at: System.monotonic_time(:millisecond), already_draining?: already_draining?}
+    active_drain = %{ref: ref, timer: timer, pid: pid, monitor: monitor, waiters: [from], workers: %{}, coordinator_down?: false, summary: nil, snapshot: snapshot, counters: empty_counters([], []), pending: [{:http_streams, snapshot}, {:receipt_settlements, snapshot}], owners_seen: 0, timeout_ms: timeout_ms, started_at: System.monotonic_time(:millisecond), already_draining?: already_draining?}
 
     state =
       state
@@ -916,6 +964,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
         "proxy_turns_completed=#{summary.proxy_turns_completed} " <>
         "proxy_turns_aborted=#{summary.proxy_turns_aborted} " <>
         "proxy_turns_failed=#{summary.proxy_turns_failed} " <>
+        "receipt_settlements_seen=#{summary.receipt_settlements_seen} " <>
+        "receipt_settlements_completed=#{summary.receipt_settlements_completed} " <>
+        "receipt_settlements_superseded=#{summary.receipt_settlements_superseded} " <>
+        "receipt_settlements_aborted=#{summary.receipt_settlements_aborted} " <>
+        "receipt_settlements_failed=#{summary.receipt_settlements_failed} " <>
+        "receipt_producers_failed=#{summary.receipt_producers_failed?} " <>
         "http_streams_seen=#{summary.http_streams_seen} " <>
         "http_streams_completed=#{summary.http_streams_completed} " <>
         "http_streams_aborted=#{summary.http_streams_aborted} " <>
@@ -943,6 +997,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
       proxy_turns_completed: 0,
       proxy_turns_aborted: 0,
       proxy_turns_failed: 0,
+      receipt_settlements_seen: 0,
+      receipt_settlements_completed: 0,
+      receipt_settlements_superseded: 0,
+      receipt_settlements_aborted: 0,
+      receipt_settlements_failed: 0,
+      receipt_producers_failed?: false,
       http_streams_seen: 0,
       http_streams_completed: 0,
       http_streams_aborted: 0,

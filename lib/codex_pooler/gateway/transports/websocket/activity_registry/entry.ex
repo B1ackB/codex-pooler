@@ -1,7 +1,7 @@
 defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry.Entry do
   @moduledoc false
 
-  @type kind :: :direct | :proxy | :local_owner
+  @type kind :: :direct | :proxy | :local_owner | :receipt_settlement
   @type status :: :registered | :admitted | :cancelling
   @type t :: %{
           required(:token) => reference(),
@@ -11,6 +11,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry.Entry do
           required(:status) => status(),
           required(:cancel_pid) => pid(),
           required(:ack_pid) => pid(),
+          optional(:receipt_identity) => CodexPooler.Gateway.Transports.Websocket.ActivityRegistry.receipt_identity(),
+          optional(:receipt_disposition) => CodexPooler.Gateway.Transports.Websocket.ActivityRegistry.receipt_disposition(),
           optional(:cancel_reason) => :owner_drained,
           optional(:direct_ref) => reference(),
           optional(:direct_parent) => pid(),

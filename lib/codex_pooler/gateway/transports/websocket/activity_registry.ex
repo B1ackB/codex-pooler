@@ -58,6 +58,33 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   @type token :: reference()
   @type drain_entry :: Drain.entry()
 
+  @type receipt_identity :: %{request_id: String.t(), attempt_id: String.t(), replay_generation: non_neg_integer()}
+  @type receipt_disposition :: :inserted | :reused | :replaced | :superseded | :failed | :aborted
+
+  # Called only by the accepting owner, before it exposes the accepted turn.
+  # The capability carries original admission identity; it never admits provider work.
+  @spec begin_receipt_producer(receipt_identity(), keyword()) :: {:ok, token()} | {:error, :owner_drained | :invalid_identity}
+  def begin_receipt_producer(identity, opts \\ []),
+    do: GenServer.call(server(opts), {:begin_receipt_producer, identity})
+
+  @spec register_receipt_settlement(token(), receipt_identity(), pid(), keyword()) :: {:ok, token()} | {:error, :producer_closed | :identity_mismatch | :already_registered}
+  def register_receipt_settlement(producer, identity, worker, opts \\ []) when is_reference(producer) and is_pid(worker),
+    do: GenServer.call(server(opts), {:register_receipt_settlement, producer, identity, worker})
+
+  @spec finish_receipt_producer(token(), keyword()) :: :ok | {:error, :producer_closed}
+  def finish_receipt_producer(producer, opts \\ []),
+    do: GenServer.call(server(opts), {:finish_receipt_producer, producer})
+
+  @spec complete_receipt_settlement(token(), receipt_disposition(), keyword()) :: :ok | {:error, :unknown_activity}
+  def complete_receipt_settlement(token, disposition, opts \\ []) when disposition in [:inserted, :reused, :replaced, :superseded, :failed, :aborted],
+    do: GenServer.call(server(opts), {:complete_receipt_settlement, token, disposition})
+
+  @spec receipt_cohort(keyword()) :: %{closed?: boolean(), entries: [Drain.entry()], pending_producers: non_neg_integer(), producers_failed?: boolean()}
+  def receipt_cohort(opts \\ []), do: GenServer.call(server(opts), :receipt_cohort)
+
+  @spec force_receipt_cohort(keyword()) :: :ok
+  def force_receipt_cohort(opts \\ []), do: GenServer.call(server(opts), :force_receipt_cohort)
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, :ok, name: Keyword.get(opts, :name, __MODULE__))
@@ -120,7 +147,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   @spec begin_drain(keyword()) :: {reference(), [Drain.entry()]}
   def begin_drain(opts \\ []), do: GenServer.call(server(opts), :begin_drain)
 
-  @spec complete_drain(reference(), keyword()) :: :ok
+  @spec complete_drain(reference(), keyword()) :: :ok | {:error, :receipt_work_pending}
   def complete_drain(epoch, opts \\ []) when is_reference(epoch) do
     GenServer.call(server(opts), {:complete_drain, epoch})
   end
@@ -164,7 +191,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
 
   @impl GenServer
   def init(:ok) do
-    {:ok, %{activities: %{}, monitors: %{}, draining?: false, drain: nil, finished_direct: %{}}}
+    {:ok, %{activities: %{}, monitors: %{}, draining?: false, drain: nil, finished_direct: %{}, receipt_producers: %{}, receipt_producer_monitors: %{}}}
   end
 
   @impl GenServer
@@ -312,6 +339,92 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
     end
   end
 
+  def handle_call({:begin_receipt_producer, _identity}, _from, %{draining?: true} = state),
+    do: {:reply, {:error, :owner_drained}, state}
+
+  def handle_call({:begin_receipt_producer, identity}, {owner, _}, state) do
+    case identity do
+      %{request_id: request, attempt_id: attempt, replay_generation: generation}
+      when is_binary(request) and byte_size(request) > 0 and is_binary(attempt) and byte_size(attempt) > 0 and is_integer(generation) and generation >= 0 and map_size(identity) == 3 ->
+        token = make_ref()
+        monitor = Process.monitor(owner)
+        producer = %{owner: owner, identity: identity, monitor: monitor, worker: nil}
+        state = %{state | receipt_producers: Map.put(state.receipt_producers, token, producer), receipt_producer_monitors: Map.put(state.receipt_producer_monitors, monitor, token)}
+        {:reply, {:ok, token}, state}
+
+      _invalid ->
+        {:reply, {:error, :invalid_identity}, state}
+    end
+  end
+
+  def handle_call({:register_receipt_settlement, producer, identity, worker}, {owner, _}, state) do
+    case Map.get(state.receipt_producers, producer) do
+      %{owner: ^owner, identity: ^identity, worker: nil} ->
+        token = make_ref()
+        monitor = Process.monitor(worker)
+        entry = Entry.new(token, :receipt_settlement, worker, monitor) |> Map.put(:status, :admitted) |> Map.put(:receipt_identity, identity)
+        state = %{state | activities: Map.put(state.activities, token, entry), monitors: Map.put(state.monitors, monitor, token), drain: Drain.join_receipt(state.drain, token)}
+        state = put_in(state.receipt_producers[producer].worker, {worker, token})
+        {:reply, {:ok, token}, state}
+
+      %{owner: ^owner, identity: ^identity, worker: {^worker, token}} ->
+        {:reply, {:ok, token}, state}
+
+      %{owner: ^owner, identity: ^identity} ->
+        {:reply, {:error, :already_registered}, state}
+
+      %{owner: ^owner} ->
+        {:reply, {:error, :identity_mismatch}, state}
+
+      _closed_or_wrong_owner ->
+        {:reply, {:error, :producer_closed}, state}
+    end
+  end
+
+  def handle_call({:finish_receipt_producer, token}, {owner, _}, state) do
+    case Map.get(state.receipt_producers, token) do
+      %{owner: ^owner} -> {:reply, :ok, finish_receipt_producer_state(state, token, false)}
+      _closed_or_wrong_owner -> {:reply, {:error, :producer_closed}, state}
+    end
+  end
+
+  def handle_call({:complete_receipt_settlement, token, disposition}, {worker, _}, state) do
+    case Map.get(state.activities, token) do
+      %{kind: :receipt_settlement, pid: ^worker} ->
+        state = put_in(state.activities[token][:receipt_disposition], disposition)
+        outcome = if disposition in [:failed, :aborted], do: disposition, else: :completed
+        {:reply, :ok, finish_activity(state, token, outcome, true, true)}
+
+      nil ->
+        {:reply, :ok, state}
+
+      _other ->
+        {:reply, {:error, :unknown_activity}, state}
+    end
+  end
+
+  def handle_call(:receipt_cohort, _from, state) do
+    drain = Drain.close_receipts(state.drain, map_size(state.receipt_producers) == 0)
+    cohort = %{closed?: not is_nil(drain) and drain.receipts_closed?, entries: Drain.receipt_entries(drain, state.activities), pending_producers: map_size(state.receipt_producers), producers_failed?: not is_nil(drain) and drain.receipt_producers_failed?}
+    {:reply, cohort, %{state | drain: drain}}
+  end
+
+  def handle_call(:force_receipt_cohort, _from, state) do
+    state = Enum.reduce(Map.keys(state.receipt_producers), state, &finish_receipt_producer_state(&2, &1, true))
+
+    state =
+      Enum.reduce(state.activities, state, fn
+        {token, %{kind: :receipt_settlement, pid: pid}}, acc ->
+          Process.exit(pid, :kill)
+          finish_activity(acc, token, :aborted, true, true)
+
+        _other, acc ->
+          acc
+      end)
+
+    {:reply, :ok, %{state | drain: Drain.close_receipts(state.drain, true)}}
+  end
+
   def handle_call({:register, kind, pid, opts}, _from, state) do
     token = make_ref()
     monitor = Process.monitor(pid)
@@ -419,7 +532,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   end
 
   def handle_call({:complete_drain, epoch}, _from, %{drain: %{epoch: epoch}} = state) do
-    {:reply, :ok, %{state | drain: nil}}
+    pending? = map_size(state.receipt_producers) > 0 or Enum.any?(Drain.receipt_entries(state.drain, state.activities), &(&1.status == :active))
+
+    if pending?, do: {:reply, {:error, :receipt_work_pending}, state}, else: {:reply, :ok, %{state | drain: nil}}
   end
 
   def handle_call({:complete_drain, _epoch}, _from, state), do: {:reply, :ok, state}
@@ -470,6 +585,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   def handle_call(:draining?, _from, state), do: {:reply, state.draining?, state}
 
   @impl GenServer
+  def handle_info({:DOWN, monitor, :process, _pid, _reason}, %{receipt_producer_monitors: monitors} = state) when is_map_key(monitors, monitor) do
+    token = Map.fetch!(monitors, monitor)
+    failed? = is_nil(state.receipt_producers[token].worker)
+    {:noreply, finish_receipt_producer_state(state, token, failed?)}
+  end
+
   def handle_info({:DOWN, monitor, :process, _pid, _reason}, state) do
     case Map.pop(state.monitors, monitor) do
       {nil, _monitors} ->
@@ -513,6 +634,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
 
         %{state | drain: Drain.record_outcome(state.drain, token, entry, outcome)}
     end
+  end
+
+  defp finish_receipt_producer_state(state, token, failed?) do
+    {producer, producers} = Map.pop(state.receipt_producers, token)
+    Process.demonitor(producer.monitor, [:flush])
+    drain = if failed? and state.drain, do: %{state.drain | receipt_producers_failed?: true}, else: state.drain
+    %{state | receipt_producers: producers, receipt_producer_monitors: Map.delete(state.receipt_producer_monitors, producer.monitor), drain: drain}
   end
 
   defp retain_direct_cleanup(state, %{consumed?: true}), do: state

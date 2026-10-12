@@ -34,6 +34,40 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityDrain do
     end
   end
 
+  @doc "Drains dynamically registered receipt work, closing only after every producer has handed off."
+  @spec drain_receipts(integer(), policy(), GenServer.server(), (map() -> term())) :: map()
+  def drain_receipts(deadline_ms, policy, registry, observe) do
+    cohort = ActivityRegistry.receipt_cohort(name: registry)
+    observe.(cohort)
+    now_ms = policy.now_ms.()
+    active = Enum.filter(cohort.entries, &(&1.status == :active))
+    settlement_deadline = deadline_ms + policy.owner_post_deadline_call_budget_ms
+
+    cond do
+      cohort.closed? and active == [] ->
+        cohort
+
+      now_ms >= settlement_deadline ->
+        :ok = ActivityRegistry.force_receipt_cohort(name: registry)
+        cohort = ActivityRegistry.receipt_cohort(name: registry)
+        observe.(cohort)
+        cohort
+
+      true ->
+        if now_ms >= deadline_ms do
+          Enum.each(active, &ActivityRegistry.cancel(&1.token, :owner_drained, name: registry))
+        end
+
+        wait_token = make_ref()
+        until_ms = if now_ms < deadline_ms, do: deadline_ms, else: settlement_deadline
+        policy.schedule_wait.(self(), wait_token, min(@poll_interval_ms, max(0, until_ms - now_ms)))
+
+        receive do
+          {:rollout_drain_wait_elapsed, ^wait_token} -> drain_receipts(deadline_ms, policy, registry, observe)
+        end
+    end
+  end
+
   defp await(token, monitor, deadline_ms, policy, registry) do
     remaining_ms = max(0, deadline_ms - policy.now_ms.())
 
