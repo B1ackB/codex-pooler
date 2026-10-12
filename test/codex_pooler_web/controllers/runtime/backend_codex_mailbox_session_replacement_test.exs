@@ -18,6 +18,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace
   alias CodexPooler.Repo
   alias CodexPoolerWeb.GatewayControllerHelpers
+  alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
 
   @moduletag capture_log: true
   @path "/backend-api/codex/responses"
@@ -399,14 +400,60 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
 
   defp send_carrier_request(setup, thread, payload, mode, _websocket) do
     port = start_public_endpoint!()
+    before = WebsocketCleanupFence.listener_sockets()
     headers = [{"session-id", thread}, {"thread-id", thread}, {"x-codex-window-id", "#{thread}:0"}, {"originator", "codex_cli_rs"}]
     headers = if mode == "lite", do: [{"x-openai-internal-codex-responses-lite", "true"} | headers], else: headers
     {conn, websocket, ref, _} = public_websocket_connect_with_request_headers!(port, setup, thread, @path, headers)
+    socket = WebsocketCleanupFence.await_new_listener_socket!(before)
+    enrollment = observe_carrier_task!(socket)
     on_exit(fn -> Mint.HTTP.close(conn) end)
     {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, CodexPooler.JSON.encode!(Map.put(payload, "type", "response.create")))
+    {task, monitor} = await_carrier_enrollment!(socket, enrollment)
     terminal = receive_terminal!(conn, websocket, ref, System.monotonic_time(:millisecond) + @detection_budget)
+    await_carrier_task!(task, monitor)
     Mint.HTTP.close(conn)
+    :ok = WebsocketCleanupFence.await_listener_socket_cleanup!(socket)
     terminal
+  end
+
+  defp observe_carrier_task!(socket) do
+    ref = make_ref()
+    parent = self()
+    on_exit(fn -> send(socket, {ref, :release}) end)
+    :ok = :sys.install(socket, {ref, &__MODULE__.carrier_task_probe/3, %{parent: parent, ref: ref}})
+    ref
+  end
+
+  @doc false
+  def carrier_task_probe(%{parent: parent, ref: ref}, {:in, {:direct_request_cleanup, task, _binding, _receipt}}, _name) do
+    send(parent, {ref, :carrier_task, task})
+
+    receive do
+      {^ref, :release} -> :done
+    after
+      @detection_budget -> raise "carrier task enrollment was not released"
+    end
+  end
+
+  def carrier_task_probe(probe, _event, _name), do: probe
+
+  defp await_carrier_enrollment!(socket, ref) do
+    receive do
+      {^ref, :carrier_task, task} ->
+        monitor = CodexPooler.TestProcess.monitor_flushed(task)
+        send(socket, {ref, :release})
+        {task, monitor}
+    after
+      @detection_budget -> flunk("actual carrier response task was not admitted")
+    end
+  end
+
+  defp await_carrier_task!(task, monitor) do
+    receive do
+      {:DOWN, ^monitor, :process, ^task, :normal} -> :ok
+    after
+      @detection_budget -> flunk("actual carrier response task did not finish normally")
+    end
   end
 
   defp receive_terminal!(conn, websocket, ref, deadline) do
