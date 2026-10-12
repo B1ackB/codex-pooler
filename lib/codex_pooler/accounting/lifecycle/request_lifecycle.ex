@@ -962,16 +962,40 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
       original_attempt = %{original_attempt | replay_generation: Map.fetch!(context, :replay_generation)}
       authority = reconciliation_authority(original_request, original_attempt, request, attempt, entitlement, %{}, true)
 
-      if authority == :stale_generation or not receipt_session_matches?(request, context) do
-        %{request: request, attempt: attempt, finalization_disposition: :reused, stale_generation?: true}
-      else
-        attempt = persist_authoritative_receipt(attempt, receipt, context)
+      cond do
+        not receipt_session_matches?(request, context) ->
+          %{request: request, attempt: attempt, finalization_disposition: :reused, stale_generation?: true}
 
-        reconcile_recorded_receipt(request, attempt, settlement, attrs)
+        authority != :stale_generation ->
+          attempt = persist_authoritative_receipt(attempt, receipt, context)
+          reconcile_recorded_receipt(request, attempt, settlement, attrs)
+
+        matching_admitted_attempt?(original_request, original_attempt, request, attempt) and armed_original_receipt?(request, attempt, entitlement, settlement, context) ->
+          # Arming fences finalization, not the original socket's diagnostic receipt.
+          # Never retain an outcome witness or invoke a finalization callback here.
+          attempt = persist_authoritative_receipt(attempt, receipt, %{})
+          %{request: request, attempt: attempt, finalization_disposition: :reused}
+
+        true ->
+          %{request: request, attempt: attempt, finalization_disposition: :reused, stale_generation?: true}
       end
     end)
     |> unwrap_transaction()
   end
+
+  defp armed_original_receipt?(
+         %Request{id: request_id, api_key_id: key_id, pool_id: pool_id, status: "in_progress", completed_at: nil},
+         %Attempt{id: attempt_id, request_id: request_id, replay_generation: 0, status: "retryable_failed"} = attempt,
+         %RequestReplayEntitlement{request_id: request_id, codex_turn_id: turn_id, api_key_id: key_id, pool_id: pool_id, eligible_attempt_id: attempt_id, status: "armed", replay_generation: 1, replay_attempt_id: nil, closed_at: nil},
+         nil,
+         %{codex_session_id: session_id}
+       )
+       when is_binary(session_id) do
+    not newer_attempt?(attempt) and
+      Repo.exists?(from turn in CodexPooler.Gateway.Persistence.CodexTurn, where: turn.id == ^turn_id and turn.request_id == ^request_id and turn.codex_session_id == ^session_id and turn.status == "in_progress" and is_nil(turn.completed_at))
+  end
+
+  defp armed_original_receipt?(_request, _attempt, _entitlement, _settlement, _context), do: false
 
   defp persist_authoritative_receipt(attempt, receipt, context) do
     # A terminal positively written first wins over a later connection close.

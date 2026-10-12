@@ -59,6 +59,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.TerminateD
 
     [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.response_metadata["downstream_delivery"]["outcome"] == "aborted"
+    assert attempt.status == "retryable_failed"
+    refute Map.has_key?(attempt.response_metadata, "delivery_failure")
+    assert Repo.get!(Request, request.id).status == "in_progress"
+    assert Repo.get_by!(CodexPooler.Gateway.Persistence.CodexTurn, request_id: request.id).status == "in_progress"
+    assert %{status: "armed", eligible_attempt_id: eligible_id, replay_generation: 1, replay_attempt_id: nil, closed_at: nil} = Repo.get_by!(CodexPooler.Accounting.RequestReplayEntitlement, request_id: request.id)
+    assert eligible_id == attempt.id
+    assert Repo.all(from entry in LedgerEntry, where: entry.request_id == ^request.id, select: entry.entry_kind) == ["reservation"]
 
     await_owner_cleanup!(state.codex_session.id)
   end
