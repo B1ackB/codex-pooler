@@ -130,10 +130,24 @@ defmodule CodexPooler.UpstreamWebsocketRetirementPeer do
       receive do
         :release_peer ->
           update_progress(progress, id, &Map.put(&1, :phase, :draining))
+
+          probe_closure(transport, socket)
+
           drain(transport, socket, parent, ref, id, progress)
       end
     else
       serve_frames(transport, socket, parent, ref, id, script, 0)
+    end
+  end
+
+  # An abortive reset can leave the receiving TCP peer open while queued
+  # bytes arrive. A valid Ping probes the retired endpoint; only the
+  # subsequent closed/reset receive in drain/6 proves physical closure.
+  defp probe_closure(transport, socket) do
+    case transport.send(socket, <<0x89, 0>>) do
+      :ok -> :ok
+      {:error, reason} when reason in [:closed, :econnreset] -> :ok
+      {:error, reason} -> exit({:peer_probe_failed, reason})
     end
   end
 

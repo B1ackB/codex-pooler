@@ -4,6 +4,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionRetir
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.{ConnectionUpgrade, Request}
   alias CodexPooler.Platform.OutboundHTTP
   alias CodexPooler.UpstreamWebsocketRetirementPeer, as: Peer
+  alias CodexPoolerWeb.Runtime.BackendCodexTestSupport, as: SocketSupport
   @moduletag capture_log: true
   @budget 15_000
 
@@ -144,6 +145,34 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionRetir
     assert "physical peer close not observed: " <> death_json = death_error.message
     assert %{"cause" => "holder_down", "holder_exit" => "killed", "holder_alive" => false} = CodexPooler.JSON.decode!(death_json)
     assert {:ok, {:error, _reason}} = Task.yield(task, 1_500)
+  end
+
+  for transport <- [:ws, :wss] do
+    @tag transport: transport
+    test "#{transport} release probes liveness without closing a live peer", context do
+      peer = Peer.start!(context, [:stalled])
+      url = URI.parse(peer.url)
+      scheme = if context.transport == :wss, do: :https, else: :http
+      {:ok, conn} = Mint.HTTP.connect(scheme, url.host, url.port, protocols: [:http1])
+      on_exit(fn -> Mint.HTTP.close(conn) end)
+      {:ok, conn, request_ref} = Mint.WebSocket.upgrade(context.transport, conn, url.path, [])
+      {:ok, conn, status, headers} = SocketSupport.await_public_websocket_upgrade(conn, request_ref)
+      {conn, websocket} = SocketSupport.mint_websocket_new!(conn, request_ref, status, headers)
+      assert_receive {:peer_upgraded, ref, 1, holder}, @budget
+      assert ref == peer.ref
+      assert {:ok, conn} = Mint.HTTP.set_mode(conn, :passive)
+      send(holder, :release_peer)
+      assert {:ok, conn, [{:data, ^request_ref, bytes}]} = Mint.WebSocket.recv(conn, 2, @budget)
+      assert {:ok, websocket, [{:ping, ""}]} = Mint.WebSocket.decode(websocket, bytes)
+      assert {:ok, _websocket, encoded} = Mint.WebSocket.encode(websocket, {:pong, ""})
+      assert {:ok, conn} = Mint.WebSocket.stream_request_body(conn, request_ref, encoded)
+      error = assert_raise ExUnit.AssertionError, fn -> Peer.await_closed!(peer, 1, holder, Process.monitor(holder), 50) end
+      assert "physical peer close not observed: " <> json = error.message
+      assert %{"cause" => "timeout", "holder_alive" => true, "raw_port_alive" => true} = CodexPooler.JSON.decode!(json)
+      assert Mint.HTTP.open?(conn)
+      assert {:ok, _conn} = Mint.HTTP.close(conn)
+      assert :ok = Peer.await_closed!(peer, 1, holder, Process.monitor(holder), @budget)
+    end
   end
 
   defp bounded_request!(session, request) do
