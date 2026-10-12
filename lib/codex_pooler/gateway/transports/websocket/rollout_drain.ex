@@ -438,12 +438,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
   defp drain_starting_owner_after_turn(owner, deadline_ms, drain_policy) do
     :ok = WebsocketOwnerSession.begin_drain(owner)
     remaining_ms = max(1, deadline_ms - drain_policy.now_ms.())
+    owner_ref = Process.monitor(owner)
 
     try do
-      case WebsocketOwnerSession.local_drain_status(owner, %{at: deadline_ms, now_ms: drain_policy.now_ms}, remaining_ms) do
-        {:ok, %{active_turn?: false, compact_delivery_status: status}} when status in [:terminal_error, :aborted, :skipped] -> drain_settled_owner(:aborted, owner)
-        {:ok, %{active_turn?: true}} -> drain_owner_after_turn(owner, deadline_ms, drain_policy, :active)
-        {:ok, %{active_turn?: false}} -> drain_settled_owner(:idle, owner)
+      case WebsocketOwnerSession.local_drain_status(owner, %{at: deadline_ms, now_ms: drain_policy.now_ms, observer_ref: owner_ref}, remaining_ms) do
+        {:ok, %{active_turn?: false, compact_delivery_status: status}} when status in [:terminal_error, :aborted, :skipped] ->
+          drain_settled_owner(:aborted, owner, owner_ref)
+
+        {:ok, %{active_turn?: true}} ->
+          owner |> await_turn_outcome(owner_ref, deadline_ms, drain_policy, :active) |> drain_settled_owner(owner, owner_ref)
+
+        {:ok, %{active_turn?: false}} ->
+          drain_settled_owner(:idle, owner, owner_ref)
       end
     catch
       :exit, _reason ->
@@ -451,6 +457,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
         # The coordinator may stop this worker, but the owner must still stop
         # and release its lease when initialization eventually returns.
         drain_owner(owner)
+    after
+      cancel_owner_observation(owner, owner_ref)
+      Process.demonitor(owner_ref, [:flush])
     end
   end
 
@@ -463,13 +472,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
     :ok = WebsocketOwnerSession.begin_drain(owner)
     owner_ref = Process.monitor(owner)
 
-    outcome =
+    try do
       owner
       |> await_turn_outcome(owner_ref, deadline_ms, drain_policy, observed)
-      |> drain_settled_owner(owner)
-
-    Process.demonitor(owner_ref, [:flush])
-    outcome
+      |> drain_settled_owner(owner, owner_ref)
+    after
+      cancel_owner_observation(owner, owner_ref)
+      Process.demonitor(owner_ref, [:flush])
+    end
   end
 
   defp await_turn_outcome(owner, owner_ref, deadline_ms, drain_policy, :active),
@@ -477,6 +487,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
 
   defp await_turn_outcome(owner, owner_ref, deadline_ms, drain_policy, :unobserved) do
     case owner_status(owner, owner_ref, deadline_ms, drain_policy) do
+      {:drained, reply} ->
+        {:drained, reply, :idle}
+
       {:ok, %{active_turn?: false, compact_delivery_status: status}} when status in [:terminal_error, :aborted, :skipped] ->
         :aborted
 
@@ -499,7 +512,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
     else
       wait_ms = min(@drain_poll_interval_ms, remaining_ms)
 
-      case wait_or_owner_down(owner_ref, drain_policy, wait_ms) do
+      case wait_or_owner_down(owner, owner_ref, drain_policy, wait_ms) do
+        {:drained, reply} ->
+          {:drained, reply, :completed}
+
         :owner_down ->
           :failed
 
@@ -514,6 +530,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
 
   defp poll_owner_status(owner, owner_ref, deadline_ms, drain_policy) do
     case owner_status(owner, owner_ref, deadline_ms, drain_policy) do
+      {:drained, reply} ->
+        {:drained, reply, :completed}
+
       {:ok, %{active_turn?: false, compact_delivery_status: status}} when status in [:terminal_error, :aborted, :skipped] ->
         :aborted
 
@@ -530,24 +549,35 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
 
   defp owner_status(owner, owner_ref, deadline_ms, drain_policy) do
     receive do
+      {:websocket_owner_drain_finished, ^owner, ^owner_ref, reply} ->
+        observed_owner_completion(reply)
+
       {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
-        {:error, :owner_unavailable}
+        take_owner_completion(owner, owner_ref)
     after
       0 ->
-        WebsocketOwnerSession.local_drain_status(owner, %{at: deadline_ms, now_ms: drain_policy.now_ms})
+        WebsocketOwnerSession.local_drain_status(owner, %{at: deadline_ms, now_ms: drain_policy.now_ms, observer_ref: owner_ref})
     end
   catch
-    :exit, _reason -> {:error, :owner_unavailable}
+    :exit, _reason -> take_owner_completion(owner, owner_ref)
   end
 
-  defp wait_or_owner_down(owner_ref, drain_policy, wait_ms) do
+  defp wait_or_owner_down(owner, owner_ref, drain_policy, wait_ms) do
     wait_token = make_ref()
 
     try do
       wait_ref = drain_policy.schedule_wait.(self(), wait_token, wait_ms)
 
       receive do
-        {:DOWN, ^owner_ref, :process, _owner, _reason} ->
+        {:websocket_owner_drain_finished, ^owner, ^owner_ref, reply} ->
+          :ok = drain_policy.cancel_wait.(wait_ref, wait_token)
+
+          case observed_owner_completion(reply) do
+            {:drained, _} = completed -> completed
+            _failed -> :owner_down
+          end
+
+        {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
           :ok = drain_policy.cancel_wait.(wait_ref, wait_token)
           :owner_down
 
@@ -560,13 +590,48 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrain do
     end
   end
 
-  defp drain_settled_owner(:failed, _owner), do: {:error, :owner_unavailable}
+  defp drain_settled_owner(:failed, _owner, _ref), do: {:error, :owner_unavailable}
+  defp drain_settled_owner({:drained, reply, outcome}, _owner, _ref), do: drained_owner_result(reply, outcome)
 
-  defp drain_settled_owner(outcome, owner) do
+  defp drain_settled_owner(outcome, owner, ref) do
     case drain_owner(owner) do
-      :ok -> {:ok, outcome}
-      {:ok, :settled} -> {:ok, settled_outcome(outcome)}
-      {:error, _reason} = error -> error
+      {:error, _reason} = error ->
+        case take_owner_completion(owner, ref) do
+          {:drained, reply} -> drained_owner_result(reply, outcome)
+          _missing -> error
+        end
+
+      reply ->
+        receive do
+          {:websocket_owner_drain_finished, ^owner, ^ref, observed_reply} -> drained_owner_result(observed_reply, outcome)
+        after
+          0 -> drained_owner_result(reply, outcome)
+        end
+    end
+  end
+
+  defp drained_owner_result(:ok, outcome), do: {:ok, outcome}
+  defp drained_owner_result({:ok, :settled}, outcome), do: {:ok, settled_outcome(outcome)}
+  defp drained_owner_result(_failed, _outcome), do: {:error, :owner_unavailable}
+
+  defp observed_owner_completion(reply) when reply in [:ok, {:ok, :settled}], do: {:drained, reply}
+  defp observed_owner_completion(_reply), do: {:error, :owner_unavailable}
+
+  defp take_owner_completion(owner, ref) do
+    receive do
+      {:websocket_owner_drain_finished, ^owner, ^ref, reply} -> observed_owner_completion(reply)
+    after
+      0 -> {:error, :owner_unavailable}
+    end
+  end
+
+  defp cancel_owner_observation(owner, ref) do
+    # Old owners/probes ignore the extra status option and send no handshake.
+    # Send cancellation only to an owner that accepted this exact observation.
+    receive do
+      {:websocket_owner_drain_observing, ^owner, ^ref} -> GenServer.cast(owner, {:cancel_drain_observation, self(), ref})
+    after
+      0 -> :ok
     end
   end
 

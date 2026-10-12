@@ -135,7 +135,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     pending_admissions: %{},
     pending_admission_monitors: %{},
     abandoned_submissions: [],
-    exit_interrupted?: false
+    exit_interrupted?: false,
+    drain_observers: %{},
+    drain_requested?: false,
+    drain_result: nil,
+    drain_shutdown_failed?: false
   ]
 
   @type downstream :: %{
@@ -297,7 +301,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   def owner_status(owner), do: GenServer.call(owner, :owner_status, owner_call_timeout())
 
   @doc false
-  @spec local_drain_status(pid(), %{at: integer(), now_ms: (-> integer())}, pos_integer()) :: {:ok, owner_status()}
+  @spec local_drain_status(pid(), %{required(:at) => integer(), required(:now_ms) => (-> integer()), optional(:observer_ref) => reference()}, pos_integer()) :: {:ok, owner_status()}
   def local_drain_status(owner, deadline, timeout \\ owner_call_timeout())
 
   def local_drain_status(owner, %{at: at, now_ms: clock} = deadline, timeout) when is_pid(owner) and node(owner) == node() and is_integer(at) and is_function(clock, 0) and is_integer(timeout) and timeout > 0 do
@@ -1682,6 +1686,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   end
 
   def handle_call({:local_drain_status, %{at: at, now_ms: clock} = deadline}, from, state) when is_integer(at) and is_function(clock, 0) do
+    state = register_drain_observer(state, from, Map.get(deadline, :observer_ref))
+    deadline = Map.delete(deadline, :observer_ref)
     deadline = if state.compact_activity_deadline && state.compact_activity_deadline.at <= at, do: state.compact_activity_deadline, else: deadline
     handle_call(:owner_status, from, %{state | compact_activity_deadline: deadline})
   end
@@ -2659,6 +2665,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   def handle_cast({:abandon_attach, _pid, _correlation_id}, state), do: {:noreply, state}
 
+  def handle_cast({:cancel_drain_observation, observer, ref}, state) do
+    {:noreply, remove_drain_observer(state, observer, ref)}
+  end
+
   def handle_cast(:begin_drain, state), do: {:noreply, begin_drain_state(state)}
 
   @impl GenServer
@@ -3101,6 +3111,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     end
   end
 
+  def handle_info({:DOWN, monitor, :process, observer, _reason}, %{drain_observers: observers} = state) when is_map_key(observers, observer) do
+    case Map.fetch!(observers, observer) do
+      %{monitor: ^monitor, ref: ref} -> {:noreply, remove_drain_observer(state, observer, ref)}
+      _other_monitor -> {:noreply, state}
+    end
+  end
+
   def handle_info({:DOWN, monitor, :process, restorer, _reason}, state) do
     sensitivity = state.native_compaction_trace_sensitivity
 
@@ -3138,19 +3155,79 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     owner_exit_cause = owner_exit_cause(reason, state)
     Logger.owner_terminated(reason, owner_exit_reason, owner_exit_cause, state)
 
-    try do
-      state = OwnerCleanup.resolve_owner_state(state)
+    if reason == :normal and state.drain_requested? and map_size(state.drain_observers) > 0 do
+      complete_observed_drain(state, owner_exit_reason, owner_exit_cause)
+    else
+      try do
+        state = OwnerCleanup.resolve_owner_state(state)
 
-      case exit_interruption(state, owner_exit_reason) do
-        :ok -> Persistence.release_owner_lease(state, owner_exit_reason, owner_exit_cause)
-        {:error, _reason} -> :ok
+        case exit_interruption(state, owner_exit_reason) do
+          :ok -> Persistence.release_owner_lease(state, owner_exit_reason, owner_exit_cause)
+          {:error, _reason} -> :ok
+        end
+      after
+        close_upstream(state.callbacks.upstream_closer, state.upstream_pid)
+        answer_drain_waiters(state)
       end
-    after
-      close_upstream(state.callbacks.upstream_closer, state.upstream_pid)
-      answer_drain_waiters(state)
     end
 
     :ok
+  end
+
+  # The observing rollout worker may lose a race to a different drain caller.
+  # Its private ref is acknowledged only after this exact owner completed all
+  # shutdown obligations. A normal exit alone is never this evidence.
+  defp register_drain_observer(state, {observer, _tag}, ref) when is_reference(ref) do
+    case Map.get(state.drain_observers, observer) do
+      %{ref: ^ref} ->
+        state
+
+      previous ->
+        if previous, do: Process.demonitor(previous.monitor, [:flush])
+        entry = %{ref: ref, monitor: Process.monitor(observer)}
+        send(observer, {:websocket_owner_drain_observing, self(), ref})
+        %{state | drain_observers: Map.put(state.drain_observers, observer, entry)}
+    end
+  end
+
+  defp register_drain_observer(state, _from, _ref), do: state
+
+  defp remove_drain_observer(state, observer, ref) do
+    case Map.get(state.drain_observers, observer) do
+      %{ref: ^ref, monitor: monitor} ->
+        Process.demonitor(monitor, [:flush])
+        %{state | drain_observers: Map.delete(state.drain_observers, observer)}
+
+      _stale ->
+        state
+    end
+  end
+
+  defp complete_observed_drain(state, reason, cause) do
+    persisted = checked_owner_exit(state, reason, cause)
+    closed = checked_upstream_close(state)
+    complete? = persisted == :ok and closed == :ok and not state.drain_shutdown_failed? and is_nil(state.active_turn) and map_size(state.pending_admissions) == 0
+    result = if complete?, do: state.drain_result, else: {:error, :shutdown_incomplete}
+    Enum.each(state.drain_observers, fn {observer, %{ref: ref}} -> send(observer, {:websocket_owner_drain_finished, self(), ref, result}) end)
+    answer_drain_waiters(state)
+  end
+
+  defp checked_owner_exit(state, reason, cause) do
+    state = OwnerCleanup.resolve_owner_state(state)
+    with :ok <- exit_interruption(state, reason), do: Persistence.release_owner_lease_checked(state, reason, cause)
+  rescue
+    _exception -> {:error, :shutdown_incomplete}
+  catch
+    _kind, _reason -> {:error, :shutdown_incomplete}
+  end
+
+  defp checked_upstream_close(state) do
+    close_upstream(state.callbacks.upstream_closer, state.upstream_pid)
+    if is_pid(state.upstream_pid) and Process.alive?(state.upstream_pid), do: {:error, :upstream_alive}, else: :ok
+  rescue
+    _exception -> {:error, :upstream_close_failed}
+  catch
+    _kind, _reason -> {:error, :upstream_close_failed}
   end
 
   # A retiring owner persisted its exit when it settled the turn it held
@@ -3159,11 +3236,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   defp exit_interruption(state, owner_exit_reason), do: Persistence.interrupt_codex_session(state, owner_exit_reason)
 
   defp cancel_pending_admissions(state, reason) do
-    Enum.each(state.pending_admissions, fn {_task, context} ->
-      log_admitted_cleanup(DirectCleanup.terminate_admission(context, reason), state)
-    end)
+    failed? =
+      Enum.reduce(state.pending_admissions, state.drain_shutdown_failed?, fn {_task, context}, failed? ->
+        result = DirectCleanup.terminate_admission(context, reason)
+        log_admitted_cleanup(result, state)
+        failed? or match?({:error, _}, result)
+      end)
 
-    Enum.reduce(Map.keys(state.pending_admissions), state, &forget_pending_admission(&2, &1))
+    Enum.reduce(Map.keys(state.pending_admissions), %{state | drain_shutdown_failed?: failed?}, &forget_pending_admission(&2, &1))
   end
 
   defp cancel_admitted_context(state, context, reason) do
@@ -3750,7 +3830,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     do: {:noreply, %{state | drain_settlement: %{settlement | waiters: [from | waiters]}}}
 
   defp drain(from, state) do
-    state = begin_drain_state(state)
+    state = begin_drain_state(%{state | drain_requested?: true})
 
     case forwarded_turn_settlement(state) do
       :pending -> {:noreply, await_forwarded_turn_settlement(state, from)}
@@ -3760,7 +3840,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   end
 
   defp finish_or_defer_owner_drain(state, from, how) do
-    state = drain_now(state, how)
+    state = drain_now(%{state | drain_result: drain_reply(how)}, how)
 
     if match?(%{receipt_settlement: receipt} when is_map(receipt), state.active_turn) do
       {:noreply, append_receipt_drain_waiter(state, from, how)}
@@ -3777,7 +3857,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   # wait: its caller, the rollout drain or a closing downstream, goes on to
   # what follows the owner's exit.
   defp finish_drain_settlement(%{drain_settlement: %{waiters: waiters}} = state, how) do
-    state = drain_now(%{state | drain_settlement: nil}, how)
+    state = drain_now(%{state | drain_settlement: nil, drain_result: drain_reply(how)}, how)
     state = %{state | drain_replies: {Enum.reverse(waiters), drain_reply(how)}}
     if match?(%{receipt_settlement: receipt} when is_map(receipt), state.active_turn), do: {:noreply, state}, else: {:stop, :normal, state}
   end
@@ -4506,6 +4586,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   end
 
   defp complete_owner_receipt(state, disposition) do
+    state = %{state | drain_shutdown_failed?: state.drain_shutdown_failed? or disposition in [:failed, :aborted]}
     result = state.active_turn.receipt_settlement.cancellation_reply
     state = if state.retire_after_active_turn? and disposition in [:inserted, :reused, :replaced], do: %{state | exit_interrupted?: true}, else: state
     state = if state.active_turn.reply_sent?, do: state, else: state |> settle_retiring_turn() |> reply_receipt_cancellation(result)

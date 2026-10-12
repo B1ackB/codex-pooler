@@ -2,10 +2,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Persist
   @moduledoc false
 
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Persistence.SessionContinuity
+  alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, SessionContinuity}
   alias CodexPooler.Gateway.Runtime.Finalization.Interruption
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Logger, as: OwnerLogger
   alias CodexPooler.Gateway.Websocket.OwnerCleanup
+  alias CodexPooler.Repo
 
   @spec compact_delivery_status(OwnerCleanup.t(), pos_integer()) :: :pending | :delivered | :terminal_error | :aborted | :skipped
   defdelegate compact_delivery_status(witness, timeout_ms), to: Interruption
@@ -51,6 +52,43 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Persist
         release_current_owner_lease(state, reason, owner_exit_cause)
       end
     end)
+  end
+
+  @doc "Preserves a release failure for the exact owner drain observer instead of reporting recovery as completion."
+  @spec release_owner_lease_checked(map(), atom(), :idle_expiry | :drain_cut | nil) :: :ok | {:error, term()}
+  def release_owner_lease_checked(state, reason, cause) do
+    result = if reason == :stale_owner or not uuid?(state.codex_session_id), do: :ok, else: release_current_owner_lease(state, reason, cause)
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, stale} when stale in [:stale_owner_cleanup, :taken_over_owner_cleanup, :superseded_owner_cleanup] ->
+        checked_stale_release(state, reason, stale)
+
+      {:error, failure} ->
+        checked_release_failure(state, reason, failure)
+
+      _unexpected ->
+        checked_release_failure(state, reason, :unexpected_release_result)
+    end
+  rescue
+    exception -> checked_release_failure(state, reason, exception)
+  catch
+    _kind, failure -> checked_release_failure(state, reason, failure)
+  end
+
+  defp checked_stale_release(state, reason, stale) do
+    case Repo.get_by(BridgeOwnerLease, codex_session_id: state.codex_session_id, lease_token: state.owner_lease_token) do
+      %BridgeOwnerLease{status: "released"} -> :ok
+      _unreleased -> checked_release_failure(state, reason, stale)
+    end
+  end
+
+  defp checked_release_failure(state, reason, failure) do
+    OwnerLogger.owner_exit_persistence_failure(:release_owner_lease, state, reason, failure)
+    recover_owner_lifecycle_leftovers(state, reason)
+    {:error, failure}
   end
 
   defp release_current_owner_lease(state, reason, cause) do

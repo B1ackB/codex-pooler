@@ -11,10 +11,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RetainedUs
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, CodexTurn}
+  alias CodexPooler.Gateway.Runtime.Finalization.RetainedUsage
   alias CodexPooler.Gateway.Transports.Websocket.{ActivityRegistry, RolloutDrain, WebsocketOwnerSession}
   alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport
   alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport.VirtualDeadline
   alias CodexPooler.Gateway.Websocket, as: Gateway
+  alias CodexPooler.Gateway.Websocket.DownstreamSession
   alias CodexPooler.Platform.InstancePresence.Identity
   alias CodexPooler.Repo
   alias CodexPoolerWeb.CodexResponsesSocket
@@ -79,6 +81,134 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RetainedUs
       assert FakeUpstream.count(upstream) == 1
       record_evidence(%{scenario: "admitted_legacy_caller_dropped_usage", fixture_port: URI.parse(FakeUpstream.url(upstream)).port, topology: :peer, mode: mode, owner_node: Atom.to_string(peer.node), caller_node: Atom.to_string(node()), request_id: request_id, attempt_id: attempt_id, replay_generation: Repo.get!(Attempt, attempt_id).replay_generation, settlement_id: settlement.id, total_tokens: 120, request_status: request.status, error_code: request.last_error_code, actual_additive_field_dropped: true, provider_generations: 1})
     end
+  end
+
+  for mode <- ["full", "lite"] do
+    @tag graceful_owner_drain: true
+    test "a competing local cleanup completes the exact owner while rollout polling waits (#{mode})", do: run_competing_owner_drain(unquote(mode))
+  end
+
+  for ending <- [:receipt_failure, :kill_with_stale_ack] do
+    @tag graceful_owner_drain: true
+    test "a competing cleanup does not hide #{ending}", do: run_competing_owner_drain("full", unquote(ending))
+  end
+
+  defp run_competing_owner_drain(mode, ending \\ :graceful) do
+    OwnerCrashAfterSendScenario.per_process_connections!()
+    assert_namespace!()
+    harness = WebsocketRolloutDrainSupport.start_rollout_drain_harness(self())
+    hold = make_ref()
+    upstream = start_upstream(FakeUpstream.websocket_text_frames([encode(completed())]))
+    setup = gateway_setup(upstream)
+    register_unboxed_pool_cleanup!(setup)
+    set_model_serving_mode!(model_serving_scope(), setup, mode)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {session, owner} = start_remote_session_owner!(auth, %{session_header: @window, session_header_source: "x-codex-window-id"}, node(), :real, upstream: held_terminal_writer_boundary(self(), hold), receipt_registry: harness.activity_registry, terminal_delivery_timeout_ms: 30_000)
+    port = start_public_endpoint!()
+    {conn, ws, ref, _} = public_websocket_connect_with_request_headers!(port, setup, Ecto.UUID.generate(), "/backend-api/codex/responses", socket_headers(mode))
+    {conn, _ws} = public_websocket_send_text!(conn, ws, ref, encode(%{"type" => "response.create", "model" => setup.model.exposed_model_id, "instructions" => "synthetic instructions", "input" => [%{"role" => "user", "content" => "synthetic question"}], "tools" => [], "stream" => true}))
+    on_exit(fn -> Mint.HTTP.close(conn) end)
+    assert_receive {:held_terminal_writer, writer, ^hold}, @timeout
+    on_exit(fn -> send(writer, {:discard_terminal_writer, hold}) end)
+    pending = await_pending!(owner, deadline())
+    request_id = pending.active_turn.admission_request_id
+    assert {:ok, %{response_usage: %{total_tokens: 120}}} = pending.active_turn.pending_result
+    {:ok, lock} = Postgrex.start_link(Keyword.take(Repo.config(), [:hostname, :port, :username, :password, :database]))
+    Process.unlink(lock)
+    on_exit(fn -> if Process.alive?(lock), do: GenServer.stop(lock) end)
+    Postgrex.query!(lock, "BEGIN", [])
+    %{rows: [[backend]]} = Postgrex.query!(lock, "SELECT pg_backend_pid() FROM requests WHERE id=$1 FOR UPDATE", [Ecto.UUID.dump!(request_id)])
+    drain = Task.async(fn -> RolloutDrain.start_drain([name: harness.name, timeout_ms: 5_000] ++ WebsocketRolloutDrainSupport.deadline_options(harness.deadline)) end)
+    await_owner_and_receipt_poll!(harness.deadline, deadline())
+    assert :sys.get_state(owner).compact_activity_deadline != nil
+    owner_monitor = Process.monitor(owner)
+
+    if ending == :receipt_failure, do: fail_receipt_completion_after_commit(owner)
+
+    cleanup_state = %{websocket_owner_pid: owner, websocket_owner_downstream: pending.downstream, websocket_owner_lease_token: session.owner_lease_token, codex_session: session, opts: %{}}
+
+    cleanup =
+      Task.async(fn ->
+        receive do
+          :cleanup -> DownstreamSession.cleanup(cleanup_state, :shutdown)
+        end
+      end)
+
+    mfa = {WebsocketOwnerSession, :drain_owner, 1}
+    :erlang.trace_pattern(mfa, [{:_, [], [{:return_trace}]}], [:local])
+    :erlang.trace(cleanup.pid, true, [:call, {:tracer, self()}])
+    on_exit(fn -> :erlang.trace_pattern(mfa, false, [:local]) end)
+    send(cleanup.pid, :cleanup)
+    caller = cleanup.pid
+
+    duplicate =
+      try do
+        assert_receive {:trace, ^caller, :call, {WebsocketOwnerSession, :drain_owner, [^owner]}}, @timeout
+        await_sql_receipt_worker!(harness.activity_registry, deadline())
+        assert_sql_blocker!(backend, deadline())
+
+        disrupt_owner_observation(owner, ending)
+
+        if ending == :graceful do
+          duplicate = Task.async(fn -> WebsocketOwnerSession.drain_owner(owner) end)
+          await_owner_drain_waiters!(owner, 2, deadline())
+          duplicate
+        end
+      after
+        Postgrex.query!(lock, "ROLLBACK", [])
+        GenServer.stop(lock)
+      end
+
+    expected_exit = if ending == :kill_with_stale_ack, do: :killed, else: :normal
+    if ending != :kill_with_stale_ack, do: assert_receive({:trace, ^caller, :return_from, ^mfa, :ok}, @timeout)
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, ^expected_exit}, @timeout
+    Task.await(cleanup, @timeout)
+    if duplicate, do: assert(Task.await(duplicate, @timeout) == :ok)
+    :erlang.trace_pattern(mfa, false, [:local])
+    assert await_settlement!(request_id, deadline()).total_tokens == 120
+    assert %DateTime{} = Repo.get!(CodexSession, session.id).disconnected_at
+    assert Repo.get_by!(BridgeOwnerLease, codex_session_id: session.id, lease_token: session.owner_lease_token).status == "released"
+    VirtualDeadline.advance(harness.deadline, 200)
+    summary = Task.await(drain, @timeout)
+    send(writer, {:discard_terminal_writer, hold})
+    Mint.HTTP.close(conn)
+    WebsocketCleanupFence.await_session_cleanups!()
+    assert :ok = WebsocketRolloutDrainSupport.await_rollout_drain_harness(harness)
+    record_evidence(%{scenario: "competing_local_cleanup_owner_exit", mode: mode, ending: ending, request_id: request_id, actual_drain_caller_observed: true, actual_drain_return: if(ending == :kill_with_stale_ack, do: nil, else: "ok"), owner_exit: expected_exit, sql_blocker_observed: true, original_lease_released: true, session_disconnected: true, total_tokens: 120, summary: summary})
+    assert_competing_owner_outcome(summary, ending)
+  end
+
+  defp disrupt_owner_observation(owner, :kill_with_stale_ack) do
+    [{observer, %{ref: observation}}] = Map.to_list(:sys.get_state(owner).drain_observers)
+    send(observer, {:websocket_owner_drain_finished, owner, make_ref(), :ok})
+    send(observer, {:websocket_owner_drain_finished, self(), observation, :ok})
+    Process.exit(owner, :kill)
+  end
+
+  defp disrupt_owner_observation(_owner, _ending), do: :ok
+
+  defp fail_receipt_completion_after_commit(owner) do
+    :sys.replace_state(owner, fn state ->
+      put_in(state.persistence[:retained_usage], fn snapshot ->
+        {:ok, _committed} = RetainedUsage.finalize(snapshot)
+        {:error, :synthetic_receipt_completion_failure}
+      end)
+    end)
+  end
+
+  defp await_owner_drain_waiters!(owner, count, limit) do
+    case :sys.get_state(owner).drain_replies do
+      {waiters, _reply} when length(waiters) == count -> :ok
+      _pending -> retry!(fn -> await_owner_drain_waiters!(owner, count, limit) end, limit, "duplicate drain caller was not registered")
+    end
+  end
+
+  defp assert_competing_owner_outcome(summary, :graceful), do: assert(%{result: :ok, owners_seen: 1, owners_drained: 1, owners_failed: 0, turns_completed: 1, receipt_settlements_seen: 1, receipt_settlements_completed: 1} = summary)
+  defp assert_competing_owner_outcome(summary, :receipt_failure), do: assert(%{result: :error, owners_seen: 1, owners_failed: 1, receipt_settlements_seen: 1, receipt_settlements_failed: 1} = summary)
+  defp assert_competing_owner_outcome(summary, :kill_with_stale_ack), do: assert(%{result: :error, owners_seen: 1, owners_failed: 1, receipt_settlements_seen: 1, receipt_settlements_completed: 1} = summary)
+
+  defp await_owner_and_receipt_poll!(clock, limit) do
+    if length(VirtualDeadline.waiter_pids(clock)) >= 2, do: :ok, else: retry!(fn -> await_owner_and_receipt_poll!(clock, limit) end, limit, "owner and receipt cohorts never reached their poll barriers")
   end
 
   for force_cut <- [false, true] do
