@@ -19,6 +19,7 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
 
   alias CodexPooler.Gateway.Persistence.SessionContinuity.{Aliases, ExpiredSessions, OwnerWitness}
   alias CodexPooler.Gateway.Websocket, as: Gateway
+  alias CodexPooler.Gateway.Websocket.DeliveryReceipt
   alias CodexPooler.InstanceSettings
   alias CodexPooler.InstanceSettings.Settings
   alias Ecto.Adapters.SQL.Sandbox
@@ -1048,7 +1049,7 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
     assert session_heartbeat == lease_heartbeat
   end
 
-  test "stale owner completion preserves replacement ownership while settling interrupted turn" do
+  test "stale owner completion requires delivered terminal proof to promote an interrupted turn" do
     %{auth: auth, session: session} = owner_session_fixture()
     %{assignment: stale_assignment} = upstream_assignment_fixture(auth.pool)
     %{assignment: replacement_assignment} = upstream_assignment_fixture(auth.pool)
@@ -1119,6 +1120,18 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
                witness
              )
 
+    assert %CodexTurn{status: "interrupted", final_attempt_id: nil} = Repo.reload!(turn)
+    assert is_nil(Repo.reload!(attempt).response_metadata["downstream_delivery"])
+    assert Repo.get!(CodexSession, session.id) == before_session
+    assert active_lease!(session.id) == before_lease
+    assert response_aliases_for_session(session.id) == before_aliases
+
+    receipt = DeliveryReceipt.build(%{outcome: "delivered", terminal_class: "response.completed", transport: "http_sse", pushed_at: DateTime.utc_now(), frames_after_visible: 1})
+    assert :ok = DeliveryReceipt.persist(attempt.id, receipt)
+    assert Repo.reload!(attempt).response_metadata["downstream_delivery"] == receipt
+
+    assert ^result = SessionContinuity.complete_codex_turn(result, CodexTurn.succeeded_status(), nil, attempt, witness)
+
     assert %CodexTurn{status: "succeeded", final_attempt_id: final_attempt_id} =
              Repo.reload!(turn)
 
@@ -1140,6 +1153,8 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
     assert Repo.reload!(turn).status == CodexTurn.succeeded_status()
     assert Repo.get!(CodexSession, session.id) == before_session
     assert active_lease!(session.id) == before_lease
+    assert response_aliases_for_session(session.id) == before_aliases
+    CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "visible_then_delivered_terminal", before_receipt: "interrupted", after_receipt: Repo.reload!(turn).status, exact_attempt: Repo.reload!(turn).final_attempt_id == attempt.id, replacement_session_unchanged: Repo.get!(CodexSession, session.id) == before_session, replacement_lease_unchanged: active_lease!(session.id) == before_lease}))
   end
 
   @tag :replay_schema

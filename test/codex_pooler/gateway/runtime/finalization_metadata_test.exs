@@ -43,7 +43,7 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataTest do
     assert_raise KeyError, fn -> RequestOptions.put_runtime_context(options, payload_compression: %{}) end
   end
 
-  test "stale owner terminal settlement keeps accounting truthful without moving replacement assignment" do
+  test "stale owner usage settles without promoting an interrupted turn or moving replacement assignment" do
     setup = accounting_setup()
 
     %{assignment: replacement_assignment} =
@@ -134,7 +134,13 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataTest do
 
     assert Repo.reload!(reserved.request).status == "succeeded"
     assert Repo.reload!(attempt).status == "succeeded"
-    assert Repo.reload!(turn).status == CodexTurn.succeeded_status()
+    assert Repo.reload!(turn).status == CodexTurn.interrupted_status()
+    assert Repo.reload!(reserved.request).usage_status == "usage_known"
+    assert Repo.reload!(attempt).usage_status == "usage_known"
+    assert is_nil(Repo.reload!(attempt).response_metadata["downstream_delivery"])
+    assert [settlement] = Repo.all(from entry in LedgerEntry, where: entry.request_id == ^reserved.request.id and entry.entry_kind == "settlement" and entry.amount_status == "recorded")
+    assert settlement.total_tokens == 5
+    CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "open_accounting_interrupted_turn", status: Repo.reload!(reserved.request).status, attempt: Repo.reload!(attempt).status, turn: Repo.reload!(turn).status, tokens: settlement.total_tokens, delivered_receipt: false}))
     assert Repo.get!(CodexSession, session.id) == before_session
     assert Repo.reload!(lease) == before_lease
   end

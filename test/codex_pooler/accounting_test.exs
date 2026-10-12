@@ -445,7 +445,7 @@ defmodule CodexPooler.AccountingTest do
              ) == 1
     end
 
-    test "late known usage replaces an unknown settlement and its projections" do
+    test "late known usage replaces unknown accounting while preserving the failed outcome" do
       setup =
         accounting_setup(%{
           input_token_micros: Decimal.new(25),
@@ -531,10 +531,17 @@ defmodule CodexPooler.AccountingTest do
                )
 
       assert Map.keys(reconciled) |> Enum.sort() == [:attempt, :release, :request, :settlement]
-      assert reconciled.request.status == "succeeded"
+      assert reconciled.request.status == "failed"
       assert reconciled.request.usage_status == "usage_known"
-      assert reconciled.attempt.status == "succeeded"
+      assert reconciled.attempt.status == "failed"
       assert reconciled.attempt.usage_status == "usage_known"
+      assert reconciled.request.last_error_code == "owner_drained"
+      assert reconciled.request.completed_at == first_timestamp
+      assert reconciled.attempt.network_error_code == "owner_drained"
+      assert reconciled.attempt.completed_at == failed.attempt.completed_at
+      assert reconciled.attempt.response_metadata == failed.attempt.response_metadata
+      assert reconciled.settlement.occurred_at == failed.settlement.occurred_at
+      assert reconciled.settlement.created_at == failed.settlement.created_at
       assert reconciled.settlement.usage_status == "usage_known"
       assert reconciled.settlement.correction_of_entry_id == failed.settlement.id
       assert reconciled.settlement.source_event_id =~ ":settlement:usage-known"
@@ -569,7 +576,9 @@ defmodule CodexPooler.AccountingTest do
             order_by: [asc: entry.created_at, asc: entry.id]
         )
 
-      assert [voided, recorded] = settlements
+      assert length(settlements) == 2
+      assert voided = Enum.find(settlements, &(&1.id == failed.settlement.id))
+      assert recorded = Enum.find(settlements, &(&1.id == reconciled.settlement.id))
       assert voided.id == failed.settlement.id
       assert voided.amount_status == "voided"
       assert recorded.id == reconciled.settlement.id
@@ -611,8 +620,8 @@ defmodule CodexPooler.AccountingTest do
                )
 
       assert daily_rollup.request_count == 1
-      assert daily_rollup.success_count == 1
-      assert daily_rollup.failure_count == 0
+      assert daily_rollup.success_count == 0
+      assert daily_rollup.failure_count == 1
       assert daily_rollup.total_tokens == 21
 
       assert [hourly_rollup] =
@@ -624,12 +633,12 @@ defmodule CodexPooler.AccountingTest do
                )
 
       assert hourly_rollup.request_count == 1
-      assert hourly_rollup.success_count == 1
-      assert hourly_rollup.failure_count == 0
+      assert hourly_rollup.success_count == 0
+      assert hourly_rollup.failure_count == 1
       assert hourly_rollup.total_tokens == 21
 
       fact = Repo.get_by!(RequestLogFact, request_id: reserved.request.id)
-      assert fact.latest_attempt_status == "succeeded"
+      assert fact.latest_attempt_status == "failed"
       assert fact.latest_settlement_entry_id == reconciled.settlement.id
       assert fact.latest_settlement_usage_status == "usage_known"
       assert fact.latest_total_tokens == 21
@@ -639,6 +648,8 @@ defmodule CodexPooler.AccountingTest do
       assert fact.latest_reasoning_tokens == 2
       assert Decimal.equal?(fact.latest_settled_cost_micros, Decimal.new(623))
       assert Decimal.equal?(fact.latest_cached_input_cost_micros, Decimal.new(20))
+
+      CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "late_known_failed_accounting", database: Repo.query!("SELECT current_database()").rows, status: Repo.reload!(reconciled.request).status, error: reconciled.request.last_error_code, tokens: recorded.total_tokens, cost: Decimal.to_string(recorded.settled_cost_micros), daily: Map.take(daily_rollup, [:request_count, :success_count, :failure_count, :total_tokens]), hourly: Map.take(hourly_rollup, [:request_count, :success_count, :failure_count, :total_tokens]), settlement_reused: repeated.settlement.id == recorded.id, original_timestamp: recorded.occurred_at == failed.settlement.occurred_at}))
 
       for rollup <- [daily_rollup, hourly_rollup] do
         assert rollup.input_tokens == 16
@@ -718,7 +729,15 @@ defmodule CodexPooler.AccountingTest do
           )
         end)
 
-      assert {:ok, _reconciled} = replacement
+      assert {:ok, reconciled} = replacement
+      assert reconciled.request.status == "failed"
+      assert reconciled.request.last_error_code == "owner_drained"
+      assert reconciled.request.completed_at == failed.request.completed_at
+      assert reconciled.attempt.status == "failed"
+      assert reconciled.attempt.network_error_code == "owner_drained"
+      assert reconciled.settlement.correction_of_entry_id == failed.settlement.id
+      assert reconciled.settlement.total_tokens == 10
+      assert Repo.reload!(racing_reserved.request).status == "succeeded"
 
       # The subtract side never reads rollup rows back: it decrements with
       # relative arithmetic in single UPDATE statements.
@@ -732,8 +751,8 @@ defmodule CodexPooler.AccountingTest do
                )
 
       assert daily_rollup.request_count == 2
-      assert daily_rollup.success_count == 2
-      assert daily_rollup.failure_count == 0
+      assert daily_rollup.success_count == 1
+      assert daily_rollup.failure_count == 1
       assert daily_rollup.total_tokens == 110
 
       assert [hourly_rollup] =
@@ -745,8 +764,10 @@ defmodule CodexPooler.AccountingTest do
                )
 
       assert hourly_rollup.request_count == 2
-      assert hourly_rollup.success_count == 2
+      assert hourly_rollup.success_count == 1
+      assert hourly_rollup.failure_count == 1
       assert hourly_rollup.total_tokens == 110
+      CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "atomic_replacement_neighbor", target_status: Repo.reload!(reconciled.request).status, neighbor_status: Repo.reload!(racing_reserved.request).status, daily: Map.take(daily_rollup, [:request_count, :success_count, :failure_count, :total_tokens]), hourly: Map.take(hourly_rollup, [:request_count, :success_count, :failure_count, :total_tokens])}))
     end
 
     test "releases stale undispatched reservations without settling usage" do

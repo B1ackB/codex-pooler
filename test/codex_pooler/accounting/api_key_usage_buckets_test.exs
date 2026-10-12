@@ -200,7 +200,12 @@ defmodule CodexPooler.Accounting.APIKeyUsageBucketsTest do
 
       assert corrected.settlement.correction_of_entry_id == failed.settlement.id
       assert corrected.settlement.occurred_at == unknown_at
-      assert corrected.settlement.created_at == known_at
+      assert corrected.settlement.created_at == unknown_at
+      assert corrected.request.status == "failed"
+      assert corrected.request.last_error_code == "synthetic_unknown_usage"
+      assert corrected.request.completed_at == unknown_at
+      assert Repo.reload!(failed.settlement).amount_status == "voided"
+      assert %{rows: [[0]]} = Repo.query!("SELECT COUNT(*) FROM api_key_usage_buckets WHERE api_key_id = $1::text::uuid AND bucket_started_at = $2", [setup.api_key.id, minute_start(known_at)])
 
       assert_bucket!(
         setup.api_key.id,
@@ -227,6 +232,7 @@ defmodule CodexPooler.Accounting.APIKeyUsageBucketsTest do
 
       assert later.effective_request_count == 0
       assert later.effective_total_tokens == 0
+      CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "original_settlement_bucket", status: Repo.reload!(corrected.request).status, occurred_at: corrected.settlement.occurred_at, created_at: corrected.settlement.created_at, total_tokens: usage.known_total_tokens, request_count: usage.effective_request_count, later_tokens: later.effective_total_tokens}))
     end
 
     test "API-key cascades remove ledger entries and buckets without recreating projection rows" do

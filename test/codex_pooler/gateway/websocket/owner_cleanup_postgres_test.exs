@@ -104,18 +104,35 @@ defmodule CodexPooler.Gateway.Websocket.OwnerCleanupPostgresTest do
     assert_receive {:cleanup_finished, ^delayed, :ok}, @budget
     facts = call(source, :facts, [current])
     assert facts.request.status == "failed"
+    assert facts.request.last_error_code == "owner_drained"
     assert facts.attempt.status == "failed"
+    assert facts.attempt.network_error_code == "owner_drained"
     assert facts.turn.status == "interrupted"
     assert {:ok, correction} = call(source, :correct_usage, [current])
     assert correction.finalization_disposition == :replaced
-    assert correction.request.status == "succeeded"
+    assert correction.request.status == "failed"
+    assert correction.request.last_error_code == facts.request.last_error_code
+    assert correction.request.completed_at == facts.request.completed_at
+    assert correction.attempt.status == "failed"
+    assert correction.attempt.network_error_code == facts.attempt.network_error_code
+    assert correction.attempt.completed_at == facts.attempt.completed_at
     assert correction.attempt.usage_status == "usage_known"
-    assert correction.settlement.correction_of_entry_id
+    original = Enum.find(facts.ledger, &(&1.entry_kind == "settlement" and &1.amount_status == "recorded"))
+    assert correction.settlement.correction_of_entry_id == original.id
+    assert correction.settlement.occurred_at == original.occurred_at
+    assert correction.settlement.pricing_snapshot_id == original.pricing_snapshot_id
+    assert correction.settlement.total_tokens == 10
     corrected = call(source, :facts, [current])
+    assert corrected.turn == facts.turn
+    assert corrected.lease == facts.lease
+    assert corrected.session == facts.session
+    assert corrected.request.usage_status == "usage_known"
+    assert corrected.attempt.usage_status == "usage_known"
     assert {:ok, repeated} = call(source, :correct_usage, [current])
     assert repeated.settlement.id == correction.settlement.id
     assert corrected.ledger == call(source, :facts, [current]).ledger
     assert_effective_disposition(corrected.ledger)
+    CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "accepted_owner_cleanup_correction", status: corrected.request.status, error: corrected.request.last_error_code, turn: corrected.turn.status, tokens: correction.settlement.total_tokens, original_timestamp: correction.settlement.occurred_at == original.occurred_at, repeated_ledger_unchanged: corrected.ledger == call(source, :facts, [current]).ledger}))
     finish(source, current)
   end
 

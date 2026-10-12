@@ -958,7 +958,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.SocketLifecycleTest do
     end
   end
 
-  test "late websocket success after disconnect promotes an interrupted turn" do
+  test "late websocket usage after disconnect preserves the interrupted delivery outcome" do
     setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
@@ -993,7 +993,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.SocketLifecycleTest do
     assert Repo.get!(CodexTurn, turn.id).status == "interrupted"
     assert Repo.get!(Request, reserved.request.id).status == "failed"
 
-    assert {:ok, _result} =
+    interrupted_request = Repo.get!(Request, reserved.request.id)
+    interrupted_attempt = Repo.get!(Attempt, attempt.id)
+    interrupted_turn = Repo.get!(CodexTurn, turn.id)
+
+    assert {:ok, result} =
              AttemptSettlement.finalize_success(
                reserved.request,
                attempt,
@@ -1001,21 +1005,31 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.SocketLifecycleTest do
                %{response_status_code: 200}
              )
 
-    assert Repo.get!(CodexTurn, turn.id).status == "succeeded"
-    assert Repo.get!(CodexTurn, turn.id).error_code == nil
-    assert Repo.get!(Request, reserved.request.id).status == "succeeded"
-    assert Repo.get!(Request, reserved.request.id).last_error_code == nil
+    assert Repo.get!(CodexTurn, turn.id).status == "interrupted"
+    assert Repo.get!(CodexTurn, turn.id).error_code == "client_disconnected"
+    assert Repo.get!(Request, reserved.request.id).status == "failed"
+    assert Repo.get!(Request, reserved.request.id).last_error_code == "client_disconnected"
 
     reloaded_attempt = Repo.get!(Attempt, attempt.id)
-    assert reloaded_attempt.status == "succeeded"
-    assert reloaded_attempt.network_error_code == nil
-    assert reloaded_attempt.error_message == nil
+    assert reloaded_attempt.status == "failed"
+    assert reloaded_attempt.network_error_code == "client_disconnected"
+    assert reloaded_attempt.error_message == interrupted_attempt.error_message
+    assert reloaded_attempt.completed_at == interrupted_attempt.completed_at
+    assert Repo.get!(Request, reserved.request.id).completed_at == interrupted_request.completed_at
+    assert Repo.get!(CodexTurn, turn.id) == interrupted_turn
+    assert result.settlement.total_tokens == 2
+    assert result.settlement.usage_status == "usage_known"
+    assert Repo.get!(Request, reserved.request.id).usage_status == "usage_known"
+    assert reloaded_attempt.usage_status == "usage_known"
+    assert is_nil(reloaded_attempt.response_metadata["downstream_delivery"])
 
     assert %{items: [log]} =
              Accounting.list_request_logs(setup.pool, filters: %{request_id: reserved.request.id})
 
-    assert log.status == "succeeded"
-    assert log.errors == []
+    assert log.status == "failed"
+    assert Enum.any?(log.errors, &(&1.source == "request" and &1.code == "client_disconnected"))
+    assert Enum.any?(log.errors, &(&1.source == "attempt" and &1.code == "client_disconnected"))
+    CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "socket_disconnect_late_usage", status: Repo.get!(Request, reserved.request.id).status, attempt: reloaded_attempt.status, turn: Repo.get!(CodexTurn, turn.id).status, tokens: result.settlement.total_tokens, log_status: log.status, errors: Enum.map(log.errors, &Map.take(&1, [:source, :code]))}))
   end
 
   test "websocket terminate lets a response task released during grace finish before interrupting" do
