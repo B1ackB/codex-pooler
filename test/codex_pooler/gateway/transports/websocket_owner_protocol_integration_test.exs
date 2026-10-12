@@ -27,6 +27,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerProtocolIntegra
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
   alias CodexPooler.Gateway.Websocket, as: Gateway
+  alias CodexPooler.Pools.Routing
+  alias CodexPooler.Pools.RoutingStrategy
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.SavedResets.{ProbeLease, RedemptionLifecycle}
@@ -1606,6 +1608,109 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerProtocolIntegra
              )
 
     assert Repo.get!(CodexSession, session.id).owner_lease_token == lease_token
+  end
+
+  @tag timeout: 180_000
+  test "routing profiles preserve actual two-BEAM owner envelopes and connection-bound refusal", %{sandbox_owner: sandbox_owner, sandbox_settings_cache: settings_cache} do
+    alias CodexPooler.Gateway.Payloads.RequestOptions.TimeoutConfig
+    alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
+    alias CodexPooler.Gateway.Transports.Websocket.{WebsocketOwnerForwarder, WebsocketOwnerRequestV8}
+    alias CodexPooler.{ProviderCreditsFixtures, UnboxedFixture}
+    alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
+
+    terminal = terminal_frame("resp_synthetic_profile_owner")
+    fixture = ProviderCreditsFixtures.open!(mode: FakeUpstream.websocket_text_frames([terminal]))
+    on_exit(fn -> CodexPooler.DataCase.stop_sandbox(sandbox_owner, settings_cache) end)
+    peer = fixture.peer.node
+    assert peer != node()
+    assert Node.list() == [peer]
+    assert :erpc.call(peer, Node, :list, []) == [node()]
+    assert :erpc.call(peer, :erlang, :node, []) == peer
+    assert is_pid(:erpc.call(peer, Process, :whereis, [CodexPooler.PubSub]))
+    assert is_pid(:erpc.call(peer, Process, :whereis, [Repo]))
+    assert :erpc.call(peer, Repo, :config, [])[:database] == Repo.config()[:database]
+    [[local_backend]] = UnboxedFixture.run_unboxed(fn -> Repo.query!("SELECT pg_backend_pid()").rows end)
+    [[remote_backend]] = :erpc.call(peer, Repo, :query!, ["SELECT pg_backend_pid()"]).rows
+    refute local_backend == remote_backend
+    topic = "routing-profile-peer-#{Ecto.UUID.generate()}"
+    :ok = Phoenix.PubSub.subscribe(CodexPooler.PubSub, topic)
+    pubsub_marker = make_ref()
+    :ok = :erpc.call(peer, Phoenix.PubSub, :broadcast, [CodexPooler.PubSub, topic, {:profile_peer_pubsub, pubsub_marker}])
+    assert_receive {:profile_peer_pubsub, ^pubsub_marker}, 15_000
+    setup = ProviderCreditsFixtures.runtime_setup!(fixture, :a, :included)
+    pool = fixture.pools.a
+    auth = %{pool: pool, api_key: setup.api_key}
+    identity = setup.identity
+    context = %ProviderCreditsAdmission.Context{version: 1, pool_id: pool.id, pool_upstream_assignment_id: setup.assignment.id, upstream_identity_id: identity.id, credential_epoch: CredentialFencing.credential_epoch(identity), model: setup.model.exposed_model_id, upstream_model: setup.model.upstream_model_id, serving_mode: :full, transport: :bridged_websocket, route_class: "proxy_websocket", request_id: nil, attempt_id: nil, reset_probe: nil, redemption_generation: nil, redemption_attempt_id: nil}
+
+    for profile <- RoutingStrategy.ids(), owner_node <- [peer, node()] do
+      settings = UnboxedFixture.run_unboxed(fn -> Routing.ensure_routing_settings(pool) end)
+      UnboxedFixture.run_unboxed(fn -> Repo.update!(Ecto.Changeset.change(settings, routing_strategy: profile)) end)
+      assert :erpc.call(peer, CodexPooler.Pools.Routing, :get_routing_settings, [pool.id]).routing_strategy == profile
+      {:ok, session} = UnboxedFixture.run_unboxed(fn -> Gateway.start_codex_session(auth, %{accepted_turn_state: "profile-#{Ecto.UUID.generate()}", owner_instance_id: Atom.to_string(owner_node)}) end)
+
+      on_exit(fn ->
+        if owner_node == node() or owner_node in Node.list(), do: :erpc.call(owner_node, WebsocketOwnerNodeHarness, :stop_owner, [session.id, 15_000])
+      end)
+
+      {:ok, owner} = :erpc.call(owner_node, WebsocketOwnerSession, :start_owner, [[codex_session_id: session.id, owner_lease_token: session.owner_lease_token, owner_instance_id: session.owner_instance_id, owner_renewal_ms: 60_000]])
+      assert node(owner) == owner_node
+      downstream = %{pid: self(), correlation_id: "profile-#{profile}-#{owner_node}", epoch: 1}
+      {:ok, attached} = profile_peer_call(peer, owner_node, WebsocketOwnerForwarder, :remote_attach_downstream, [session.id, downstream])
+      inner = %WebsocketOwnerRequest{version: 1, url: FakeUpstream.url(fixture.upstream) <> "/backend-api/codex/responses", headers: [], payload: CodexPooler.JSON.encode!(%{"type" => "response.create", "model" => setup.model.exposed_model_id}), timeouts: %TimeoutConfig{connect_timeout_ms: 5_000, pool_timeout_ms: 5_000, receive_timeout_ms: 5_000}, mapper: :public_openai_responses, upstream_identity_id: identity.id, observation: %{request_id: nil, client_request_id: nil, attempt_id: nil, mode: "full"}, reset_probe: nil, native_codex_response_control: nil, assignment_advertised?: false, connection_bound_continuation?: false, forward_error_body?: false, submission_notification?: false}
+      {:ok, envelope} = WebsocketOwnerRequestV8.new(%{version: 8, request: inner, provider_credits_context: context})
+      assert Enum.sort(Map.keys(Map.from_struct(envelope))) == [:provider_credits_context, :request, :version]
+      assert Enum.sort(Map.keys(Map.from_struct(inner))) == Enum.sort(~w(version url headers payload timeouts mapper upstream_identity_id observation reset_probe native_codex_response_control assignment_advertised? connection_bound_continuation? forward_error_body? submission_notification?)a)
+      assert :ok = WebsocketOwnerRequestV8.validate(envelope)
+      before_count = FakeUpstream.count(fixture.upstream)
+      before_connections = FakeUpstream.websocket_connection_count(fixture.upstream)
+      invalid = %{envelope | version: 99}
+      assert {:error, :owner_unavailable} = profile_peer_call(peer, owner_node, WebsocketOwnerForwarder, :remote_submit_request_v8, [session.id, attached, invalid])
+      assert FakeUpstream.count(fixture.upstream) == before_count
+      anchored = %{envelope | request: %{inner | connection_bound_continuation?: true, payload: CodexPooler.JSON.encode!(%{"type" => "response.create", "model" => setup.model.exposed_model_id, "previous_response_id" => "resp_synthetic_missing_anchor"})}}
+      assert {:ok, refusal} = profile_peer_call(peer, owner_node, WebsocketOwnerForwarder, :remote_submit_request_v8, [session.id, attached, anchored])
+      assert refusal.upstream_error_code == "previous_response_not_found"
+      assert FakeUpstream.count(fixture.upstream) == before_count
+      assert {:ok, normal} = profile_peer_call(peer, owner_node, WebsocketOwnerForwarder, :remote_submit_request_v8, [session.id, attached, envelope])
+      assert normal.status == 200
+      assert FakeUpstream.count(fixture.upstream) == before_count + 1
+      assert {:ok, continuation} = profile_peer_call(peer, owner_node, WebsocketOwnerForwarder, :remote_submit_request_v8, [session.id, attached, %{anchored | request: %{anchored.request | payload: CodexPooler.JSON.encode!(%{"type" => "response.create", "model" => setup.model.exposed_model_id, "previous_response_id" => "resp_synthetic_profile_owner"})}}])
+      assert continuation.upstream_websocket_connection.reused
+      assert FakeUpstream.count(fixture.upstream) == before_count + 2
+      state = :erpc.call(owner_node, :sys, :get_state, [owner])
+      assert :ok = :erpc.call(owner_node, UpstreamWebsocketSession, :invalidate_connection, [state.upstream_pid])
+      assert {:ok, lost_connection} = profile_peer_call(peer, owner_node, WebsocketOwnerForwarder, :remote_submit_request_v8, [session.id, attached, anchored])
+      assert lost_connection.upstream_error_code == "previous_response_not_found"
+      assert FakeUpstream.count(fixture.upstream) == before_count + 2
+      assert {:ok, recovered} = profile_peer_call(peer, owner_node, WebsocketOwnerForwarder, :remote_submit_request_v8, [session.id, attached, envelope])
+      assert recovered.status == 200
+      assert recovered.upstream_websocket_connection.reconnected
+      assert FakeUpstream.count(fixture.upstream) == before_count + 3
+      assert FakeUpstream.websocket_connection_count(fixture.upstream) == before_connections + 2
+      stored = :erpc.call(peer, Repo, :get!, [CodexSession, session.id])
+      assert stored.owner_instance_id == Atom.to_string(owner_node)
+      assert stored.owner_lease_token == session.owner_lease_token
+      lease = :erpc.call(peer, Repo, :get_by!, [BridgeOwnerLease, [codex_session_id: session.id]])
+      assert lease.status == "active"
+      assert lease.owner_instance_id == Atom.to_string(owner_node)
+      assert lease.lease_token == session.owner_lease_token
+      CodexPooler.TestDiagnostics.puts(fn -> CodexPooler.JSON.encode!(%{scenario: "routing_profile_real_peer", profile: profile, caller_node: to_string(if(owner_node == peer, do: node(), else: peer)), owner_node: to_string(owner_node), connected_nodes: Enum.map(Node.list(), &to_string/1), owner_pid: inspect(owner), db: Repo.config()[:database], local_backend: local_backend, peer_backend: remote_backend, pubsub_delivered: true, lease_status: lease.status, protocol: 8, normal_dispatches: 1, recovered_normal_dispatches: 1, physical_connections: 2, reused_anchor_dispatches: 1, fresh_anchor_dispatches: 0, lost_connection_dispatches: 0, invalid_envelope_dispatches: 0, listener: FakeUpstream.url(fixture.upstream)}) end)
+      assert :ok = :erpc.call(owner_node, WebsocketOwnerNodeHarness, :stop_owner, [session.id, 15_000])
+    end
+
+    CodexPooler.DataCase.stop_sandbox(sandbox_owner, settings_cache)
+    ProviderCreditsFixtures.close!(fixture)
+    assert Node.list() == []
+    assert UnboxedFixture.run_unboxed(fn -> Repo.aggregate(from(p in CodexPooler.Pools.Pool, where: p.id in ^fixture.pool_ids), :count) end) == 0
+    CodexPooler.TestDiagnostics.puts("routing_profile_real_peer cleanup: peer absent; owned pools absent; fixture close completed")
+  end
+
+  defp profile_peer_call(peer, owner_node, module, function, arguments) do
+    if owner_node == peer do
+      :erpc.call(peer, module, function, arguments, 15_000)
+    else
+      :erpc.call(peer, :erpc, :call, [owner_node, module, function, arguments, 15_000], 20_000)
+    end
   end
 
   defp owner_session_fixture(auth, suffix, owner_instance_id \\ Atom.to_string(@remote_node)) do

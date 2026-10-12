@@ -119,23 +119,6 @@ defmodule CodexPooler.Pools.Routing do
       |> RoutingSettings.changeset(%{
         routing_strategy: routing_attr(attrs, "routing_strategy", settings.routing_strategy),
         bridge_ring_size: parse_positive_integer(routing_attr(attrs, "bridge_ring_size", settings.bridge_ring_size)),
-        sticky_websocket_sessions:
-          parse_boolean(
-            routing_attr(
-              attrs,
-              "sticky_websocket_sessions",
-              settings.sticky_websocket_sessions
-            )
-          ),
-        sticky_http_sessions: parse_boolean(routing_attr(attrs, "sticky_http_sessions", settings.sticky_http_sessions)),
-        prompt_cache_affinity_enabled:
-          parse_boolean(
-            routing_attr(
-              attrs,
-              "prompt_cache_affinity_enabled",
-              settings.prompt_cache_affinity_enabled
-            )
-          ),
         v1_compatibility_enabled:
           parse_boolean(
             routing_attr(
@@ -163,9 +146,6 @@ defmodule CodexPooler.Pools.Routing do
           record_pool_audit_event(scope, "pool.routing_update", pool, %{
             routing_strategy: settings.routing_strategy,
             bridge_ring_size: settings.bridge_ring_size,
-            sticky_websocket_sessions: settings.sticky_websocket_sessions,
-            sticky_http_sessions: settings.sticky_http_sessions,
-            prompt_cache_affinity_enabled: settings.prompt_cache_affinity_enabled,
             allow_image_generation: settings.allow_image_generation,
             allow_audio_transcription: settings.allow_audio_transcription
           })
@@ -198,9 +178,6 @@ defmodule CodexPooler.Pools.Routing do
       pool_id: pool_id,
       routing_strategy: "bridge_ring",
       bridge_ring_size: 3,
-      sticky_websocket_sessions: true,
-      sticky_http_sessions: false,
-      prompt_cache_affinity_enabled: true,
       v1_compatibility_enabled: true,
       allow_image_generation: true,
       allow_audio_transcription: true,

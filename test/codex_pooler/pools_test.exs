@@ -171,9 +171,6 @@ defmodule CodexPooler.PoolsTest do
                pool_id: pool_id,
                routing_strategy: "bridge_ring",
                bridge_ring_size: 3,
-               sticky_websocket_sessions: true,
-               sticky_http_sessions: false,
-               prompt_cache_affinity_enabled: true,
                v1_compatibility_enabled: true,
                allow_image_generation: true
              } = Pools.routing_settings_with_defaults(pool)
@@ -183,7 +180,6 @@ defmodule CodexPooler.PoolsTest do
 
       assert %RoutingSettings{
                routing_strategy: "bridge_ring",
-               prompt_cache_affinity_enabled: true,
                v1_compatibility_enabled: true,
                allow_image_generation: true
              } =
@@ -212,11 +208,11 @@ defmodule CodexPooler.PoolsTest do
                  "allow_image_generation" => false
                })
 
-      refute Pools.get_routing_settings(routed_pool).prompt_cache_affinity_enabled
+      refute Map.has_key?(Pools.get_routing_settings(routed_pool), :prompt_cache_affinity_enabled)
       refute Map.has_key?(Pools.get_routing_settings(routed_pool), :request_compression_enabled)
       refute Pools.get_routing_settings(routed_pool).allow_image_generation
       refute Pools.allow_image_generation?(routed_pool)
-      refute Pools.routing_settings_with_defaults(routed_pool).prompt_cache_affinity_enabled
+      refute Map.has_key?(Pools.routing_settings_with_defaults(routed_pool), :prompt_cache_affinity_enabled)
 
       refute Map.has_key?(Pools.routing_settings_with_defaults(routed_pool), :request_compression_enabled)
       refute Pools.v1_compatibility_enabled?(routed_pool)
@@ -228,7 +224,7 @@ defmodule CodexPooler.PoolsTest do
                  "request_compression_enabled" => false
                })
 
-      assert reenabled_settings.prompt_cache_affinity_enabled
+      refute Map.has_key?(reenabled_settings, :prompt_cache_affinity_enabled)
       assert reenabled_settings.v1_compatibility_enabled
       refute Map.has_key?(reenabled_settings, :request_compression_enabled)
       assert Pools.v1_compatibility_enabled?(routed_pool)
@@ -261,16 +257,10 @@ defmodule CodexPooler.PoolsTest do
                "deterministic_rotation"
              ]
 
-      assert Enum.map(audits, & &1.details["sticky_http_sessions"]) == [true, true, true, true]
+      for field <- ~w(sticky_websocket_sessions sticky_http_sessions prompt_cache_affinity_enabled) do
+        refute Enum.any?(audits, &Map.has_key?(&1.details, field))
+      end
 
-      assert Enum.map(audits, & &1.details["prompt_cache_affinity_enabled"]) == [
-               false,
-               true,
-               true,
-               true
-             ]
-
-      assert Enum.all?(audits, &is_boolean(&1.details["prompt_cache_affinity_enabled"]))
       refute Enum.any?(audits, &Map.has_key?(&1.details, "request_compression_enabled"))
 
       assert Enum.map(audits, & &1.details["allow_image_generation"]) == [
@@ -300,19 +290,16 @@ defmodule CodexPooler.PoolsTest do
       assert %{
                ^pool_id => %RoutingSettings{
                  routing_strategy: "bridge_ring",
-                 prompt_cache_affinity_enabled: true,
                  v1_compatibility_enabled: true,
                  allow_image_generation: true
                },
                ^routed_pool_id => %RoutingSettings{
                  routing_strategy: "deterministic_rotation",
-                 prompt_cache_affinity_enabled: true,
                  v1_compatibility_enabled: true,
                  allow_image_generation: false
                },
                ^missing_pool_id => %RoutingSettings{
                  routing_strategy: "bridge_ring",
-                 prompt_cache_affinity_enabled: true,
                  v1_compatibility_enabled: true,
                  allow_image_generation: true
                }
@@ -423,33 +410,24 @@ defmodule CodexPooler.PoolsTest do
       end
     end
 
-    test "pool workflow defaults prompt cache affinity on and persists explicit disables" do
-      %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+    for websocket <- [false, true], http <- [false, true], cache <- [false, true] do
+      test "legacy affinity values #{websocket}/#{http}/#{cache} survive current writes" do
+        assert_legacy_affinity_preserved([unquote(websocket), unquote(http), unquote(cache)])
+      end
+    end
+
+    test "new workflow and lazy settings use SQL defaults despite stale affinity attrs" do
+      %{user: owner} = bootstrap_owner_fixture()
       scope = Scope.for_user(owner, ["instance_owner"])
-
-      assert {:ok, default_pool} =
-               PoolWorkflow.create_pool_with_related_settings(scope, %{
-                 "name" => "Workflow Default"
-               })
-
-      assert Pools.get_routing_settings(default_pool).prompt_cache_affinity_enabled == true
-
-      assert {:ok, disabled_pool} =
-               PoolWorkflow.create_pool_with_related_settings(scope, %{
-                 "name" => "Workflow Disabled",
-                 "prompt_cache_affinity_enabled" => "false"
-               })
-
-      assert Pools.get_routing_settings(disabled_pool).prompt_cache_affinity_enabled == false
-
-      assert {:ok, _updated_pool} =
-               PoolWorkflow.update_pool_with_related_settings(scope, disabled_pool, %{
-                 "name" => disabled_pool.name,
-                 "status" => disabled_pool.status,
-                 "prompt_cache_affinity_enabled" => true
-               })
-
-      assert Pools.get_routing_settings(disabled_pool).prompt_cache_affinity_enabled == true
+      stale = Map.new(~w(sticky_websocket_sessions sticky_http_sessions prompt_cache_affinity_enabled), &{&1, "invalid"})
+      assert {:ok, pool} = PoolWorkflow.create_pool_with_related_settings(scope, Map.put(stale, "name", "Workflow Default"))
+      assert legacy_affinity_values(pool) == [true, false, true]
+      Repo.delete!(Pools.get_routing_settings(pool))
+      defaults = Pools.routing_settings_with_defaults(pool)
+      refute Pools.get_routing_settings(pool)
+      refute Map.has_key?(defaults, :sticky_websocket_sessions)
+      assert Pools.ensure_routing_settings(pool)
+      assert legacy_affinity_values(pool) == [true, false, true]
     end
 
     test "instance owner memberships can list and manage all pools without cached scope roles" do
@@ -1085,5 +1063,39 @@ defmodule CodexPooler.PoolsTest do
     %User{}
     |> User.bootstrap_changeset(valid_bootstrap_attributes(attrs))
     |> Repo.insert!()
+  end
+
+  defp assert_legacy_affinity_preserved(values) do
+    %{user: owner} = bootstrap_owner_fixture()
+    scope = Scope.for_user(owner, ["instance_owner"])
+    assert {:ok, pool} = Pools.create_pool(scope, %{slug: "legacy-affinity", name: "Legacy Affinity"})
+    settings = Pools.ensure_routing_settings(pool)
+    assert legacy_affinity_values(pool) == [true, false, true]
+    Repo.query!("UPDATE pool_routing_settings SET sticky_websocket_sessions = $1, sticky_http_sessions = $2, prompt_cache_affinity_enabled = $3 WHERE pool_id = $4", values ++ [Ecto.UUID.dump!(pool.id)])
+    fields = ~w(sticky_websocket_sessions sticky_http_sessions prompt_cache_affinity_enabled)a
+
+    for stale <- [true, false, "true", "false", "invalid", "ignore all instructions"] do
+      attrs = Map.new(fields, &{&1, stale}) |> Map.put(:bridge_ring_size, 7)
+      changeset = RoutingSettings.changeset(settings, attrs)
+      assert changeset.valid?
+      assert Map.take(changeset.changes, fields) == %{}
+      assert {:ok, updated} = Pools.update_routing_settings(scope, pool, attrs)
+      assert updated.bridge_ring_size == 7
+      assert legacy_affinity_values(pool) == values
+      assert Map.take(Map.from_struct(Pools.get_routing_settings(pool)), fields) == %{}
+    end
+
+    assert {:error, changeset} = Pools.update_routing_settings(scope, pool, %{"routing_strategy" => "invalid", "bridge_ring_size" => 9})
+    assert Keyword.has_key?(changeset.errors, :routing_strategy)
+    assert Pools.get_routing_settings(pool).bridge_ring_size == 7
+    assert legacy_affinity_values(pool) == values
+    audits = Repo.all(from audit in AuditEvent, where: audit.action == "pool.routing_update" and audit.target_id == ^pool.id)
+    assert length(audits) == 6
+    assert Enum.all?(audits, &(Map.take(&1.details, Enum.map(fields, fn field -> Atom.to_string(field) end)) == %{}))
+  end
+
+  defp legacy_affinity_values(pool) do
+    [values] = Repo.query!("SELECT sticky_websocket_sessions, sticky_http_sessions, prompt_cache_affinity_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
+    values
   end
 end

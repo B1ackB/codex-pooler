@@ -14,6 +14,7 @@ defmodule CodexPoolerWeb.Admin.PolicyEditorComponents do
   attr :current_step, :any, required: true
   attr :sections_label, :string, default: "Policy sections"
   attr :step_event, :string, default: nil
+  attr :step_form_id, :string, default: nil
   attr :backdrop_event, :string, default: nil
   attr :backdrop_label, :string, default: "close"
   attr :docs_url, :string, default: "https://www.codex-pooler.com/docs/operators/admin-ui/"
@@ -51,6 +52,8 @@ defmodule CodexPoolerWeb.Admin.PolicyEditorComponents do
             </p>
           </div>
 
+          <%!-- Keep Enter in a field on the form's save action, before the step submitters. --%>
+          <button :if={@step_form_id} type="submit" form={@step_form_id} hidden aria-hidden="true" tabindex="-1" />
           <div id={"#{@id}-sections"} class="policy-editor-sections min-w-0">
             <ol
               id={"#{@id}-tabs"}
@@ -66,15 +69,19 @@ defmodule CodexPoolerWeb.Admin.PolicyEditorComponents do
                 <button
                   :if={@step_event}
                   id={wizard_tab_dom_id(@id, step.id)}
-                  type="button"
+                  type={if @step_form_id, do: "submit", else: "button"}
+                  form={@step_form_id}
+                  name={@step_form_id && "wizard_step"}
+                  value={@step_form_id && step.id}
+                  formnovalidate={@step_form_id != nil}
                   class={wizard_step_class(step.id, @current_step_id)}
                   aria-label={step.label}
                   aria-current={step.id == @current_step_id && "step"}
                   aria-selected={if(step.id == @current_step_id, do: "true", else: "false")}
                   aria-controls={wizard_section_dom_id(@id, step.id)}
                   role="tab"
-                  phx-click={@step_event}
-                  phx-value-step={step.id}
+                  phx-click={if @step_form_id, do: nil, else: @step_event}
+                  phx-value-step={if @step_form_id, do: nil, else: step.id}
                 >
                   <span
                     data-role="policy-editor-step-marker"

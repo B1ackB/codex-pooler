@@ -50,9 +50,6 @@ defmodule CodexPooler.Dev.RoutingStrategyFixtureTest do
       |> RoutingSettings.changeset(%{
         routing_strategy: "deterministic_rotation",
         bridge_ring_size: 7,
-        sticky_websocket_sessions: false,
-        sticky_http_sessions: true,
-        prompt_cache_affinity_enabled: false,
         v1_compatibility_enabled: false,
         allow_image_generation: false,
         metadata: %{"baseline" => true},
@@ -60,6 +57,8 @@ defmodule CodexPooler.Dev.RoutingStrategyFixtureTest do
         updated_at: baseline_updated_at
       })
       |> Repo.insert!()
+
+      Repo.query!("UPDATE pool_routing_settings SET sticky_websocket_sessions = false, sticky_http_sessions = true, prompt_cache_affinity_enabled = false WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)])
 
       options = Keyword.put(context.options, :routing_strategy, "quota_first")
 
@@ -125,14 +124,13 @@ defmodule CodexPooler.Dev.RoutingStrategyFixtureTest do
       assert %RoutingSettings{
                routing_strategy: "deterministic_rotation",
                bridge_ring_size: 7,
-               sticky_websocket_sessions: false,
-               sticky_http_sessions: true,
-               prompt_cache_affinity_enabled: false,
                v1_compatibility_enabled: false,
                allow_image_generation: false,
                metadata: %{"baseline" => true},
                updated_at: ^baseline_updated_at
              } = Repo.get!(RoutingSettings, pool.id)
+
+      assert [[false, true, false]] = Repo.query!("SELECT sticky_websocket_sessions, sticky_http_sessions, prompt_cache_affinity_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
 
       # The pre-existing Pool survives; everything the fixture created is gone.
       assert Repo.get_by(Pool, slug: Names.pool_slug())
@@ -216,29 +214,31 @@ defmodule CodexPooler.Dev.RoutingStrategyFixtureTest do
     end
 
     @tag timeout: 120_000
-    test "prompt cache locality makes every strategy inert", context do
+    test "prompt cache locality changes only the cache locality strategy", context do
       Enum.each(@strategies, fn strategy ->
         with_fixture(context.options, strategy, fn fixture ->
           seed = "routing-locality-#{strategy}"
           strategy_order = expected_order(fixture, strategy, seed)
 
           # Pick a cache key whose locality order starts somewhere else, so
-          # "the strategy was ignored" is a discriminating claim rather than a
-          # coincidence.
+          # cache/profile precedence is a discriminating claim.
           prompt_cache_key = prompt_cache_key_diverging_from(fixture, hd(strategy_order))
           locality_order = locality_order(fixture, prompt_cache_key)
 
           plan = plan_route(fixture, seed, prompt_cache_key: prompt_cache_key)
 
-          assert plan.locality.status == "applied"
           assert plan.strategy == strategy
-          assert plan_indexes(fixture, plan) == Enum.take(locality_order, @ring_size)
 
-          assert plan.selected_assignment_id ==
-                   assignment_id_for_index(fixture, hd(locality_order))
-
-          refute plan.selected_assignment_id ==
-                   assignment_id_for_index(fixture, hd(strategy_order))
+          if strategy == "bridge_ring" do
+            assert plan.locality.status == "applied"
+            assert plan_indexes(fixture, plan) == Enum.take(locality_order, @ring_size)
+            refute plan.selected_assignment_id == assignment_id_for_index(fixture, hd(strategy_order))
+          else
+            assert plan.locality.status == "disabled"
+            assert plan.locality.unhonored_reason == "routing_strategy_policy"
+            assert plan_indexes(fixture, plan) == Enum.take(strategy_order, @ring_size)
+            refute plan.selected_assignment_id == assignment_id_for_index(fixture, hd(locality_order))
+          end
         end)
       end)
     end

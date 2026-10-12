@@ -216,9 +216,6 @@ defmodule CodexPooler.Admin.PoolWorkflow do
     %{
       "routing_strategy" => Map.get(attrs, "routing_strategy", "bridge_ring"),
       "bridge_ring_size" => Map.get(attrs, "bridge_ring_size", 3),
-      "sticky_websocket_sessions" => Map.get(attrs, "sticky_websocket_sessions", true),
-      "sticky_http_sessions" => Map.get(attrs, "sticky_http_sessions", false),
-      "prompt_cache_affinity_enabled" => Map.get(attrs, "prompt_cache_affinity_enabled", true),
       "v1_compatibility_enabled" => Map.get(attrs, "v1_compatibility_enabled", true),
       "allow_image_generation" => Map.get(attrs, "allow_image_generation", true),
       "allow_audio_transcription" => Map.get(attrs, "allow_audio_transcription", true)

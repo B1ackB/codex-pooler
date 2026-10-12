@@ -147,6 +147,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
         current_step={@current_step}
         sections_label="Pool sections"
         step_event="pool_wizard_step"
+        step_form_id={(@mode != :models && @form_id) || nil}
         backdrop_event={@cancel_event}
         docs_url={@docs_url}
       >
@@ -196,16 +197,16 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
             class={step_panel_class(@current_step, "routing")}
           >
             <section id={"#{@id}-step-routing-panel"} class="grid min-w-0 gap-5">
-              <div id={@routing_controls_id} class="grid min-w-0 gap-5">
+              <div id={@routing_controls_id} class="pool-routing-profiles grid min-w-0 gap-5">
                 <div class="group/selpolicy grid min-w-0 gap-2">
                   <div class="flex min-w-0 flex-wrap items-center gap-2">
                     <p class="text-[0.6rem] font-bold uppercase tracking-wide text-base-content/50">
                       Selection policy
                       <span class="ml-1 text-[11px] font-medium normal-case tracking-normal text-base-content/45">
-                        Strategy and fan-out size used for runtime requests
+                        How eligible upstreams are ordered
                       </span>
                     </p>
-                    <span class="ml-auto flex items-center gap-2 opacity-45 transition-opacity group-has-[.strategy-bridge:checked]/selpolicy:opacity-100">
+                    <span class="ml-auto flex items-center gap-2">
                       <label
                         for={@form[:bridge_ring_size].id}
                         class="text-[0.6rem] font-bold uppercase tracking-wide text-base-content/55"
@@ -216,6 +217,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                         id={@form[:bridge_ring_size].id}
                         type="number"
                         min="1"
+                        aria-describedby={"#{@form[:bridge_ring_size].id}_help"}
                         name={@form[:bridge_ring_size].name}
                         value={@form[:bridge_ring_size].value}
                         class="input input-sm w-14 text-center tabular-nums"
@@ -255,13 +257,14 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                           name={@form[:routing_strategy].name}
                           value={value}
                           checked={to_string(@form[:routing_strategy].value) == value}
+                          aria-describedby={"#{@form[:routing_strategy].id}_#{value}_description"}
                         />
                         <span class="grid min-w-0 gap-0.5">
                           <span class="text-[13px] font-semibold leading-tight text-base-content">
                             {label}
                           </span>
                           <span class="text-[11px] leading-4 text-base-content/55">
-                            {pool_strategy_description(value)}
+                            {AdminBadges.routing_strategy_presentation(value).description}
                           </span>
                         </span>
                       </label>
@@ -269,32 +272,30 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                   </div>
                 </div>
 
+                <p id={"#{@form[:bridge_ring_size].id}_help"} class="text-xs text-base-content/55">
+                  Ring size limits the candidate shortlist. Credit and saved-reset recovery may try additional accounts.
+                </p>
                 <div class="grid min-w-0 items-start gap-4 md:grid-cols-2">
-                  <div class="grid min-w-0 content-start gap-2">
+                  <section
+                    :for={{_label, value} <- @strategy_options}
+                    id={"#{@form[:routing_strategy].id}_#{value}_description"}
+                    aria-labelledby={"#{@form[:routing_strategy].id}_#{value}"}
+                    data-routing-profile={value}
+                    class="pool-routing-profile min-w-0 content-start gap-2"
+                  >
                     <p class="text-[0.6rem] font-bold uppercase tracking-wide text-base-content/50">
-                      Continuity
+                      How it routes
                       <span class="ml-1 text-[11px] font-medium normal-case tracking-normal text-base-content/45">
-                        Identity-aware routing behavior
+                        {AdminBadges.routing_strategy_label(value)}
                       </span>
                     </p>
-                    <div class="overflow-hidden rounded-box border border-base-300 bg-base-100">
-                      <.routing_toggle_row
-                        field={@form[:sticky_websocket_sessions]}
-                        label="Sticky websocket sessions"
-                        help="Same upstream for websocket sessions with continuity identity."
-                      />
-                      <.routing_toggle_row
-                        field={@form[:sticky_http_sessions]}
-                        label="HTTP affinity"
-                        help="Same upstream preference for related HTTP requests."
-                      />
-                      <.routing_toggle_row
-                        field={@form[:prompt_cache_affinity_enabled]}
-                        label="Prompt cache affinity"
-                        help="Sends requests that share a prompt cache to the same upstream."
-                      />
-                    </div>
-                  </div>
+                    <ul class="grid gap-3 py-1">
+                      <.routing_feature icon={AdminBadges.routing_strategy_icon(value)} title={AdminBadges.routing_strategy_presentation(value).feature} description={AdminBadges.routing_strategy_presentation(value).detail} />
+                      <.routing_feature icon="hero-link" title="Keep sessions together" description="Related turns prefer the session's current upstream." />
+                      <.routing_feature icon="hero-shield-check" title="Respect routing safeguards" description="Quota, health and required continuity always apply." />
+                      <.routing_feature icon="hero-information-circle" title={AdminBadges.routing_strategy_presentation(value).cache_title} description={AdminBadges.routing_strategy_presentation(value).cache_description} />
+                    </ul>
+                  </section>
 
                   <div class="grid min-w-0 content-start gap-2">
                     <p class="text-[0.6rem] font-bold uppercase tracking-wide text-base-content/50">
@@ -566,19 +567,21 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
 
   defp pool_step_heading(step), do: Map.fetch!(@pool_step_headings, normalize_step(step))
 
-  defp pool_strategy_description("bridge_ring"),
-    do: "Stable rendezvous ordering, within continuity and quota."
+  attr :icon, :string, required: true
+  attr :title, :string, required: true
+  attr :description, :string, required: true
 
-  defp pool_strategy_description("deterministic_rotation"),
-    do: "Rotates which upstream goes first per session, in a fixed, predictable order."
-
-  defp pool_strategy_description("least_recent_success"),
-    do: "Prefers the upstream that has waited longest since its last successful request."
-
-  defp pool_strategy_description("quota_first"),
-    do: "Prefers the upstream with the most remaining quota for the requested model."
-
-  defp pool_strategy_description(_strategy), do: nil
+  defp routing_feature(assigns) do
+    ~H"""
+    <li class="flex items-start gap-2.5">
+      <.icon name={@icon} class="mt-0.5 size-[18px] shrink-0 text-base-content/55" />
+      <span class="grid min-w-0 gap-0.5">
+        <span class="text-[13px] font-semibold leading-4">{@title}</span>
+        <span class="text-xs leading-4 text-base-content/55">{@description}</span>
+      </span>
+    </li>
+    """
+  end
 
   defp sort_selected_first(options, field) do
     Enum.sort_by(options, fn option ->

@@ -24,7 +24,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   alias CodexPooler.Gateway.Routing.RoutePlanInput
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Pools.Routing, as: PoolRouting
-  alias CodexPooler.Pools.RoutingSettings
+  alias CodexPooler.Pools.{RoutingSettings, RoutingStrategy}
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
@@ -106,7 +106,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     # written after it is state this turn was never in a position to disprove.
     planned_at = now()
     settings = routing_settings(auth, route_state)
-    affinity = affinity_context(auth, model, route_plan_input, request_options, settings)
+    affinity = affinity_context(auth, model, route_plan_input, request_options)
     demotions = active_demotions(auth, model, candidates)
 
     prompt_cache_locality =
@@ -400,9 +400,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
        ),
        do: strategy_order(strategy, candidates, model, seed, route_state)
 
-  # Reason: affinity selection intentionally compares all sticky routing inputs together.
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
-  defp affinity_context(auth, model, %RoutePlanInput{} = input, opts, settings) do
+  defp affinity_context(auth, model, %RoutePlanInput{} = input, opts) do
     %{
       codex_session: codex_session,
       request_id: explicit_request_id,
@@ -411,7 +409,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
     {enabled?, kind, key_value} =
       cond do
-        codex_session && settings.sticky_websocket_sessions ->
+        codex_session ->
           {true, "codex_session", codex_session.id}
 
         is_binary(idempotency_key) and idempotency_key != "" ->
@@ -419,9 +417,6 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
         is_binary(explicit_request_id) and explicit_request_id != "" ->
           {true, "request_correlation", explicit_request_id}
-
-        settings.sticky_http_sessions ->
-          {true, "request_correlation", input.correlation_id}
 
         true ->
           {false, nil, nil}
@@ -632,37 +627,28 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     %{status: "unavailable", applied?: false, unhonored_reason: Map.fetch!(@unusable_prompt_cache_key_reasons, state)}
   end
 
-  defp prompt_cache_locality_status(%RequestOptions{}, settings, affinity, prompt_cache_key, candidate_count),
-    do: prompt_cache_locality_status(settings, affinity, prompt_cache_key, candidate_count)
+  defp prompt_cache_locality_status(%RequestOptions{}, settings, affinity, prompt_cache_key, candidate_count) do
+    cond do
+      not valid_prompt_cache_key?(prompt_cache_key) ->
+        %{status: "unavailable", applied?: false, unhonored_reason: "prompt_cache_key_absent"}
 
-  defp prompt_cache_locality_status(_settings, _affinity, prompt_cache_key, _candidate_count)
-       when not (is_binary(prompt_cache_key) and prompt_cache_key != "") do
-    %{status: "unavailable", applied?: false, unhonored_reason: "prompt_cache_key_absent"}
+      not RoutingStrategy.prompt_cache_locality?(settings.routing_strategy) ->
+        %{status: "disabled", applied?: false, unhonored_reason: "routing_strategy_policy"}
+
+      true ->
+        prompt_cache_continuity_status(affinity, candidate_count)
+    end
   end
 
-  defp prompt_cache_locality_status(
-         %RoutingSettings{prompt_cache_affinity_enabled: false},
-         _affinity,
-         _prompt_cache_key,
-         _candidate_count
-       ) do
-    %{status: "disabled", applied?: false, unhonored_reason: "pool_toggle_disabled"}
-  end
-
-  defp prompt_cache_locality_status(_settings, _affinity, _prompt_cache_key, 0) do
+  defp prompt_cache_continuity_status(_affinity, 0) do
     %{status: "unavailable", applied?: false, unhonored_reason: "no_eligible_candidates"}
   end
 
-  defp prompt_cache_locality_status(_settings, _affinity, _prompt_cache_key, 1) do
+  defp prompt_cache_continuity_status(_affinity, 1) do
     %{status: "unavailable", applied?: false, unhonored_reason: "single_eligible_candidate"}
   end
 
-  defp prompt_cache_locality_status(
-         _settings,
-         %{row: %BridgeAffinity{}},
-         _prompt_cache_key,
-         _count
-       ) do
+  defp prompt_cache_continuity_status(%{row: %BridgeAffinity{}}, _count) do
     %{
       status: "blocked_by_stronger_continuity",
       applied?: false,
@@ -670,12 +656,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     }
   end
 
-  defp prompt_cache_locality_status(
-         _settings,
-         %{kind: "codex_session"},
-         _prompt_cache_key,
-         _count
-       ) do
+  defp prompt_cache_continuity_status(%{kind: "codex_session"}, _count) do
     %{
       status: "blocked_by_stronger_continuity",
       applied?: false,
@@ -683,12 +664,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     }
   end
 
-  defp prompt_cache_locality_status(
-         _settings,
-         %{kind: "idempotency_key"},
-         _prompt_cache_key,
-         _count
-       ) do
+  defp prompt_cache_continuity_status(%{kind: "idempotency_key"}, _count) do
     %{
       status: "blocked_by_stronger_continuity",
       applied?: false,
@@ -696,7 +672,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     }
   end
 
-  defp prompt_cache_locality_status(_settings, _affinity, _prompt_cache_key, _candidate_count) do
+  defp prompt_cache_continuity_status(_affinity, _candidate_count) do
     %{status: "applied", applied?: true, unhonored_reason: nil}
   end
 
@@ -1196,9 +1172,6 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
       pool_id: pool_id,
       routing_strategy: @default_strategy,
       bridge_ring_size: @default_ring_size,
-      sticky_websocket_sessions: true,
-      sticky_http_sessions: false,
-      prompt_cache_affinity_enabled: true,
       metadata: %{}
     }
   end

@@ -1156,7 +1156,11 @@ defmodule CodexPooler.SchemaContractTest do
   test "pool routing settings retain inert legacy column and its default" do
     columns = table_columns("pool_routing_settings")
 
-    assert columns["prompt_cache_affinity_enabled"] == {"boolean", "NO"}
+    for {field, default} <- [{"sticky_websocket_sessions", "true"}, {"sticky_http_sessions", "false"}, {"prompt_cache_affinity_enabled", "true"}] do
+      assert columns[field] == {"boolean", "NO"}
+      assert [[^default]] = Repo.query!("SELECT column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'pool_routing_settings' AND column_name = $1", [field]).rows
+    end
+
     assert columns["request_compression_enabled"] == {"boolean", "NO"}
 
     assert [["true"]] =
@@ -1540,8 +1544,9 @@ defmodule CodexPooler.SchemaContractTest do
 
     assert UpstreamIdentity.__schema__(:type, :account_email) == :string
 
-    assert RoutingSettings.__schema__(:type, :prompt_cache_affinity_enabled) ==
-             :boolean
+    for field <- ~w(sticky_websocket_sessions sticky_http_sessions prompt_cache_affinity_enabled)a do
+      refute field in RoutingSettings.__schema__(:fields)
+    end
 
     refute :request_compression_enabled in RoutingSettings.__schema__(:fields)
 

@@ -272,7 +272,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     assert has_element?(
              view,
              "#request-log-pool-filter [data-role='pool-filter-trigger']",
-             "Bridge ring"
+             "Cache locality"
            )
 
     assert has_element?(

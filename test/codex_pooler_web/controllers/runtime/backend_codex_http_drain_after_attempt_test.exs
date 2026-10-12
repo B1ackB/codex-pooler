@@ -17,9 +17,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpDrainAfterAttemptTest do
   import Ecto.Query
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport, only: [auth: 2, deterministic_rotation_seed: 2, native_text_input: 1, stream_retry_setup: 2, stream_success_sse: 0]
 
+  alias CodexPooler.Access
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, PreAttemptRelease, Request, RequestClientRetryLink}
   alias CodexPooler.FakeUpstream
-  alias CodexPooler.Gateway.Persistence.CodexTurn
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Persistence.{CodexTurn, SessionContinuity}
+  alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
+  alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
   alias CodexPooler.Gateway.Runtime.Service
   alias CodexPooler.Gateway.Transports.Streaming.DeferredStreamRegistry
   alias CodexPooler.Repo
@@ -52,8 +56,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpDrainAfterAttemptTest do
     ref = make_ref()
     refusal = FakeUpstream.barrier_json_response(%{"error" => %{"code" => "server_error", "message" => "synthetic pre-output refusal"}}, status: 503, notify: self(), release_ref: ref)
     {setup, first_upstream, second_upstream} = stream_retry_setup(FakeUpstream.strict_sequence([refusal, stream_success_sse()]), stream_success_sse())
-    order_by_request_id!(setup)
     session = "codex-session-drain-after-attempt-#{System.unique_integer([:positive])}"
+    setup = Map.put(setup, :request_id, assert_session_order!(setup, session))
     parent = self()
 
     request =
@@ -94,9 +98,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpDrainAfterAttemptTest do
   # admission and before its reservation while the drain starts.
   test "a drain before the first candidate still releases before any attempt", %{conn: conn, stream_registry: stream_registry} do
     {setup, first_upstream, second_upstream} = stream_retry_setup(stream_success_sse(), stream_success_sse())
-    order_by_request_id!(setup)
     session = "codex-session-drain-first-candidate-#{System.unique_integer([:positive])}"
     ref = make_ref()
+    setup = Map.put(setup, :request_id, assert_session_order!(setup, session))
     parent = self()
 
     request =
@@ -121,14 +125,33 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpDrainAfterAttemptTest do
     assert_received {^releases, %{count: 1}, %{phase: "turn_interrupted", release_reason: "owner_drained"}}
   end
 
-  # A Codex session would key the rotation on its random id; without session
-  # stickiness the rotation keys on the request id, so the first account is
-  # tried first (`deterministic_rotation_seed(2, 0)`).
-  defp order_by_request_id!(setup) do
-    setup.pool
-    |> CodexPooler.Pools.ensure_routing_settings()
-    |> Ecto.Changeset.change(%{sticky_websocket_sessions: false, updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)})
-    |> Repo.update!()
+  # Resolve the real session before dispatch, then construct creation order
+  # so its automatic rotation seed selects the refusal account. The request
+  # id deliberately points at the competing account on that same ordering.
+  defp assert_session_order!(setup, session_header) do
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    payload = %{"model" => setup.model.exposed_model_id, "stream" => true}
+    options = RequestOptions.build(%{api_key_policy: auth.api_key, session_header: session_header, session_header_source: "session-id"}, @path, payload)
+    assert {:ok, session} = SessionContinuity.start_codex_session(auth, options)
+    offset = :erlang.phash2(session.id, 2)
+    first = if offset == 0, do: setup.assignment, else: setup.fallback_assignment
+    last = if offset == 0, do: setup.fallback_assignment, else: setup.assignment
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    Repo.update!(Ecto.Changeset.change(first, created_at: DateTime.add(now, -2, :second)))
+    Repo.update!(Ecto.Changeset.change(last, created_at: DateTime.add(now, -1, :second)))
+
+    assert {:ok, %{request_options: options, candidates: candidates}} = PreDispatch.prepare(auth, @path, payload, options, setup.model)
+    assert options.continuity.codex_session.id == session.id
+    request_id = deterministic_rotation_seed(2, 1 - offset)
+    input = %{auth: auth, model: setup.model, candidates: candidates, route_plan_input: %RoutePlanInput{correlation_id: request_id}, request_options: options}
+    plan = BridgeRing.plan_route(input)
+    assert plan.affinity.kind == "codex_session"
+    assert plan.affinity.seed == session.id
+    assert plan.selected_assignment_id == setup.assignment.id
+
+    competing_options = RequestOptions.build(%{request_id: request_id}, @path, payload)
+    assert BridgeRing.plan_route(%{input | request_options: competing_options}).selected_assignment_id == setup.fallback_assignment.id
+    request_id
   end
 
   defp post_turn(conn, setup, session) do
@@ -136,7 +159,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpDrainAfterAttemptTest do
     |> Phoenix.ConnTest.recycle()
     |> auth(setup)
     |> put_req_header("session-id", session)
-    |> put_req_header("x-request-id", deterministic_rotation_seed(2, 0))
+    |> put_req_header("x-request-id", setup.request_id)
     |> post(@path, %{"model" => setup.model.exposed_model_id, "input" => native_text_input("drain after attempt turn"), "stream" => true, "client_metadata" => %{"session_id" => "client-metadata-session", "x-codex-turn-metadata" => CodexPooler.JSON.encode!(%{"turn_id" => @turn_id, "request_kind" => "turn"})}})
   end
 

@@ -38,6 +38,98 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
   setup :register_and_log_in_user
 
+  test "routing profiles replace legacy controls and associate native radios with explanations", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/pools")
+    _ = await_pool_traffic(view)
+    open_create_dialog(view)
+    view |> form("#pool-create-form") |> put_submitter("#pool-create-dialog-tab-routing") |> render_submit()
+
+    for {strategy, label} <- [{"bridge_ring", "Cache locality"}, {"deterministic_rotation", "Rotation"}, {"least_recent_success", "Least recent success"}, {"quota_first", "Quota first"}] do
+      radio = "pool_routing_strategy_#{strategy}"
+      panel = "#{radio}_description"
+      assert has_element?(view, "##{radio}[type='radio'][aria-describedby='#{panel}']")
+      assert has_element?(view, "##{panel}[aria-labelledby='#{radio}']", label)
+      assert has_element?(view, "##{panel} li", "Keep sessions together")
+      assert has_element?(view, "##{panel} li", "Respect routing safeguards")
+      assert has_element?(view, "##{panel} li:nth-child(4)", if(strategy == "bridge_ring", do: "It does not guarantee a cache hit.", else: "Provider caching remains available."))
+      refute has_element?(view, "##{panel} li:nth-child(5)")
+    end
+
+    for field <- ~w(sticky_websocket_sessions sticky_http_sessions prompt_cache_affinity_enabled) do
+      refute has_element?(view, "[name='pool[#{field}]']")
+    end
+
+    refute has_element?(view, "#pool-create-form[phx-change]")
+    assert has_element?(view, "#pool_bridge_ring_size[aria-describedby='pool_bridge_ring_size_help']")
+    assert has_element?(view, "#pool_bridge_ring_size_help", "shortlist")
+  end
+
+  test "invalid routing profiles cannot create or update Pools and keep unrelated submitted fields", %{conn: conn, scope: scope} do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "profile-validation", name: "Profile validation"})
+    {:ok, _settings} = Pools.update_routing_settings(scope, pool, %{routing_strategy: "quota_first", bridge_ring_size: 5})
+    {:ok, view, _html} = live(conn, ~p"/admin/pools")
+    _ = await_pool_traffic(view)
+    open_create_dialog(view)
+    attrs = %{"name" => "Invalid profile", "routing_strategy" => "unsupported", "bridge_ring_size" => "7", "v1_compatibility_enabled" => "false", "sticky_http_sessions" => "true"}
+    render_submit(view, "create_pool", %{"pool" => attrs})
+    assert has_element?(view, "#pool-create-dialog[open]")
+    assert has_element?(view, "#pool_name[value='Invalid profile']")
+    assert has_element?(view, "#pool_bridge_ring_size[value='7']")
+    refute has_element?(view, "#pool_v1_compatibility_enabled[checked]")
+    refute Repo.get_by(Pool, slug: "invalid-profile")
+    view |> element("#pool-create-cancel") |> render_click()
+    view |> element("#edit-pool-#{pool.id}") |> render_click()
+    render_submit(view, "save_pool", %{"pool_edit" => Map.merge(attrs, %{"id" => pool.id, "status" => "active"})})
+    assert has_element?(view, "#pool-edit-dialog[open]")
+    assert has_element?(view, "#pool_edit_name[value='Invalid profile']")
+    assert has_element?(view, "#pool_edit_bridge_ring_size[value='7']")
+    refute has_element?(view, "#pool_edit_v1_compatibility_enabled[checked]")
+    assert Repo.get!(Pool, pool.id).name == "Profile validation"
+    assert Pools.get_routing_settings(pool).routing_strategy == "quota_first"
+    assert Pools.get_routing_settings(pool).bridge_ring_size == 5
+  end
+
+  @tag :routing_step_state
+  test "wizard step submitters retain unsaved create and edit fields without mutations", %{conn: conn, scope: scope} do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "step-state", name: "Step state"})
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    %{api_key: api_key} = api_key_fixture(pool)
+    {:ok, view, _html} = live(conn, ~p"/admin/pools")
+    _ = await_pool_traffic(view)
+    before = {Repo.aggregate(Pool, :count), Repo.aggregate(AuditEvent, :count), Repo.get!(PoolUpstreamAssignment, assignment.id), Repo.get!(APIKey, api_key.id)}
+
+    for mode <- ["create", "edit"] do
+      if mode == "create", do: open_create_dialog(view), else: view |> element("#edit-pool-#{pool.id}") |> render_click()
+      prefix = if mode == "create", do: "pool", else: "pool_edit"
+      attrs = %{"name" => "   ", "routing_strategy" => "quota_first", "bridge_ring_size" => "0", "v1_compatibility_enabled" => "false", "allow_image_generation" => "false", "allow_audio_transcription" => "false", "upstream_identity_ids" => [assignment.upstream_identity_id], "api_key_ids" => [api_key.id]}
+
+      view |> form("#pool-#{mode}-form", %{prefix => attrs}) |> put_submitter("#pool-#{mode}-dialog-tab-upstreams") |> render_submit()
+      assert has_element?(view, "#pool-#{mode}-dialog-tab-upstreams[aria-selected='true'][formnovalidate]")
+
+      for step <- ["api-keys", "routing", "details"] do
+        view |> form("#pool-#{mode}-form") |> put_submitter("#pool-#{mode}-dialog-tab-#{step}") |> render_submit()
+        assert has_element?(view, "#pool-#{mode}-dialog-tab-#{step}[aria-selected='true']")
+        assert has_element?(view, "##{prefix}_name[value='   ']")
+        assert has_element?(view, "##{prefix}_bridge_ring_size[value='0']")
+        assert has_element?(view, "##{prefix}_routing_strategy_quota_first[checked]")
+        refute has_element?(view, "##{prefix}_v1_compatibility_enabled[checked]")
+        assert has_element?(view, "input[name='#{prefix}[upstream_identity_ids][]'][value='#{assignment.upstream_identity_id}'][checked]")
+        assert has_element?(view, "input[name='#{prefix}[api_key_ids][]'][value='#{api_key.id}'][checked]")
+      end
+
+      for malformed <- [nil, [], 7] do
+        event = if mode == "create", do: "create_pool", else: "save_pool"
+        render_submit(view, event, %{"wizard_step" => "upstreams", prefix => malformed})
+        assert has_element?(view, "#pool-#{mode}-dialog-tab-details[aria-selected='true']")
+      end
+
+      refute has_element?(view, "#flash-error")
+      assert {Repo.aggregate(Pool, :count), Repo.aggregate(AuditEvent, :count), Repo.get!(PoolUpstreamAssignment, assignment.id), Repo.get!(APIKey, api_key.id)} == before
+      assert Repo.get!(Pool, pool.id).name == "Step state"
+      view |> element("#pool-#{mode}-cancel") |> render_click()
+    end
+  end
+
   @tag :admin_pool_url_filters
   test "plain Pool route loads the default projection once per LiveView phase", %{
     conn: conn,
@@ -329,7 +421,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
       "step" => "details"
     })
 
-    view |> element("#pool-edit-dialog-tab-upstreams") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-upstreams") |> render_submit()
 
     assert_pool_patch_params(view, %{
       "edit_pool_id" => pool.id,
@@ -544,7 +636,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert_patch(view, ~p"/admin/pools?edit_pool_id=#{pool.id}&step=details")
     assert has_element?(view, "#pool-edit-dialog-tab-details[aria-selected='true']")
 
-    view |> element("#pool-edit-dialog-tab-upstreams") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-upstreams") |> render_submit()
 
     assert_patch(view, ~p"/admin/pools?edit_pool_id=#{pool.id}&step=upstreams")
     assert has_element?(view, "#pool-edit-dialog-tab-upstreams[aria-selected='true']")
@@ -987,7 +1079,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-row-#{pool.id}-request-count", "0")
     assert has_element?(view, "#pool-row-#{pool.id}-tokens-per-sec", "0")
     assert has_element?(view, "#pool-row-#{pool.id}-settled-cost", "$0.00")
-    assert has_element?(view, "#pool-row-#{pool.id}-routing-strategy", "Deterministic rotation")
+    assert has_element?(view, "#pool-row-#{pool.id}-routing-strategy", "Rotation")
 
     assert has_element?(
              view,
@@ -1105,7 +1197,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-row-#{other_pool.id}-request-count", "0")
     assert has_element?(view, "#pool-row-#{other_pool.id}-tokens-per-sec", "0")
     assert has_element?(view, "#pool-row-#{other_pool.id}-settled-cost", "$0.00")
-    assert has_element?(view, "#pool-row-#{other_pool.id}-routing-strategy", "Bridge ring")
+    assert has_element?(view, "#pool-row-#{other_pool.id}-routing-strategy", "Cache locality")
     assert has_element?(view, "#pool-row-#{other_pool.id}-status", "disabled")
     assert has_element?(view, "#pool-row-#{other_pool.id}-activity")
     refute has_element?(view, "#pool-row-#{other_pool.id}-quota-remaining")
@@ -2125,48 +2217,48 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     render_click(view, "pool_wizard_step", %{"step" => "models"})
     assert has_element?(view, "#pool-create-dialog-tab-details[aria-selected='true']")
 
-    view |> element("#pool-create-dialog-tab-routing") |> render_click()
+    view |> form("#pool-create-form") |> put_submitter("#pool-create-dialog-tab-routing") |> render_submit()
 
     assert has_element?(view, "#pool-create-dialog-tab-routing[aria-selected='true']")
     assert has_element?(view, "#pool-create-dialog-step-routing-panel")
     assert has_element?(view, "#pool-create-routing-controls")
     assert has_element?(view, "#pool-create-routing-controls #pool_routing_strategy")
     assert has_element?(view, "#pool-create-routing-controls #pool_bridge_ring_size")
-    assert has_element?(view, "#pool-create-routing-controls #pool_sticky_websocket_sessions")
-    assert has_element?(view, "#pool-create-routing-controls #pool_sticky_http_sessions")
-    assert has_element?(view, "#pool-create-routing-controls #pool_prompt_cache_affinity_enabled")
+    refute has_element?(view, "#pool-create-routing-controls #pool_sticky_websocket_sessions")
+    refute has_element?(view, "#pool-create-routing-controls #pool_sticky_http_sessions")
+    refute has_element?(view, "#pool-create-routing-controls #pool_prompt_cache_affinity_enabled")
     assert has_element?(view, "#pool-create-routing-controls #pool_v1_compatibility_enabled")
     refute has_element?(view, "#pool-create-routing-controls #pool_request_compression_enabled")
     assert has_element?(view, "#pool_routing_strategy")
     assert has_element?(view, "#pool_bridge_ring_size")
-    assert has_element?(view, "#pool_sticky_websocket_sessions")
-    assert has_element?(view, "#pool_sticky_http_sessions")
-    assert has_element?(view, "#pool_prompt_cache_affinity_enabled[checked]")
+    refute has_element?(view, "#pool_sticky_websocket_sessions")
+    refute has_element?(view, "#pool_sticky_http_sessions")
+    refute has_element?(view, "#pool_prompt_cache_affinity_enabled[checked]")
     assert has_element?(view, "#pool_v1_compatibility_enabled")
     refute has_element?(view, "#pool_request_compression_enabled[checked]")
 
     assert has_element?(
              view,
              "#pool-create-routing-controls",
-             "Strategy and fan-out size used for runtime requests"
+             "How eligible upstreams are ordered"
            )
 
     assert has_element?(
              view,
              "#pool-create-routing-controls",
-             "Identity-aware routing behavior"
+             "Keep sessions together"
            )
 
     assert has_element?(
              view,
              "#pool-create-routing-controls",
-             "Sends requests that share a prompt cache to the same upstream."
+             "Matching cache keys prefer the same eligible upstream."
            )
 
     assert has_element?(
              view,
              "#pool-create-routing-controls",
-             "Sends requests that share a prompt cache to the same upstream."
+             "Matching cache keys prefer the same eligible upstream."
            )
 
     assert has_element?(
@@ -2187,12 +2279,12 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              "Shrinks eligible Responses tool outputs before upstream dispatch."
            )
 
-    assert has_element?(view, "#pool_routing_strategy", "Bridge ring")
+    assert has_element?(view, "#pool_routing_strategy", "Cache locality")
 
     assert has_element?(
              view,
              "#pool-create-routing-controls",
-             "Stable rendezvous ordering, within continuity and quota."
+             "Stable routing with a preference for matching prompt-cache keys."
            )
 
     refute has_element?(
@@ -2227,10 +2319,10 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
            )
 
     assert has_element?(view, "#pool_bridge_ring_size[type='number'][value='3']")
-    assert has_element?(view, "#pool_routing_strategy", "Deterministic rotation")
+    assert has_element?(view, "#pool_routing_strategy", "Rotation")
     assert has_element?(view, "#pool_routing_strategy", "Least recent success")
     assert has_element?(view, "#pool_routing_strategy", "Quota first")
-    view |> element("#pool-create-dialog-tab-upstreams") |> render_click()
+    view |> form("#pool-create-form") |> put_submitter("#pool-create-dialog-tab-upstreams") |> render_submit()
 
     assert has_element?(view, "#pool-create-dialog-tab-upstreams[aria-selected='true']")
 
@@ -2251,7 +2343,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              "Pool upstream assignments"
            )
 
-    view |> element("#pool-create-dialog-tab-api-keys") |> render_click()
+    view |> form("#pool-create-form") |> put_submitter("#pool-create-dialog-tab-api-keys") |> render_submit()
 
     assert has_element?(view, "#pool-create-dialog-tab-api-keys[aria-selected='true']")
     assert has_element?(view, "#pool-create-dialog-header", "API Keys")
@@ -2333,7 +2425,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     settings = Pools.get_routing_settings(created_pool)
 
     assert created_pool.name == "Generated Slug Pool"
-    assert settings.prompt_cache_affinity_enabled == true
+    refute Map.has_key?(settings, :prompt_cache_affinity_enabled)
     assert settings.v1_compatibility_enabled == true
     refute Map.has_key?(settings, :request_compression_enabled)
     assert has_element?(view, "#pool-row-#{created_pool.id}", "Generated Slug Pool")
@@ -2468,7 +2560,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert created_pool.name == "Routed Create Pool"
     assert settings.routing_strategy == "least_recent_success"
-    assert settings.prompt_cache_affinity_enabled == false
+    refute Map.has_key?(settings, :prompt_cache_affinity_enabled)
     assert settings.v1_compatibility_enabled == false
     refute Map.has_key?(settings, :request_compression_enabled)
     assert settings.allow_image_generation == false
@@ -2649,7 +2741,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     _ = await_pool_traffic(view)
 
     view |> element("#edit-pool-#{pool.id}") |> render_click()
-    view |> element("#pool-edit-dialog-tab-models") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-models") |> render_submit()
 
     assert has_element?(view, "#pool-edit-dialog-tab-models[aria-selected='true']")
     assert has_element?(view, "#pool-edit-dialog-section-models[role='tabpanel']")
@@ -2750,7 +2842,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     _ = await_pool_traffic(view)
     view |> element("#edit-pool-#{pool.id}") |> render_click()
     _ = render_async(view)
-    view |> element("#pool-edit-dialog-tab-models") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-models") |> render_submit()
 
     revision = model_serving_revision(view)
 
@@ -2815,7 +2907,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     view |> element("#edit-pool-#{pool.id}") |> render_click()
     _ = render_async(view)
-    view |> element("#pool-edit-dialog-tab-models") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-models") |> render_submit()
 
     full_revision = model_serving_revision(view)
 
@@ -3044,7 +3136,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     _ = await_pool_traffic(view)
 
     view |> element("#edit-pool-#{pool.id}") |> render_click()
-    view |> element("#pool-edit-dialog-tab-models") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-models") |> render_submit()
     _ = render_async(view)
 
     assert {:ok, committed} =
@@ -3168,7 +3260,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert loading_html =~ "admin-loading-icon"
 
     _ = render_async(view)
-    view |> element("#pool-edit-dialog-tab-models") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-models") |> render_submit()
 
     assert has_element?(view, "#pool-edit-dialog-tab-models[aria-selected='true']")
 
@@ -3497,7 +3589,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
       }
     })
 
-    view |> element("#pool-edit-dialog-tab-details") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-details") |> render_submit()
 
     view
     |> element("#pool-edit-form")
@@ -3521,7 +3613,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-edit-dialog[open]")
     assert Repo.get!(Pool, pool.id).name == "Cross Form State Updated"
 
-    view |> element("#pool-edit-dialog-tab-models") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-models") |> render_submit()
 
     assert has_element?(
              view,
@@ -3759,7 +3851,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     view |> element("#pool-edit-cancel") |> render_click()
     view |> element("#edit-pool-#{pool.id}") |> render_click()
     _ = render_async(view)
-    view |> element("#pool-edit-dialog-tab-models") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-models") |> render_submit()
 
     assert has_element?(
              view,
@@ -3868,7 +3960,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-edit-dialog-header", "Edit Pool")
     refute has_element?(view, "#pool-edit-dialog-header", "Pool lifecycle")
 
-    view |> element("#pool-edit-dialog-tab-routing") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-routing") |> render_submit()
 
     assert has_element?(view, "#pool-edit-dialog-tab-routing[aria-selected='true']")
     assert has_element?(view, "#pool-edit-dialog-section-routing[role='tabpanel']")
@@ -3876,10 +3968,10 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-edit-routing-controls")
     assert has_element?(view, "#pool-edit-routing-controls #pool_edit_routing_strategy")
     assert has_element?(view, "#pool-edit-routing-controls #pool_edit_bridge_ring_size")
-    assert has_element?(view, "#pool-edit-routing-controls #pool_edit_sticky_websocket_sessions")
-    assert has_element?(view, "#pool-edit-routing-controls #pool_edit_sticky_http_sessions")
+    refute has_element?(view, "#pool-edit-routing-controls #pool_edit_sticky_websocket_sessions")
+    refute has_element?(view, "#pool-edit-routing-controls #pool_edit_sticky_http_sessions")
 
-    assert has_element?(
+    refute has_element?(
              view,
              "#pool-edit-routing-controls #pool_edit_prompt_cache_affinity_enabled"
            )
@@ -3900,34 +3992,34 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert has_element?(view, "#pool_edit_routing_strategy")
     assert has_element?(view, "#pool_edit_bridge_ring_size")
-    assert has_element?(view, "#pool_edit_sticky_websocket_sessions")
-    assert has_element?(view, "#pool_edit_sticky_http_sessions")
-    assert has_element?(view, "#pool_edit_prompt_cache_affinity_enabled[checked]")
+    refute has_element?(view, "#pool_edit_sticky_websocket_sessions")
+    refute has_element?(view, "#pool_edit_sticky_http_sessions")
+    refute has_element?(view, "#pool_edit_prompt_cache_affinity_enabled[checked]")
     assert has_element?(view, "#pool_edit_v1_compatibility_enabled")
     refute has_element?(view, "#pool_edit_request_compression_enabled[checked]")
 
     assert has_element?(
              view,
              "#pool-edit-routing-controls",
-             "Strategy and fan-out size used for runtime requests"
+             "How eligible upstreams are ordered"
            )
 
     assert has_element?(
              view,
              "#pool-edit-routing-controls",
-             "Identity-aware routing behavior"
+             "Keep sessions together"
            )
 
     assert has_element?(
              view,
              "#pool-edit-routing-controls",
-             "Sends requests that share a prompt cache to the same upstream."
+             "Matching cache keys prefer the same eligible upstream."
            )
 
     assert has_element?(
              view,
              "#pool-edit-routing-controls",
-             "Sends requests that share a prompt cache to the same upstream."
+             "Matching cache keys prefer the same eligible upstream."
            )
 
     assert has_element?(
@@ -3951,7 +4043,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(
              view,
              "#pool-edit-routing-controls",
-             "Stable rendezvous ordering, within continuity and quota."
+             "Stable routing with a preference for matching prompt-cache keys."
            )
 
     refute has_element?(
@@ -3960,7 +4052,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              "Balances upstreams by continuity, cache locality, and quota evidence."
            )
 
-    view |> element("#pool-edit-dialog-tab-upstreams") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-upstreams") |> render_submit()
 
     assert has_element?(view, "#pool-edit-dialog-tab-upstreams[aria-selected='true']")
     assert has_element?(view, "#pool-edit-dialog-section-upstreams[role='tabpanel']")
@@ -4008,7 +4100,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              "#pool-edit-upstream-assignment-options input[value='#{kept_assignment.id}']"
            )
 
-    view |> element("#pool-edit-dialog-tab-api-keys") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-api-keys") |> render_submit()
 
     assert has_element?(view, "#pool-edit-dialog-tab-api-keys[aria-selected='true']")
     assert has_element?(view, "#pool-edit-dialog-section-api-keys[role='tabpanel']")
@@ -4062,9 +4154,9 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     settings = Pools.get_routing_settings(pool)
     assert settings.routing_strategy == "quota_first"
     assert settings.bridge_ring_size == 5
-    assert settings.sticky_websocket_sessions == false
-    assert settings.sticky_http_sessions == true
-    assert settings.prompt_cache_affinity_enabled == false
+    refute Map.has_key?(settings, :sticky_websocket_sessions)
+    refute Map.has_key?(settings, :sticky_http_sessions)
+    refute Map.has_key?(settings, :prompt_cache_affinity_enabled)
     assert settings.v1_compatibility_enabled == false
     refute Map.has_key?(settings, :request_compression_enabled)
     assert Repo.get!(PoolUpstreamAssignment, removed_assignment.id).status == "deleted"
@@ -4101,7 +4193,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     _ = await_pool_traffic(view)
 
     view |> element("#edit-pool-#{target_pool.id}") |> render_click()
-    view |> element("#pool-edit-dialog-tab-upstreams") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-upstreams") |> render_submit()
 
     assert has_element?(view, "#pool-edit-upstream-assignment-count", "2 available")
     assert has_element?(view, "#pool-edit-upstream-assignment-options", "Already target account")
@@ -4238,7 +4330,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
     _ = await_pool_traffic(view)
 
-    assert has_element?(view, "#pool-row-#{pool.id}-routing-strategy", "Bridge ring")
+    assert has_element?(view, "#pool-row-#{pool.id}-routing-strategy", "Cache locality")
     refute has_element?(view, "#pool-inspector")
 
     assert {:ok, _settings} =
@@ -4248,7 +4340,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     _ = :sys.get_state(view.pid)
 
-    assert has_element?(view, "#pool-row-#{pool.id}-routing-strategy", "Deterministic rotation")
+    assert has_element?(view, "#pool-row-#{pool.id}-routing-strategy", "Rotation")
     refute has_element?(view, "#pool-inspector")
     _ = await_pool_traffic(view)
   end
@@ -4473,9 +4565,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     view |> element("#edit-pool-#{pool.id}") |> render_click()
     _ = render_async(view)
 
-    view
-    |> element("#pool-edit-dialog-tab-routing")
-    |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-routing") |> render_submit()
 
     assert has_element?(view, "#pool-edit-dialog-tab-routing[aria-selected='true']")
 
@@ -4550,7 +4640,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
         "allow_audio_transcription" => false
       })
 
-    Repo.query!("UPDATE pool_routing_settings SET request_compression_enabled = true WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)])
+    Repo.query!("UPDATE pool_routing_settings SET request_compression_enabled = true, sticky_websocket_sessions = false, sticky_http_sessions = true, prompt_cache_affinity_enabled = false WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)])
 
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
     _ = await_pool_traffic(view)
@@ -4583,12 +4673,12 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert settings.routing_strategy == "quota_first"
     assert settings.bridge_ring_size == 7
-    assert settings.sticky_websocket_sessions == false
-    assert settings.sticky_http_sessions == true
-    assert settings.prompt_cache_affinity_enabled == false
+    refute Map.has_key?(settings, :sticky_websocket_sessions)
+    refute Map.has_key?(settings, :sticky_http_sessions)
+    refute Map.has_key?(settings, :prompt_cache_affinity_enabled)
     assert settings.v1_compatibility_enabled == false
     refute Map.has_key?(settings, :request_compression_enabled)
-    assert [[true]] = Repo.query!("SELECT request_compression_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
+    assert [[true, false, true, false]] = Repo.query!("SELECT request_compression_enabled, sticky_websocket_sessions, sticky_http_sessions, prompt_cache_affinity_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
     assert settings.allow_image_generation == true
     assert settings.allow_audio_transcription == true
     assert Repo.get!(Pool, pool.id).name == "Preserved Routing"
@@ -4637,8 +4727,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert Repo.get!(Pool, pool.id).name == "Rollback Routing"
     assert settings.routing_strategy == "deterministic_rotation"
     assert settings.bridge_ring_size == 5
-    assert settings.sticky_websocket_sessions == false
-    assert settings.sticky_http_sessions == true
+    refute Map.has_key?(settings, :sticky_websocket_sessions)
+    refute Map.has_key?(settings, :sticky_http_sessions)
     assert Repo.get!(PoolUpstreamAssignment, assignment.id).status == "active"
   end
 
@@ -5354,7 +5444,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   defp open_edit_models(view, pool) do
     view |> element("#edit-pool-#{pool.id}") |> render_click()
     _ = render_async(view)
-    view |> element("#pool-edit-dialog-tab-models") |> render_click()
+    view |> form("#pool-edit-form") |> put_submitter("#pool-edit-dialog-tab-models") |> render_submit()
   end
 
   defp model_serving_revision(view) do

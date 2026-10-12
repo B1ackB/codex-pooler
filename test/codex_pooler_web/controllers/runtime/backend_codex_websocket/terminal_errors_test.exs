@@ -10,9 +10,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.TerminalErrorsTest do
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestLogs}
   alias CodexPooler.Events
   alias CodexPooler.FakeUpstream
-  alias CodexPooler.Gateway.Persistence.{BridgeDemotion, CodexTurn, RoutingCircuitState}
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Persistence.{BridgeDemotion, CodexSession, CodexTurn, RoutingCircuitState}
+  alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
+  alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
   alias CodexPooler.Gateway.Websocket, as: Gateway
-  alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPoolerWeb.CodexResponsesSocket
@@ -248,12 +250,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.TerminalErrorsTest do
       gateway_upstream(setup.pool, fallback_upstream, "upstream-token-policy-fallback", compact?: false)
 
     prime_routing_quota!(fallback.identity)
-    use_routing_strategy!(setup.pool, "bridge_ring", 2)
-
-    setup.pool
-    |> Pools.ensure_routing_settings()
-    |> Ecto.Changeset.change(%{sticky_websocket_sessions: false})
-    |> Repo.update!()
+    use_routing_strategy!(setup.pool, "deterministic_rotation", 2)
 
     setup =
       Map.put(
@@ -283,16 +280,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.TerminalErrorsTest do
       }
       |> Repo.insert!()
 
-    request_id =
-      Enum.find_value(1..500, fn index ->
-        seed = "native-policy-reuse-bridge-ring-seed-#{index}"
-
-        preferred =
-          [setup.assignment.id, fallback.assignment.id]
-          |> Enum.max_by(&rendezvous_score(seed, &1))
-
-        if preferred == setup.assignment.id, do: seed
-      end) || raise "missing native policy routing seed for #{setup.assignment.id}"
+    turn_state = "native-policy-reuse-#{System.unique_integer([:positive])}"
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: turn_state})
+    request_id = deterministic_rotation_seed(2, 1 - :erlang.phash2(session.id, 2))
+    assert_policy_session_order!(setup, fallback, session, request_id)
 
     assert :ok = Events.subscribe_pool(setup.pool)
     port = start_public_endpoint!()
@@ -301,7 +293,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.TerminalErrorsTest do
       public_websocket_connect_with_request_headers!(
         port,
         setup,
-        "native-policy-reuse-#{System.unique_integer([:positive])}",
+        turn_state,
         "/backend-api/codex/responses",
         [{"x-request-id", request_id}]
       )
@@ -441,6 +433,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.TerminalErrorsTest do
                )
 
       assert failed_request.id == failed_request_id
+      assert failed_request.request_metadata["codex_session_id"] == session.id
+      assert failed_request.request_metadata["routing"]["affinity_kind"] == "codex_session"
+      assert succeeded_request.request_metadata["codex_session_id"] == session.id
       assert failed_request.status == "failed"
       assert failed_request.retry_count == 0
       assert failed_request.last_error_code == "misalignment_policy_violation"
@@ -1484,6 +1479,29 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.TerminalErrorsTest do
     assert attempt.response_metadata["websocket_frame_headers"] == %{
              "x-oai-request-id" => "ws-frame-oai-request"
            }
+  end
+
+  defp assert_policy_session_order!(setup, fallback, session, request_id) do
+    assert Repo.get!(CodexSession, session.id).id == session.id
+    assert is_nil(session.pool_upstream_assignment_id)
+    offset = :erlang.phash2(session.id, 2)
+    first = if offset == 0, do: setup.assignment, else: fallback.assignment
+    last = if offset == 0, do: fallback.assignment, else: setup.assignment
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    Repo.update!(Ecto.Changeset.change(first, created_at: DateTime.add(now, -2, :second)))
+    Repo.update!(Ecto.Changeset.change(last, created_at: DateTime.add(now, -1, :second)))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    payload = %{"model" => setup.model.exposed_model_id, "stream" => true}
+    options = RequestOptions.build(%{api_key_policy: auth.api_key, request_id: request_id}, "/backend-api/codex/responses", payload) |> RequestOptions.put_continuity(codex_session: session)
+    assert {:ok, %{candidates: candidates}} = PreDispatch.prepare(auth, "/backend-api/codex/responses", payload, options, setup.model)
+    plan = BridgeRing.plan_route(%{auth: auth, model: setup.model, candidates: candidates, route_plan_input: %RoutePlanInput{correlation_id: request_id}, request_options: options})
+    assert plan.affinity.kind == "codex_session"
+    assert plan.affinity.seed == session.id
+    assert plan.selected_assignment_id == setup.assignment.id
+    assert length(plan.candidates) == 2
+    competing = RequestOptions.put_continuity(options, codex_session: nil)
+    input = %{auth: auth, model: setup.model, candidates: candidates, route_plan_input: %RoutePlanInput{correlation_id: request_id}, request_options: competing}
+    assert BridgeRing.plan_route(input).selected_assignment_id == fallback.assignment.id
   end
 
   defp failed_turn_attempt!(request_id, frame_headers) do

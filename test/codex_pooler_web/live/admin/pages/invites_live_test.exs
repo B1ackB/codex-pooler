@@ -497,7 +497,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     assert has_element?(
              view,
              "#invite-pool-filter button[data-pool-id='#{pool.id}']",
-             "Bridge ring"
+             "Cache locality"
            )
 
     assert has_element?(

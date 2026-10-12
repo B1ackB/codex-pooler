@@ -42,20 +42,40 @@ defmodule CodexPoolerWeb.Admin.BadgeComponents do
 
   @routing_strategy_presentations %{
     "bridge_ring" => %{
-      label: "Bridge ring",
-      icon: "hero-arrow-path-rounded-square"
+      label: "Cache locality",
+      icon: "hero-circle-stack",
+      description: "Stable routing with a preference for matching prompt-cache keys.",
+      feature: "Prefer cache locality",
+      detail: "Matching cache keys prefer the same eligible upstream.",
+      cache_title: "Cache affinity can improve reuse",
+      cache_description: "It does not guarantee a cache hit."
     },
     "deterministic_rotation" => %{
-      label: "Deterministic rotation",
-      icon: "hero-arrow-path"
+      label: "Rotation",
+      icon: "hero-arrow-path",
+      description: "Varies the starting upstream for independent requests.",
+      feature: "Vary the starting upstream",
+      detail: "Independent requests use a deterministic rotation.",
+      cache_title: "Cache keys do not override rotation",
+      cache_description: "Provider caching remains available."
     },
     "least_recent_success" => %{
       label: "Least recent success",
-      icon: "hero-clock"
+      icon: "hero-clock",
+      description: "Prefers upstreams whose last successful request was longest ago.",
+      feature: "Prefer the least recent success",
+      detail: "Prefers accounts without successes, then the oldest success.",
+      cache_title: "Cache keys do not override success history",
+      cache_description: "Provider caching remains available."
     },
     "quota_first" => %{
       label: "Quota first",
-      icon: "hero-chart-bar-square"
+      icon: "hero-chart-bar-square",
+      description: "Prefers upstreams with more usable quota for the requested model.",
+      feature: "Prefer available quota",
+      detail: "Prioritizes usable remaining quota for the requested model.",
+      cache_title: "Quota takes priority over cache locality",
+      cache_description: "Provider caching remains available."
     }
   }
 
@@ -245,11 +265,12 @@ defmodule CodexPoolerWeb.Admin.BadgeComponents do
     Map.get(@canonical_plan_labels, normalized, plan_label)
   end
 
-  defp routing_strategy_presentation(strategy) when is_binary(strategy) do
+  @spec routing_strategy_presentation(term()) :: map() | nil
+  def routing_strategy_presentation(strategy) when is_binary(strategy) do
     Map.get(@routing_strategy_presentations, strategy)
   end
 
-  defp routing_strategy_presentation(_strategy), do: nil
+  def routing_strategy_presentation(_strategy), do: nil
 
   defp plan_tone(plan_label) when is_binary(plan_label) do
     normalized = plan_label |> String.downcase() |> String.trim()

@@ -3,6 +3,7 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
 
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Admin.PoolWorkflow
+  alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Catalog
   alias CodexPooler.Events
   alias CodexPooler.FakeUpstream
@@ -13,6 +14,8 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+
+  alias CodexPoolerWeb.Admin.PoolForm
 
   import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
@@ -348,7 +351,7 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
 
       refute Map.has_key?(settings, :request_compression_enabled)
       assert [[false]] = Repo.query!("SELECT request_compression_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
-      assert settings.prompt_cache_affinity_enabled == true
+      refute Map.has_key?(settings, :prompt_cache_affinity_enabled)
       assert settings.v1_compatibility_enabled == true
     end
 
@@ -381,8 +384,49 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
       assert updated_pool.id == pool.id
       refute Map.has_key?(settings, :request_compression_enabled)
       assert [[true]] = Repo.query!("SELECT request_compression_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
-      assert settings.prompt_cache_affinity_enabled == false
+      refute Map.has_key?(settings, :prompt_cache_affinity_enabled)
       assert settings.v1_compatibility_enabled == false
+    end
+
+    test "stale forms omit retired attrs and failed workflows preserve settings and historical audit" do
+      %{user: owner} = bootstrap_owner_fixture()
+      scope = Scope.for_user(owner, ["instance_owner"])
+      assert {:ok, pool} = PoolWorkflow.create_pool_with_related_settings(scope, %{"name" => "Legacy Workflow"})
+      assert {:ok, settings} = Pools.update_routing_settings(scope, pool, %{"bridge_ring_size" => 7, "allow_image_generation" => false, "allow_audio_transcription" => false, "v1_compatibility_enabled" => false})
+      Repo.query!("UPDATE pool_routing_settings SET sticky_websocket_sessions = false, sticky_http_sessions = true, prompt_cache_affinity_enabled = false WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)])
+      legacy = %{"sticky_websocket_sessions" => false, "sticky_http_sessions" => true, "prompt_cache_affinity_enabled" => false}
+      prior_audits = assignment_audit_events(pool, "pool.routing_update")
+      historical = List.last(prior_audits)
+      historical = historical |> Ecto.Changeset.change(details: Map.merge(historical.details, legacy)) |> Repo.update!()
+      stale = Map.new(legacy, fn {key, _value} -> {key, "invalid"} end)
+
+      for form <- [PoolForm.create_form(stale), PoolForm.edit_form(pool, stale)] do
+        assert Map.take(form.params, Map.keys(legacy)) == %{}
+      end
+
+      assert :ok = Events.subscribe_all_pools()
+      attrs = Map.merge(stale, %{"name" => "Changed", "status" => "active", "routing_strategy" => "quota_first", "bridge_ring_size" => 9, "api_key_ids" => [Ecto.UUID.generate()]})
+      assert {:error, %{message: "selected API keys are not available"}} = publish_from_task(fn -> PoolWorkflow.update_pool_with_related_settings(scope, pool, attrs) end)
+      assert Pools.get_pool(pool.id).name == pool.name
+      assert Pools.get_routing_settings(pool) == settings
+      assert Repo.get!(AuditEvent, historical.id) == historical
+      assert [[false, true, false]] = Repo.query!("SELECT sticky_websocket_sessions, sticky_http_sessions, prompt_cache_affinity_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
+      refute_receive {Events, _event}
+
+      attrs = Map.merge(stale, %{"name" => pool.name, "status" => "active", "routing_strategy" => "quota_first", "bridge_ring_size" => 7, "v1_compatibility_enabled" => false, "allow_image_generation" => false, "allow_audio_transcription" => false})
+      assert {:ok, _pool} = publish_from_task(fn -> PoolWorkflow.update_pool_with_related_settings(scope, pool, attrs) end)
+      assert_receive {Events, %{reason: "pool_updated"}}
+      refute_receive {Events, _event}
+      updated = Pools.get_routing_settings(pool)
+      assert updated.routing_strategy == "quota_first"
+      assert updated.bridge_ring_size == 7
+      refute updated.v1_compatibility_enabled
+      refute updated.allow_image_generation
+      refute updated.allow_audio_transcription
+      assert Repo.get!(AuditEvent, historical.id) == historical
+      assert [[false, true, false]] = Repo.query!("SELECT sticky_websocket_sessions, sticky_http_sessions, prompt_cache_affinity_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
+      assert [new_audit] = Enum.reject(assignment_audit_events(pool, "pool.routing_update"), &(&1.id in Enum.map(prior_audits, fn audit -> audit.id end)))
+      assert Map.take(new_audit.details, Map.keys(legacy)) == %{}
     end
 
     test "creation defaults image generation permission on" do
@@ -448,7 +492,7 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
 
   defp assignment_audit_events(pool, action) do
     Repo.all(
-      from event in CodexPooler.Audit.AuditEvent,
+      from event in AuditEvent,
         where: event.pool_id == ^pool.id and event.action == ^action,
         order_by: [asc: event.occurred_at]
     )

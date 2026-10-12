@@ -132,13 +132,6 @@ defmodule CodexPooler.Dev.RoutingStrategyFixture.Provisioner do
       |> RoutingSettings.changeset(%{
         routing_strategy: routing_strategy,
         bridge_ring_size: @bridge_ring_size,
-        # Stickiness and locality are deliberate: sticky HTTP sessions would
-        # reorder every plan before the strategy could be observed, and the
-        # prompt-cache toggle has to stay on so the lane can prove the inert
-        # case as well as the differentiated one.
-        sticky_websocket_sessions: true,
-        sticky_http_sessions: false,
-        prompt_cache_affinity_enabled: true,
         v1_compatibility_enabled: true,
         allow_image_generation: true,
         metadata: settings.metadata || %{},

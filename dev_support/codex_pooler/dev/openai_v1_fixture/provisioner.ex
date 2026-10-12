@@ -156,10 +156,7 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Provisioner do
     |> RoutingSettings.changeset(%{
       routing_strategy: "bridge_ring",
       bridge_ring_size: 3,
-      sticky_websocket_sessions: true,
-      sticky_http_sessions: false,
       v1_compatibility_enabled: true,
-      prompt_cache_affinity_enabled: settings.prompt_cache_affinity_enabled,
       allow_image_generation: true,
       allow_audio_transcription: true,
       metadata: settings.metadata || %{},

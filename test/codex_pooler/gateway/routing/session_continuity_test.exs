@@ -856,45 +856,32 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                [preferred_id | List.delete(ordinary_ids, preferred_id)]
     end
 
-    # Pre-dispatch ordering is not the decision: `BridgeRing.plan_route/1`
-    # re-sorts the whole shortlist afterwards. Both assignments are driven
-    # through a real recreation against one fixed ring seed, so the ring's own
-    # order is the same in both runs and exactly one of them contradicts it.
-    # A single run would pass whenever the ring already favoured the preferred
-    # assignment, which is how this went unnoticed in production.
+    # The replacement's real session id is the automatic rotation seed. Put
+    # the competing candidate at its selected offset, so every arm must move
+    # a different assignment to win rather than passing by chance.
     test "the ring selects the previous assignment over its own ordering" do
       context = recreation_context()
-      pin_ring_seed!(context)
-      route_plan_input = fixed_ring_seed()
+      use_session_rotation!(context)
+      route_plan_input = %RoutePlanInput{request_id: nil, correlation_id: "recreation-control"}
 
-      outcomes =
-        Enum.map(context.assignment_ids, fn assignment_id ->
-          session_header = "window-#{System.unique_integer([:positive])}"
-          expired = expired_assigned_session!(context, assignment_id, session_header)
+      for assignment_id <- context.assignment_ids do
+        session_header = "window-#{System.unique_integer([:positive])}"
+        expired = expired_assigned_session!(context, assignment_id, session_header)
 
-          assert {:ok, %{request_options: options, candidates: candidates}} =
-                   prepare_session_turn(context, session_header)
+        assert {:ok, %{request_options: options, candidates: candidates}} =
+                 prepare_session_turn(context, session_header)
 
-          replacement = options.continuity.codex_session
+        replacement = options.continuity.codex_session
+        refute replacement.id == expired.id
+        assert replacement.recreated_from_assignment_id == assignment_id
+        {preferred, [competitor]} = Enum.split_with(candidates, &(elem(&1, 0).id == assignment_id))
+        [preferred] = preferred
+        offset = :erlang.phash2(replacement.id, 2)
+        candidates = if offset == 0, do: [competitor, preferred], else: [preferred, competitor]
 
-          refute replacement.id == expired.id
-          assert replacement.recreated_from_assignment_id == assignment_id
-
-          %{
-            expected: assignment_id,
-            preferred: selected_assignment_id(context, route_plan_input, options, candidates),
-            baseline:
-              selected_assignment_id(
-                context,
-                route_plan_input,
-                without_recreation_preference(options),
-                candidates
-              )
-          }
-        end)
-
-      assert Enum.map(outcomes, & &1.preferred) == Enum.map(outcomes, & &1.expected)
-      assert Enum.any?(outcomes, &(&1.baseline != &1.expected))
+        assert selected_assignment_id(context, route_plan_input, without_recreation_preference(options), candidates) == elem(competitor, 0).id
+        assert selected_assignment_id(context, route_plan_input, options, candidates) == assignment_id
+      end
     end
 
     test "an expired session with no assignment leaves ordinary ordering alone" do
@@ -1213,38 +1200,30 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
     }
   end
 
-  # Sticky session affinity would seed the ring from the replacement session id,
-  # which is new on every recreation. Seeding from a fixed correlation id
-  # instead keeps the ring's own order identical across runs, so the preference
-  # is the only thing that can move the selection.
-  defp pin_ring_seed!(context) do
+  defp use_session_rotation!(context) do
     context.pool
     |> Pools.ensure_routing_settings()
     |> Ecto.Changeset.change(%{
-      routing_strategy: "bridge_ring",
+      routing_strategy: "deterministic_rotation",
       bridge_ring_size: length(context.assignment_ids),
-      sticky_websocket_sessions: false,
-      sticky_http_sessions: false,
       updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
     })
     |> Repo.update!()
   end
 
-  defp fixed_ring_seed do
-    %RoutePlanInput{
-      request_id: nil,
-      correlation_id: "ring-seed-#{System.unique_integer([:positive])}"
-    }
-  end
-
   defp selected_assignment_id(context, %RoutePlanInput{} = route_plan_input, options, candidates) do
-    BridgeRing.plan_route(%{
-      auth: context.auth,
-      model: context.model,
-      candidates: candidates,
-      route_plan_input: route_plan_input,
-      request_options: options
-    }).selected_assignment_id
+    plan =
+      BridgeRing.plan_route(%{
+        auth: context.auth,
+        model: context.model,
+        candidates: candidates,
+        route_plan_input: route_plan_input,
+        request_options: options
+      })
+
+    assert plan.affinity.kind == "codex_session"
+    assert plan.affinity.seed == options.continuity.codex_session.id
+    plan.selected_assignment_id
   end
 
   defp without_recreation_preference(options) do

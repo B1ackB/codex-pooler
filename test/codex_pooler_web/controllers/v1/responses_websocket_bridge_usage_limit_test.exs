@@ -18,6 +18,9 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeUsageLimitTest do
 
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
+  alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
   alias CodexPooler.Repo
 
   @moduletag capture_log: true
@@ -39,7 +42,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeUsageLimitTest do
 
     conn = post_bridged(conn, setup)
 
-    CodexPooler.TestDiagnostics.puts(fn -> "206-582 wire bridge: #{conn.status} #{inspect(Enum.filter(conn.resp_headers, fn {name, _value} -> name in ["retry-after", "x-should-retry", "content-type"] end))} #{conn.resp_body}" end)
+    CodexPooler.TestDiagnostics.puts(fn -> "206-582 wire bridge: #{conn.status} #{inspect(Enum.filter(conn.resp_headers, fn {name, _value} -> name in ["retry-after", "x-should-retry", "content-type"] end))}" end)
 
     assert FakeUpstream.websocket_connection_count(upstream) == 1
     assert FakeUpstream.http_request_count(upstream) == 0
@@ -93,13 +96,14 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeUsageLimitTest do
     sibling = gateway_upstream(setup.pool, sibling_upstream, "upstream-token-sibling", compact?: false)
     prime_routing_quota!(sibling.identity)
     use_deterministic_rotation!(setup.pool, 2)
-    # The rotation seed is the request id, not the fresh codex session's id.
-    setup.pool |> CodexPooler.Pools.ensure_routing_settings() |> Ecto.Changeset.change(sticky_websocket_sessions: false) |> Repo.update!()
     setup = %{setup | model: put_model_source_assignments!(setup.model, [setup.assignment, sibling.assignment])}
 
-    conn = post_bridged(conn, setup, deterministic_rotation_seed(2, 0))
+    session = "bridge-failover-#{System.unique_integer([:positive])}"
+    assert_refusing_candidate_first!(setup, sibling, session)
 
-    CodexPooler.TestDiagnostics.puts(fn -> "206-582 wire failover: #{conn.status} #{String.slice(conn.resp_body, 0, 300)}" end)
+    conn = post_session(conn, setup, session, %{"input" => "synthetic first turn"}, "first-request")
+
+    CodexPooler.TestDiagnostics.puts(fn -> "206-582 wire failover: #{conn.status} refusing_connections=#{FakeUpstream.websocket_connection_count(refusing_upstream)} sibling_dispatches=#{FakeUpstream.websocket_connection_count(sibling_upstream) + FakeUpstream.http_request_count(sibling_upstream)}" end)
 
     assert conn.status == 200
     assert conn.resp_body =~ "response.completed"
@@ -133,17 +137,18 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeUsageLimitTest do
     sibling = gateway_upstream(setup.pool, sibling_upstream, "upstream-token-sibling", compact?: false)
     prime_routing_quota!(sibling.identity)
     use_deterministic_rotation!(setup.pool, 2)
-    setup.pool |> CodexPooler.Pools.ensure_routing_settings() |> Ecto.Changeset.change(sticky_websocket_sessions: false) |> Repo.update!()
     setup = %{setup | model: put_model_source_assignments!(setup.model, [setup.assignment, sibling.assignment])}
     session = "bridge-failover-continuity-#{System.unique_integer([:positive])}"
 
-    first = post_session(conn, setup, session, %{"input" => "synthetic first turn"}, deterministic_rotation_seed(2, 0))
+    assert_refusing_candidate_first!(setup, sibling, session)
+
+    first = post_session(conn, setup, session, %{"input" => "synthetic first turn"}, "first-request")
     assert first.status == 200
     assert first.resp_body =~ "resp_sibling_first"
 
-    second = post_session(build_conn(), setup, session, %{"input" => [%{"type" => "function_call_output", "call_id" => "call_synthetic_continuity", "output" => "synthetic tool output"}], "previous_response_id" => "resp_sibling_first"}, deterministic_rotation_seed(2, 0) <> "-second")
+    second = post_session(build_conn(), setup, session, %{"input" => [%{"type" => "function_call_output", "call_id" => "call_synthetic_continuity", "output" => "synthetic tool output"}], "previous_response_id" => "resp_sibling_first"}, "second-request")
 
-    CodexPooler.TestDiagnostics.puts(fn -> "206-585 second turn: #{second.status} #{String.slice(second.resp_body, 0, 300)}" end)
+    CodexPooler.TestDiagnostics.puts(fn -> "206-585 second turn: #{second.status} refusing_connections=#{FakeUpstream.websocket_connection_count(refusing_upstream)} sibling_connections=#{FakeUpstream.websocket_connection_count(sibling_upstream)}" end)
 
     assert second.status == 200
     assert second.resp_body =~ "resp_sibling_second"
@@ -162,6 +167,47 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeUsageLimitTest do
     assert {FakeUpstream.websocket_connection_count(sibling_upstream), FakeUpstream.http_request_count(sibling_upstream)} == {1, 0}
     assert :ok = FakeUpstream.verify!(refusing_upstream)
     assert :ok = FakeUpstream.verify!(sibling_upstream)
+  end
+
+  # Prepare the real session once, then orient the two fixture rows around its
+  # automatic seed. No request-id override or random session retry controls order.
+  defp assert_refusing_candidate_first!(setup, sibling, session_header) do
+    {:ok, auth} = CodexPooler.Access.authenticate_authorization_header(setup.authorization)
+    endpoint = "/backend-api/codex/responses"
+    payload = %{"model" => setup.model.exposed_model_id, "input" => native_text_input("synthetic first turn"), "stream" => true}
+    options = RequestOptions.build(%{api_key_policy: auth.api_key, session_header: session_header, session_header_source: "x-session-id"}, endpoint, payload)
+    assert {:ok, prepared} = PreDispatch.prepare(auth, endpoint, payload, options, setup.model)
+    session = prepared.request_options.continuity.codex_session
+    assert is_binary(session.id)
+    assert is_nil(session.pool_upstream_assignment_id)
+
+    plan = session_plan(auth, setup, prepared)
+    assert length(plan.candidates) == 2
+
+    if plan.selected_assignment_id != setup.assignment.id do
+      earlier = DateTime.utc_now() |> DateTime.add(-10, :second)
+      setup.assignment |> Ecto.Changeset.change(created_at: DateTime.add(earlier, 1, :second)) |> Repo.update!()
+      sibling.assignment |> Ecto.Changeset.change(created_at: earlier) |> Repo.update!()
+    end
+
+    assert {:ok, prepared} = PreDispatch.prepare(auth, endpoint, payload, options, setup.model)
+    assert prepared.request_options.continuity.codex_session.id == session.id
+    plan = session_plan(auth, setup, prepared)
+    assert plan.affinity.kind == "codex_session"
+    assert plan.affinity.seed == session.id
+    assert Enum.map(plan.candidates, fn {assignment, _identity} -> assignment.id end) == [setup.assignment.id, sibling.assignment.id]
+    CodexPooler.TestDiagnostics.puts("automatic session seed: candidates=2 order=refusing,sibling affinity=codex_session assigned=false")
+  end
+
+  defp session_plan(auth, setup, prepared) do
+    BridgeRing.plan_route(%{
+      auth: auth,
+      model: setup.model,
+      candidates: prepared.candidates,
+      route_plan_input: RoutePlanInput.from_request_opts(prepared.request_options),
+      request_options: prepared.request_options,
+      route_state: prepared.route_state
+    })
   end
 
   defp bridge_turn(connection_ordinal, respond, equals \\ %{}) do

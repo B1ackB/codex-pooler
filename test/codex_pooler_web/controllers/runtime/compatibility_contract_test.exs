@@ -27,6 +27,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
   alias CodexPooler.Gateway.Websocket, as: GatewayWebsocket
   alias CodexPooler.Gateway.Websocket.Adapter, as: WebsocketAdapter
   alias CodexPooler.Gateway.Websocket.DeliveryReceipt
+  alias CodexPooler.Pools.{Routing, RoutingStrategy}
   alias CodexPooler.Quotas
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
@@ -1202,7 +1203,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
       assert feature.contract =~ "accept prompt_cache_options"
       assert feature.contract =~ "account-backed egress omits both explicit controls"
-      assert feature.contract =~ "Pool affinity remains exclusively keyed by prompt_cache_key"
+      assert feature.contract =~ "Pool prompt-cache locality is keyed only by prompt_cache_key under bridge_ring"
 
       assert fixture.upstream_prompt_cache_controls == %{
                request_options_field: "prompt_cache_options",
@@ -1218,6 +1219,31 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
              }
 
       assert fixture.prompt_cache_routing.typed_input == "prompt_cache_key"
+    end
+
+    test "documents automatic profile policy separately from provider caching" do
+      routing = CompatibilityMatrix.fixture!(:responses_chat).prompt_cache_routing
+
+      assert routing.policy == "routing_profile"
+      assert routing.default_profile == Routing.routing_settings_with_defaults(Ecto.UUID.generate()).routing_strategy
+      assert Enum.map(routing.profiles, & &1.id) == RoutingStrategy.ids()
+
+      for profile <- routing.profiles do
+        assert profile.locality_enabled == RoutingStrategy.prompt_cache_locality?(profile.id)
+        assert profile.provider_caching == "available"
+      end
+
+      assert routing.automatic_affinity == ["codex_session", "idempotency_key", "request_identity"]
+      assert routing.locality_key_max_bytes == 256
+      assert routing.provider_session_key_max_bytes == 512
+
+      assert routing.alternative_profile_diagnostic == %{
+               status: "disabled",
+               unhonored_reason: "routing_strategy_policy"
+             }
+
+      refute Map.has_key?(routing, :setting)
+      refute Map.has_key?(routing, :default_enabled)
     end
 
     test "documents OpenAI reasoning context literal support" do

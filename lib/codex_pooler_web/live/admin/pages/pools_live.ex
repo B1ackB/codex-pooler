@@ -107,6 +107,18 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
     {:noreply, socket |> close_create_dialog() |> flush_deferred_pool_traffic_refresh()}
   end
 
+  def handle_event("create_pool", %{"wizard_step" => step, "pool" => attrs}, socket) when is_map(attrs) do
+    with :ok <- ensure_can_manage_pools(socket),
+         true <- socket.assigns.creating_pool do
+      socket = assign(socket, :create_form, PoolForm.create_form(attrs))
+      handle_event("pool_wizard_step", %{"step" => step}, socket)
+    else
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("create_pool", %{"wizard_step" => _step}, socket), do: {:noreply, socket}
+
   def handle_event("create_pool", %{"pool" => pool_params}, socket) do
     with :ok <- ensure_can_manage_pools(socket),
          {:ok, _pool} <-
@@ -209,6 +221,19 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
       {:noreply, socket}
     end
   end
+
+  def handle_event("save_pool", %{"wizard_step" => step, "pool_edit" => attrs}, socket) when is_map(attrs) do
+    with :ok <- ensure_can_manage_pools(socket),
+         %{id: pool_id} = pool <- socket.assigns.editing_pool do
+      form = PoolForm.edit_form(pool, Map.put(attrs, "id", pool_id))
+      socket = assign(socket, :edit_form, form)
+      handle_event("pool_wizard_step", %{"step" => step}, socket)
+    else
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("save_pool", %{"wizard_step" => _step}, socket), do: {:noreply, socket}
 
   def handle_event("save_pool", %{"pool_edit" => pool_params}, socket) do
     pool_id = pool_params["id"]

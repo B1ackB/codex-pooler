@@ -1818,11 +1818,9 @@ live is always one click away and never something the operator has to arrange.
   the narrowest column** the grid produces. Corner cluster
   `absolute right-2.5 top-2 pointer-events-none`: a `hero-check size-3
   text-primary` glyph rendered only while the card is checked, composing with
-  a permanent micro tag when one exists (the Bridge ring card reads
+  a permanent micro tag when one exists (the Cache locality card reads
   "✓ DEFAULT" while selected; the tag alone otherwise).
-  The Bridge ring description is exactly "Stable rendezvous ordering, within
-  continuity and quota." and remains within the two-line description contract
-  at the narrowest strategy-card column.
+  Routing descriptions summarize the selected profile from the shared presentation mapping.
 - **States:** hover `border-primary/50`; checked `border-primary/60
   bg-primary/5` (the [Policy editor dialog and wizard](#policy-editor-dialog-and-wizard) wash recipe is retired for these cards); focus
   ring `outline-2 outline-primary outline-offset-2` driven by the hidden
@@ -1834,10 +1832,9 @@ live is always one click away and never something the operator has to arrange.
   cockpit form is submit-only and nested `&:has` re-invalidation proved
   unreliable there. New call sites should prefer the utility form unless they
   hit the same constraint.
-- **Dependent controls stay put:** a control owned by one option (Ring size
-  for Bridge ring) is always rendered and dims to `opacity-45` while its
-  option is unselected — never `hidden`, so changing the selection cannot
-  shift the layout.
+- **Routing profiles:** Cache locality, Rotation, Least recent success, and Quota first retain their persisted radio values. Ring size stays visible and fully opaque for all profiles; its help describes the candidate shortlist and credit/reset recovery exceptions.
+- **Routing explanation:** the left column below the radios has HOW IT ROUTES and the selected profile name, four compact icon-led rows (profile objective, session preference, safeguards, cache behavior). The fourth row uses the same information icon, title/description structure, spacing, and typography as the other rows, with no separate cache block or divider. Compatibility remains on the right, stacking after the explanation on mobile. Use existing neutral tokens, 18px Heroicons, 13px row titles and 12px descriptions; no icon tiles or new palette.
+- **Routing interaction:** native radios associate to static explanation panels with `aria-describedby`; scoped `:has(input:checked)` selectors display only the selected panel, removing inactive descriptions from layout and the accessibility tree. Selection is local and immediate without a server event or form-wide change handler. Preserve focus, unsaved fields, wizard navigation, and internal mobile body scrolling with the footer visible. Pool wizard step buttons are form-associated named submitters with `formnovalidate`: step requests retain current fields without validation or persistence. A hidden first submitter preserves Enter as the normal save action; other policy editors retain their existing click events.
 - **Toggle-gated tunables go read-only, not disabled:** when a whole panel
   of cards and fields is gated by a switch (auto-redeem and the saved-reset
   tunables), the off state keeps everything rendered and dimmed, makes text

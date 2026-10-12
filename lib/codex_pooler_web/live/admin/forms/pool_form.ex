@@ -158,16 +158,13 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
       "status" => pool.status,
       "routing_strategy" => settings.routing_strategy,
       "bridge_ring_size" => settings.bridge_ring_size,
-      "sticky_websocket_sessions" => settings.sticky_websocket_sessions,
-      "sticky_http_sessions" => settings.sticky_http_sessions,
-      "prompt_cache_affinity_enabled" => settings.prompt_cache_affinity_enabled,
       "v1_compatibility_enabled" => settings.v1_compatibility_enabled,
       "allow_image_generation" => settings.allow_image_generation,
       "allow_audio_transcription" => settings.allow_audio_transcription,
       "upstream_identity_ids" => active_upstream_identity_ids(pool),
       "api_key_ids" => active_api_key_ids(pool)
     }
-    |> Map.merge(attrs)
+    |> merge_form_attrs(attrs)
     |> normalize_multi_select("upstream_identity_ids")
     |> normalize_multi_select("api_key_ids")
     |> to_form(as: :pool_edit, errors: errors)
@@ -311,16 +308,13 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
       "name" => "",
       "routing_strategy" => "bridge_ring",
       "bridge_ring_size" => 3,
-      "sticky_websocket_sessions" => true,
-      "sticky_http_sessions" => false,
-      "prompt_cache_affinity_enabled" => true,
       "v1_compatibility_enabled" => true,
       "allow_image_generation" => true,
       "allow_audio_transcription" => true,
       "upstream_identity_ids" => [],
       "api_key_ids" => []
     }
-    |> Map.merge(Map.new(attrs))
+    |> merge_form_attrs(attrs)
     |> normalize_multi_select("upstream_identity_ids")
     |> normalize_multi_select("api_key_ids")
   end
@@ -585,6 +579,10 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
   @spec configured_override(String.t()) :: String.t() | nil
   defp configured_override("auto"), do: nil
   defp configured_override(mode), do: mode
+
+  defp merge_form_attrs(defaults, attrs) do
+    Map.merge(defaults, Map.take(Map.new(attrs), Map.keys(defaults)))
+  end
 
   defp normalize_multi_select(attrs, key) do
     Map.update(attrs, key, [], fn value ->

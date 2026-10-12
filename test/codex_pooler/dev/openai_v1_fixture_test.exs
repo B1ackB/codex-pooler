@@ -363,9 +363,6 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
     |> RoutingSettings.changeset(%{
       routing_strategy: "quota_first",
       bridge_ring_size: 7,
-      sticky_websocket_sessions: false,
-      sticky_http_sessions: true,
-      prompt_cache_affinity_enabled: false,
       v1_compatibility_enabled: false,
       allow_image_generation: false,
       allow_audio_transcription: false,
@@ -374,6 +371,8 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
       updated_at: baseline_updated_at
     })
     |> Repo.insert!()
+
+    Repo.query!("UPDATE pool_routing_settings SET sticky_websocket_sessions = false, sticky_http_sessions = true, prompt_cache_affinity_enabled = false WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)])
 
     options = context.options
 
@@ -390,15 +389,14 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
     assert %RoutingSettings{
              routing_strategy: "quota_first",
              bridge_ring_size: 7,
-             sticky_websocket_sessions: false,
-             sticky_http_sessions: true,
-             prompt_cache_affinity_enabled: false,
              v1_compatibility_enabled: false,
              allow_image_generation: false,
              allow_audio_transcription: false,
              metadata: %{"baseline" => true},
              updated_at: ^baseline_updated_at
            } = Repo.get!(RoutingSettings, pool.id)
+
+    assert [[false, true, false]] = Repo.query!("SELECT sticky_websocket_sessions, sticky_http_sessions, prompt_cache_affinity_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
   end
 
   test "retired request compression CLI option is rejected before acquisition", context do

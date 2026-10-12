@@ -3,9 +3,26 @@ defmodule CodexPoolerWeb.Admin.BadgeComponentsTest do
 
   require Phoenix.LiveViewTest
 
+  alias CodexPooler.Pools.RoutingStrategy
   alias CodexPoolerWeb.Admin.BadgeComponents
+  alias CodexPoolerWeb.Admin.PoolForm
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard
   alias CodexPoolerWeb.Dev.ComponentShowcaseData
+
+  test "routing options cover the domain catalog with shared labels and complete explanations" do
+    ids = RoutingStrategy.ids()
+    options = PoolForm.routing_strategy_options()
+    assert Enum.map(options, &elem(&1, 1)) == ids
+    assert Enum.map(options, &elem(&1, 0)) == ["Cache locality", "Rotation", "Least recent success", "Quota first"]
+
+    for {_label, id} <- options do
+      presentation = BadgeComponents.routing_strategy_presentation(id)
+      for field <- [:description, :feature, :detail, :cache_title, :cache_description], do: assert(byte_size(Map.fetch!(presentation, field)) > 0)
+    end
+
+    assert BadgeComponents.routing_strategy_presentation("unsupported") == nil
+    assert BadgeComponents.routing_strategy_label(nil) == nil
+  end
 
   test "unassigned accounts without deletion capability explain permission rather than Pool removal" do
     account = ComponentShowcaseData.account_card() |> Map.merge(%{assignments: [], can_delete?: false})

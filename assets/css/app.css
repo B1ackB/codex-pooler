@@ -2951,3 +2951,15 @@ body {
     }
   }
 }
+
+/* Native routing radios select their explanation without submitting the form. */
+.pool-routing-profile {
+  display: none;
+}
+
+.pool-routing-profiles:has(.strategy-radio[value="bridge_ring"]:checked) [data-routing-profile="bridge_ring"],
+.pool-routing-profiles:has(.strategy-radio[value="deterministic_rotation"]:checked) [data-routing-profile="deterministic_rotation"],
+.pool-routing-profiles:has(.strategy-radio[value="least_recent_success"]:checked) [data-routing-profile="least_recent_success"],
+.pool-routing-profiles:has(.strategy-radio[value="quota_first"]:checked) [data-routing-profile="quota_first"] {
+  display: grid;
+}

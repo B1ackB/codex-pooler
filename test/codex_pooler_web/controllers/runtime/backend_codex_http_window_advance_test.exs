@@ -25,10 +25,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpWindowAdvanceTest do
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport
   import CodexPoolerWeb.Runtime.BackendCodexWebsocketSupport, only: [model_serving_scope: 0, set_model_serving_mode!: 3]
 
+  alias CodexPooler.Access
   alias CodexPooler.Accounting.Request
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, BridgeSessionAlias, CodexSession}
-  alias CodexPooler.Pools
+  alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
   alias CodexPooler.Repo
   alias CodexPoolerWeb.GatewayControllerHelpers
 
@@ -146,14 +148,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpWindowAdvanceTest do
   # The thread's session lapses after a compaction (no request for longer than
   # the owner lease), and the next turn names the window the session reached
   # only through its alias: the replacement session prefers the assignment the
-  # thread served on, as a lapse on the same window does (findings#270 row
-  # 270-282). Without a prompt cache key, and with the ring seeded towards the
-  # other assignment, only that preference keeps the turn where it was.
-  # Sticky session affinity would seed the ring from the replacement session's
-  # id, which is new on every run, so the request's `x-request-id` would never
-  # be read and half of the runs would pass without the preference
-  # (findings#324 row 324-3): the Pool's sticky sessions are off for this turn,
-  # so the ring is seeded by that request id.
+  # thread served on, as a lapse on the same window does. Least recent
+  # success ranks the unused competing account ahead of the served account,
+  # regardless of the random replacement session id. Only recreation's
+  # preference can override that independently observed order.
   test "after the thread's session lapses, the next window's new session prefers its assignment", %{conn: conn} do
     upstream = start_upstream(FakeUpstream.strict_sequence(upstream_responses(Enum.take(window_advance_requests(:remote), 3)) ++ [turn_sse("resp_lapse_next_turn")]))
     other_upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_lapse_other"}))
@@ -171,12 +169,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpWindowAdvanceTest do
     expire_owner_lease!(session.id)
 
     setup = %{setup | model: put_model_source_assignments!(setup.model, [setup.assignment, other.assignment])}
-    pin_ring_seed!(setup.pool, 2)
-    seed = seed_preferring_assignment([setup.assignment.id, other.assignment.id], other.assignment.id)
+    use_routing_strategy!(setup.pool, "least_recent_success", 2)
+    assert_unused_candidate_wins!(setup, other)
     next_turn = %{ids | turn: "turn-" <> unique_suffix()}
     input = history() ++ [compaction_item("one"), assistant("done"), user("next task")]
 
-    assert response(post_window(conn, setup, next_turn, "turn", input, 1, prompt_cache_key: false, request_id: seed), 200)
+    assert response(post_window(conn, setup, next_turn, "turn", input, 1, prompt_cache_key: false, request_id: "new-window-request"), 200)
 
     assert FakeUpstream.count(upstream) == 4
     assert FakeUpstream.count(other_upstream) == 0
@@ -185,7 +183,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpWindowAdvanceTest do
     assert replacement.session_key == window_session_key(ids.thread, 1)
     assert %Request{request_metadata: %{"codex_session_id" => replacement_id, "routing" => routing}} = List.last(pool_requests(setup))
     assert replacement_id == replacement.id
-    assert routing["affinity_kind"] == "request_correlation"
+    assert routing["affinity_kind"] == "codex_session"
+    assert routing["strategy"] == "least_recent_success"
     assert {routing["session_preference_kind"], routing["session_preference_status"]} == {"recreated", "applied"}
   end
 
@@ -355,19 +354,27 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexHttpWindowAdvanceTest do
 
   defp active_lease!(session_id), do: Repo.one!(from(l in BridgeOwnerLease, where: l.codex_session_id == ^session_id and l.status == "active"))
 
-  # The ring orders by the request's own correlation id instead of the session
-  # id, which a recreation draws fresh on every run.
-  defp pin_ring_seed!(pool, ring_size) do
-    pool
-    |> Pools.ensure_routing_settings()
-    |> Ecto.Changeset.change(%{
-      routing_strategy: "bridge_ring",
-      bridge_ring_size: ring_size,
-      sticky_websocket_sessions: false,
-      sticky_http_sessions: false,
-      updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    })
-    |> Repo.update!()
+  defp assert_unused_candidate_wins!(setup, other) do
+    successes = CodexPooler.Accounting.latest_success_by_assignment_ids([setup.assignment.id, other.assignment.id])
+    assert %DateTime{} = Map.fetch!(successes, setup.assignment.id)
+    refute Map.has_key?(successes, other.assignment.id)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    options =
+      RequestOptions.build(%{request_id: "window-base-order"}, "/backend-api/codex/responses", %{"stream" => true})
+
+    plan =
+      BridgeRing.plan_route(%{
+        auth: auth,
+        model: setup.model,
+        candidates: [{setup.assignment, setup.identity}, {other.assignment, other.identity}],
+        route_plan_input: %RoutePlanInput{correlation_id: "window-base-order"},
+        request_options: options
+      })
+
+    assert plan.affinity.kind == "request_correlation"
+    assert plan.selected_assignment_id == other.assignment.id
+    refute plan.selected_assignment_id == setup.assignment.id
   end
 
   defp expire_owner_lease!(session_id) do
