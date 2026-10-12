@@ -1022,7 +1022,9 @@ Forwarding a selection does not grant access. The upstream account and model mus
 
 ## Prompt-cache and continuity boundaries
 
-Prompt-cache routing locality is a local routing hint. It can apply on `POST /backend-api/codex/responses`, `POST /backend-api/codex/v1/responses`, `POST /backend-api/codex/v1/chat/completions`, `POST /v1/responses`, and `POST /v1/chat/completions`. It is excluded from websocket, compact, file, audio, image, usage, and app-server helper routes. Locality is always a heuristic and never guarantees a provider cache hit or cached-token accounting.
+Prompt-cache routing locality is automatic under the Cache locality profile (`bridge_ring`) when no stronger continuity applies. It can apply on `POST /backend-api/codex/responses`, `POST /backend-api/codex/v1/responses`, `POST /backend-api/codex/v1/chat/completions`, `POST /v1/responses`, and `POST /v1/chat/completions`. It is excluded from websocket, compact, file, audio, image, usage, and app-server helper routes. Rotation (`deterministic_rotation`), Least recent success (`least_recent_success`), and Quota first (`quota_first`) retain their own ordering when a cache key is present. Provider caching remains available under every profile; the profile does not change provider cache-key payloads or headers. Locality is always a heuristic and never guarantees a provider cache hit or cached-token accounting.
+
+Every profile preserves automatic session preference, idempotency and request-identity affinity, and required continuity constraints. A response anchor requires the physical upstream websocket connection that produced it, not just the same account. Full and Lite keep their distinct request and portability boundaries. See [Routing strategies](/reference/routing-strategies/) for the separate 256-byte local routing and 512-byte provider-session key limits.
 
 ## Websocket Guardrails
 

@@ -57,6 +57,8 @@ Use this checklist when you want to know whether a Pool can route supported Code
 
 A Pool is the routing and policy boundary that clients authenticate against. It groups upstream account assignments, Pool API keys, routing behavior, compatibility settings, and metadata scope for request and audit evidence.
 
+Choose Cache locality, Rotation, Least recent success, or Quota first to order independent requests. All four profiles keep automatic session preference and routing safeguards. Cache keys influence that ordering only with Cache locality; provider caching remains available with every profile, without a cache-hit guarantee.
+
 The routing strategy orders only accounts that already passed eligibility checks. It cannot choose a paused account, an unassigned account, an account without the requested model, or an account blocked by continuity or quota evidence.
 
 ## What Stays Metadata-Only

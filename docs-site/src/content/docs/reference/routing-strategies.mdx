@@ -87,9 +87,11 @@ Codex Pooler doesn't create a quota window, reset timestamp, duration, percentag
 
 The availability flags belong to Codex Pooler's direct provider usage response. Current Codex client quota projections omit those raw flags, so a client-side quota snapshot is not evidence that the same no-window contract was observed.
 
-## Strategy And Preference Choices
+<span id="strategy-and-preference-choices"></span>
 
-After eligibility, Codex Pooler orders the remaining accounts. The Pool's strategy affects preference, not permission.
+## Routing profiles
+
+After eligibility, Codex Pooler orders the remaining accounts with one of four complete profiles. The profile affects preference, not permission. The persisted identifiers stay `bridge_ring`, `deterministic_rotation`, `least_recent_success`, and `quota_first`.
 
 <table>
   <thead>
@@ -100,25 +102,27 @@ After eligibility, Codex Pooler orders the remaining accounts. The Pool's strate
   </thead>
   <tbody>
     <tr>
-      <td>Bridge ring</td>
-      <td>Default strategy. It spreads requests with stable scoring, then uses continuity, prompt-cache locality, and temporary demotions to keep useful stickiness without pinning every stateless request</td>
+      <td>Cache locality (<code>bridge_ring</code>)</td>
+      <td>Default profile. Stable rendezvous scoring uses a valid cache key when applicable so matching keys prefer the same eligible upstream. Cache affinity can improve reuse, but does not guarantee a cache hit</td>
     </tr>
     <tr>
-      <td>Deterministic rotation</td>
-      <td>Rotates the eligible set from a stable request seed so repeated independent requests don&#x27;t always start with the same account</td>
+      <td>Rotation (<code>deterministic_rotation</code>)</td>
+      <td>Uses a hash of the request seed to choose a starting offset in the eligible set for independent work. It is deterministic, not a round-robin counter or an equal-distribution guarantee. Cache keys do not override its order</td>
     </tr>
     <tr>
-      <td>Least recent success</td>
-      <td>Prefers accounts that haven&#x27;t recently completed successful work, which can help spread successful turns across the Pool</td>
+      <td>Least recent success (<code>least_recent_success</code>)</td>
+      <td>Prefers accounts without successes, then the oldest successful request, with a stable tie-break. Cache keys do not override success history</td>
     </tr>
     <tr>
-      <td>Quota first</td>
-      <td>Prefers eligible accounts with more usable remaining quota evidence for the requested model. A fresh reset-bearing report at 100% used counts as zero capacity, while eligibility confidence remains a separate check</td>
+      <td>Quota first (<code>quota_first</code>)</td>
+      <td>Prefers eligible accounts with more usable remaining quota evidence for the requested model. A fresh reset-bearing report at 100% used counts as zero capacity, while eligibility confidence remains a separate check. Cache keys do not override quota ordering</td>
     </tr>
   </tbody>
 </table>
 
-The ring size controls how many ordered eligible accounts are tried for a request. A ring size of `3` means Codex Pooler prepares up to three eligible upstream accounts in order. If the first account fails in a retryable way, it can try the next one. The ring doesn't include accounts that failed eligibility.
+Every profile automatically prefers the current eligible session account and respects routing safeguards. Provider caching remains available with every profile; only Cache locality gives the cache key priority in independent-request ordering.
+
+The ring size bounds the initial ordered shortlist for every profile. A ring size of `3` means Codex Pooler prepares up to three eligible upstream accounts in order. If the first account fails in a retryable way, it can try the next one. The ring doesn't include accounts that failed eligibility. It is not a global maximum attempt count: guarded credit or saved-reset recovery can extend the route plan.
 
 Temporary demotion also affects order. When an upstream attempt fails with a retryable backend or network reason, Codex Pooler can demote that assignment briefly so other eligible accounts in the same quota tier are tried first. A later success clears that demotion.
 
@@ -128,11 +132,13 @@ Demotion doesn't change the quota tier. Accounts that route through provider-att
 
 Session continuity is stronger than ordinary stateless routing.
 
-Stateless requests can be routed to any eligible upstream account in the Pool. Strategy, remaining quota, prompt-cache locality, and recent failures shape the order.
+Independent requests can be routed to any eligible upstream account in the Pool. The selected profile orders them, followed by automatic affinity and session preference, capacity tiers, temporary demotion, and ring truncation. A preference never restores an excluded account.
+
+Affinity is automatic in this order: the Codex session identity, an idempotency key when there is no session, then the request identity, including one generated by the HTTP server. A new session keeps its session seed before it has an assigned account. Without those identities there is no durable affinity; the correlation id still supplies the ordering seed.
 
 An existing Codex session prefers its current upstream account. A native websocket request carrying portable full history can use another eligible account while keeping the client's websocket open, including history that starts with the provider's compaction checkpoint or contains recognized encrypted messages between Codex agents. Previous-response anchors, uploaded file references, item references, and a compaction still being collected on the upstream connection require the account that owns that state. Additional file references or opaque state inside an agent message retain those restrictions.
 
-If an upstream rejects a portable full-history websocket request with a quota-limit terminal before output and without reported token usage, Codex Pooler can try the next eligible account in the configured ring. Successful recovery updates the session's account for later turns. Encrypted reasoning items and compaction checkpoints can remain in that history; item references retain their continuity restrictions. Work that has already produced output or reported token usage is not silently repeated on another account.
+If an upstream rejects a portable full-history websocket request with a quota-limit terminal before output and without reported token usage, Codex Pooler can try the next eligible account in the configured ring. Successful recovery updates the session's account for later turns. Full and Lite retain their distinct request contracts. A portable compaction checkpoint is not a general guarantee that encrypted reasoning can move between accounts or models; reasoning replay remains subject to the provider and the request shape. Item references retain their continuity restrictions. Work that has already produced output or reported token usage is not silently repeated on another account.
 
 Continuity headers are local routing inputs. Codex Pooler reads them in this order:
 
@@ -144,7 +150,9 @@ Continuity headers are local routing inputs. Codex Pooler reads them in this ord
 6. `session_id`
 7. `x-codex-conversation-id`
 
-`x-session-id` and `x-session-affinity` aren't forwarded upstream. They help Codex Pooler find the local routing state only. On the native `/backend-api/codex/responses` and `/backend-api/codex/responses/compact` routes, the Codex client's own `session-id`, `thread-id`, and `x-client-request-id` headers are forwarded verbatim when they are short ASCII identifiers, because the provider uses them for sticky routing and a full-history HTTP turn without them misses the prompt cache the previous turn warmed. The native `/backend-api/codex/responses` websocket forwards the same three headers, under the same limits, on the upstream websocket handshake, so a fresh or reopened upstream connection reaches the same provider session. An upstream websocket connection is reused only for turns that carry the same values; a different or missing value opens a new upstream connection. `/v1` routes keep every client continuity header local, including on `/v1/responses` websocket and bridged turns. When a `/v1/responses` or `/v1/chat/completions` request carries a `prompt_cache_key`, Codex Pooler sends the provider a `session-id` derived from that key together with the calling API key and its Pool (a UUID v5 over a fixed Codex Pooler namespace), so consecutive HTTP turns of one conversation reach the replica that holds the warm prompt cache. The derived value is stable across nodes and restarts, is never stored or logged, and is not sent for keys that are empty, longer than 512 bytes, or not strings. Because the API key and Pool are part of the derivation, two API keys or two Pools that send the same `prompt_cache_key` (for example a generic `default`) never share a provider `session-id`, even when their requests reach the same upstream account; the model is not part of it, so switching models inside a conversation keeps the same `session-id`. The native `/backend-api/codex/responses` and `/backend-api/codex/responses/compact` HTTP routes derive the same value, from the same key, API key and Pool, when the client sent no usable `session-id` of its own, for example a third-party client that names its conversation only with `session_id` or `x-session-id`. Such an alias still selects the local continuity session but is never forwarded, because it carries no tenant scope. When the request carries no `prompt_cache_key` either, as with clients that send only a conversation header, Codex Pooler derives the provider `session-id` from that header with the same API key and Pool scoping, under a separate namespace, so consecutive turns of one conversation still share one provider `session-id`. The order is: the client's own `session-id`, then `prompt_cache_key`, then the conversation header. A client `session-id` is always forwarded unchanged, and the native websocket handshake still carries only the session headers of the upgrade. The derived `session-id` only steers provider-side sticky routing: Codex Pooler creates no local session from it, so bridge eligibility and continuity still require a real continuity header. Within one API key the derivation assumes a conversation-scoped key. A client that reuses one `prompt_cache_key` across unrelated conversations on the same API key (for example one key per end user or per application) sends all of them to the provider under the same `session-id`, which concentrates them on the same provider replica; use a per-conversation key when that is not the intent.
+`x-session-id` and `x-session-affinity` aren't forwarded upstream. They help Codex Pooler find the local routing state only. On the native `/backend-api/codex/responses` and `/backend-api/codex/responses/compact` routes, the Codex client's own `session-id`, `thread-id`, and `x-client-request-id` headers are forwarded verbatim when they are short ASCII identifiers, because the provider uses them as sticky-routing hints. They can improve cache reuse but do not guarantee a hit. The native `/backend-api/codex/responses` websocket forwards the same three headers, under the same limits, on the upstream websocket handshake, to preserve those provider-routing hints across fresh or reopened upstream connections. An upstream websocket connection is reused only for turns that carry the same values; a different or missing value opens a new upstream connection. `/v1` routes keep every client continuity header local, including on `/v1/responses` websocket and bridged turns. When a `/v1/responses` or `/v1/chat/completions` request carries a `prompt_cache_key`, Codex Pooler sends the provider a `session-id` derived from that key together with the calling API key and its Pool (a UUID v5 over a fixed Codex Pooler namespace), to encourage provider-side locality across consecutive HTTP turns. The derived value is stable across nodes and restarts, is never stored or logged, and is not sent for keys that are empty, longer than 512 bytes, or not strings. Because the API key and Pool are part of the derivation, two API keys or two Pools that send the same `prompt_cache_key` (for example a generic `default`) never share a provider `session-id`, even when their requests reach the same upstream account; the model is not part of it, so switching models inside a conversation keeps the same `session-id`. The native `/backend-api/codex/responses` and `/backend-api/codex/responses/compact` HTTP routes derive the same value, from the same key, API key and Pool, when the client sent no usable `session-id` of its own, for example a third-party client that names its conversation only with `session_id` or `x-session-id`. Such an alias still selects the local continuity session but is never forwarded, because it carries no tenant scope. When the request carries no `prompt_cache_key` either, as with clients that send only a conversation header, Codex Pooler derives the provider `session-id` from that header with the same API key and Pool scoping, under a separate namespace, so consecutive turns of one conversation still share one provider `session-id`. The order is: the client's own `session-id`, then `prompt_cache_key`, then the conversation header. A client `session-id` is always forwarded unchanged, and the native websocket handshake still carries only the session headers of the upgrade. The derived `session-id` only steers provider-side sticky routing: Codex Pooler creates no local session from it, so bridge eligibility and continuity still require a real continuity header. Within one API key the derivation assumes a conversation-scoped key. A client that reuses one `prompt_cache_key` across unrelated conversations on the same API key (for example one key per end user or per application) sends all of them to the provider under the same `session-id`, which shares their provider-routing hint without guaranteeing placement on one machine; use a per-conversation key when that is not the intent.
+
+A `previous_response_id` requires the physical upstream websocket connection that produced it. The same account on another connection cannot resolve it, and native HTTP cannot carry that anchor. Public `/v1` requests that cannot use the producing connection fail with `previous_response_not_found`; the client must supply portable full history without the stale anchor.
 
 If a request still requires an upstream-owned anchor or file and that account is no longer eligible, Codex Pooler cannot silently move that request. A client-authored full-history request can recover when it contains the portable context needed by another eligible account. Check the upstream's lifecycle state, reauth status, Pool assignment, model support, quota evidence, and route health when no eligible recovery target remains.
 
@@ -152,7 +160,11 @@ If a request still requires an upstream-owned anchor or file and that account is
 
 Prompt-cache locality is a preference for stateless requests that share a `prompt_cache_key`.
 
-When prompt-cache affinity is enabled for the Pool and there is no stronger continuity rule, Codex Pooler uses the transient `prompt_cache_key` as a routing seed. That makes repeat stateless requests prefer the same eligible upstream account, which can improve provider-side cache locality.
+Under Cache locality (`bridge_ring`), when the route and key are eligible and there is no stronger continuity rule, Codex Pooler uses the transient `prompt_cache_key` as a routing seed. That makes repeat stateless requests prefer the same eligible upstream account, which can improve provider-side cache locality.
+
+Rotation, Least recent success, and Quota first keep their own ordering even when a cache key is present. This does not disable provider caching or change the accepted upstream cache-key payload.
+
+The local routing key accepts at most 256 bytes after trimming and uses the hash of that trimmed value. This is separate from the provider `session-id` derivation's 512-byte limit described above; the profile does not change either limit.
 
 This doesn't store prompts or responses locally. The raw prompt-cache key isn't stored as request evidence. It is used as a routing input, then request and routing logs remain metadata-only.
 
@@ -171,8 +183,8 @@ Prompt-cache locality can be skipped when:
       <td>Normal strategy ordering applies</td>
     </tr>
     <tr>
-      <td>Prompt-cache affinity is disabled on the Pool</td>
-      <td>Normal strategy ordering applies</td>
+      <td>Rotation, Least recent success, or Quota first is selected</td>
+      <td>The selected profile keeps its ordering; provider caching remains available</td>
     </tr>
     <tr>
       <td>Only one upstream account is eligible</td>
@@ -187,7 +199,7 @@ Prompt-cache locality can be skipped when:
 
 ## Fallback Behavior
 
-Fallback is bounded by eligibility and ring size.
+Ordinary fallback follows the eligible shortlist. Guarded credit or saved-reset recovery has its own bounded rules and can extend that shortlist.
 
 If the first chosen upstream account returns a retryable backend status, rate limit, authorization failure, or server error, or the connection to it fails before the request reaches the provider, Codex Pooler can try the next eligible account in the route plan. A network failure after the request reached the provider ends the request on that account, because the provider may already be running it, and an authorization failure that a native websocket turn receives in a response frame is relayed to the client instead. It records safe attempt metadata and may briefly demote the failing assignment for the same Pool and model.
 
@@ -231,7 +243,7 @@ Operators configure routing from the admin UI. The exact visibility depends on r
   <tbody>
     <tr>
       <td>Pools</td>
-      <td>Pool lifecycle, Pool assignments, Pool API key assignments, routing strategy, ring size, sticky websocket sessions, HTTP affinity, prompt-cache affinity, and <code>/v1</code> compatibility</td>
+      <td>Pool lifecycle, Pool assignments, Pool API key assignments, routing profile, ring size, and <code>/v1</code> compatibility</td>
     </tr>
     <tr>
       <td>Upstreams</td>
@@ -254,6 +266,12 @@ Operators configure routing from the admin UI. The exact visibility depends on r
 
 The admin UI doesn't expose raw prompts, completions, request bodies, response bodies, file bytes, audio bytes, image bytes, websocket frames, bearer tokens, raw Pool API keys after creation, upstream tokens, or Codex `auth.json` contents.
 
+## Rolling upgrades and rollback
+
+The four profile identifiers remain unchanged. The historical affinity columns, their defaults, and their stored values remain in the database for older releases; profile-aware nodes ignore them. No data backfill is needed.
+
+During a rolling upgrade, older nodes continue applying their saved affinity settings until replaced. A rollback restores that older behavior with the retained values. Mixed-version routing can therefore differ during the rollout; shared storage compatibility does not guarantee identical policy on every serving version.
+
 ## Frequently Asked Questions
 
 ### Can a routing strategy bypass eligibility checks?
@@ -262,7 +280,7 @@ No. Routing strategies only order upstream accounts that already passed hard eli
 
 ### Why does session continuity override stateless routing?
 
-Session continuity protects resumable Codex work. If a request belongs to an existing Codex session, websocket session, previous response chain, or file affinity, Codex Pooler keeps it with the upstream assignment that owns that state instead of treating it as a new stateless request.
+Session continuity protects resumable Codex work. If a request belongs to an existing Codex session, websocket session, previous response chain, or file affinity, Codex Pooler prefers the current eligible account. Required anchors and file ownership impose stronger constraints, while portable full history can recover on another eligible account.
 
 ### What happens when the preferred upstream fails?
 

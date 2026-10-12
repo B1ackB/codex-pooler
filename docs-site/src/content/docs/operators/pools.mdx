@@ -27,7 +27,7 @@ A Pool controls:
 2. upstream assignments, which decide which accounts are available to the Pool
 3. Pool API key assignments, which decide which client credentials can use the Pool
 4. routing strategy, which decides how eligible upstreams are ordered
-5. continuity settings, which decide when related requests should prefer the same upstream
+5. ring size, which bounds the initial shortlist of eligible upstreams
 6. compatibility settings, such as OpenAI-style `/v1` routes
 7. image-generation permission for the supported image generation and edit routes
 8. reporting scope for Pool-filtered request logs, audit logs, and traffic summaries
@@ -99,7 +99,7 @@ The lifecycle states are:
   </tbody>
 </table>
 
-The routing strategy label shows the ordering policy used after hard eligibility checks. For the default `Bridge ring` strategy, Codex Pooler spreads requests across eligible upstreams while still honoring continuity, prompt-cache locality, quota evidence, and recent demotions.
+The routing strategy label shows the ordering policy used after hard eligibility checks. The default `Cache locality` profile uses stable scoring and matching cache keys to prefer the same eligible upstream. Every profile preserves automatic session preference, quota evidence, and health safeguards.
 
 ## Traffic 24h
 
@@ -210,21 +210,28 @@ The Routing step controls how the Pool chooses among eligible upstream accounts.
 
 [![Create Pool routing step](/operators/pools/pools-create-dialog-routing.png)](/operators/pools/pools-create-dialog-routing.png)
 
-Routing settings are split into selection policy, continuity, and compatibility.
+Choose a routing profile and ring size. The `How it routes` list explains the selected profile on the left; Compatibility stays on the right and follows it on small screens.
 
 ### Selection Policy
 
-`Routing strategy` chooses how eligible upstreams are ordered. Strategy does not bypass eligibility. An upstream must still be active, assigned to the Pool, compatible with the requested model and route shape, and usable according to quota and health evidence.
+`Routing strategy` selects one of four complete profiles: Cache locality, Rotation, Least recent success, or Quota first. Each profile chooses how eligible upstreams are ordered for independent work. Strategy does not bypass eligibility. An upstream must still be active, assigned to the Pool, compatible with the requested model and route shape, and usable according to quota and health evidence.
 
-`Ring size` controls how many ordered upstreams Codex Pooler prepares for a request. A ring size of `3` means the route plan can include up to three eligible upstreams. If the first attempt fails in a retryable way, Codex Pooler can try the next eligible upstream in that plan.
+`Ring size` controls how many ordered upstreams Codex Pooler prepares for a request. A ring size of `3` means the route plan can include up to three eligible upstreams. If the first attempt fails in a retryable way, Codex Pooler can try the next eligible upstream in that plan. This is a shortlist limit for every profile, not a global maximum attempt count: guarded credit or saved-reset recovery can extend the route plan.
 
-### Continuity
+<span id="continuity"></span>
 
-`Sticky websocket sessions` keeps websocket work with the same upstream when a continuity identity exists. This protects reconnects and session-bound websocket state.
+### How it routes
 
-`HTTP affinity` gives related HTTP requests a same-upstream preference. It is a preference, not permission to use an ineligible account.
+The selected profile shows four icon rows in the same format: its ordering rule, `Keep sessions together`, `Respect routing safeguards`, and its cache behavior. The cache explanation is the fourth row of that list.
 
-`Prompt cache affinity` keeps related prompt-cache-key requests near the same upstream for routing locality. Codex Pooler uses this as a routing input only. It does not store prompts or responses for this control.
+- **Cache locality** prefers the same eligible upstream for matching cache keys. Cache affinity can improve reuse, but does not guarantee a cache hit.
+- **Rotation** varies the starting upstream for independent requests using a deterministic seed. Cache keys do not override rotation; provider caching remains available.
+- **Least recent success** prefers accounts without successes, then the oldest success. Cache keys do not override success history; provider caching remains available.
+- **Quota first** prioritizes usable remaining quota for the requested model. Quota takes priority over cache locality; provider caching remains available.
+
+Continuity is automatic for every profile, with no separate affinity switches. Related turns prefer the session's current eligible upstream. Without a session, an idempotency key or request identity can preserve the same preference. Required response anchors, file ownership, quota, and health still constrain routing; a response anchor needs the physical upstream websocket connection that produced it.
+
+See [Routing strategies](/reference/routing-strategies/) for ordering, fallback, and upgrade boundaries.
 
 ### Compatibility
 
