@@ -136,6 +136,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.MailboxDis
     assert [predecessor, successor] = request_logs(pool_id)
     assert {predecessor.status, predecessor.response_status_code, predecessor.last_error_code} == {"failed", 499, "client_disconnected"}
     assert {successor.status, successor.response_status_code} == {"succeeded", 200}
+    assert Repo.one!(from(entry in LedgerEntry, where: entry.request_id == ^predecessor.id and entry.entry_kind == "settlement" and entry.amount_status == "recorded", select: entry.usage_status)) == "usage_unknown"
 
     for request <- [predecessor, successor] do
       assert request.request_metadata["routing"]["model_serving_mode"] == mode

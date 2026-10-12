@@ -84,6 +84,32 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport do
     websocket_frame
   )
 
+  defmodule LegacyUsageNodeClient do
+    @moduledoc false
+    @behaviour CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder.NodeClient
+    alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder.ERPCNodeClient
+
+    @impl true
+    defdelegate connected_app_nodes(), to: ERPCNodeClient
+    @impl true
+    defdelegate app_node?(node), to: ERPCNodeClient
+    @impl true
+    defdelegate call_owner(node, module, function, args, timeout), to: ERPCNodeClient
+
+    @impl true
+    def call_owner_turn(node, module, function, args, timeout) do
+      case ERPCNodeClient.call_owner_turn(node, module, function, args, timeout) do
+        {:error, %{response_usage: usage} = error} ->
+          [_session_id, downstream | _] = args
+          send(downstream.pid, {:legacy_caller_dropped_usage, Map.take(usage, [:status, :total_tokens])})
+          {:error, Map.delete(error, :response_usage)}
+
+        other ->
+          other
+      end
+    end
+  end
+
   defmodule StaleOwnerNodeClient do
     @moduledoc false
 
@@ -216,7 +242,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport do
   # `session_attrs` are the continuity inputs the session is keyed by, as a
   # socket's upgrade would resolve them (a session header, or the public `/v1`
   # socket's `accepted_turn_state`).
-  def start_remote_session_owner!(auth, session_attrs, remote_node, persistence_kind) do
+  def start_remote_session_owner!(auth, session_attrs, remote_node, persistence_kind, owner_opts \\ []) do
     {:ok, session} = Gateway.start_codex_session(auth, Map.put(session_attrs, :owner_instance_id, Atom.to_string(remote_node)))
 
     persistence =
@@ -232,18 +258,56 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport do
       :erpc.call(remote_node, WebsocketOwnerSession, :start_owner, [
         [
           codex_session_id: session.id,
+          pool_id: session.pool_id,
+          api_key_id: session.api_key_id,
           owner_lease_token: session.owner_lease_token,
           owner_instance_id: session.owner_instance_id,
           owner_renewal_ms: 60_000,
           persistence: persistence
-        ]
+        ] ++ owner_opts
       ])
 
     on_exit(fn ->
-      if remote_node in Node.list(:connected), do: stop_remote_owner!(remote_node, owner_pid)
+      if remote_node == node() or remote_node in Node.list(:connected), do: stop_remote_owner!(remote_node, owner_pid)
     end)
 
     {session, owner_pid}
+  end
+
+  @doc false
+  @spec held_terminal_writer_boundary(pid(), reference(), binary() | nil) :: map()
+  def held_terminal_writer_boundary(test_pid, hold_ref, response_id \\ nil) do
+    real = WebsocketOwnerSession.default_upstream_boundary()
+
+    %{
+      real
+      | send: fn upstream, request, writer ->
+          held_writer = fn frame, discriminator ->
+            if TerminalDiscriminator.terminal?(discriminator) and (is_nil(response_id) or get_in(CodexPooler.JSON.decode!(frame), ["response", "id"]) == response_id) do
+              spawn(fn ->
+                monitor = Process.monitor(test_pid)
+                send(test_pid, {:held_terminal_writer, self(), hold_ref})
+
+                receive do
+                  {:release_terminal_writer, ^hold_ref} -> writer.(frame, discriminator)
+                  {:discard_terminal_writer, ^hold_ref} -> :ok
+                  {:DOWN, ^monitor, :process, ^test_pid, _reason} -> :ok
+                after
+                  60_000 -> exit(:terminal_writer_hold_timeout)
+                end
+
+                Process.demonitor(monitor, [:flush])
+              end)
+
+              :ok
+            else
+              writer.(frame, discriminator)
+            end
+          end
+
+          real.send.(upstream, request, held_writer)
+        end
+    }
   end
 
   # An owner can retire on its own at any time once its turn settled (its upstream session ended, a
@@ -398,11 +462,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport do
   # The same for any socket: `session_attrs` key the session the socket's
   # upgrade resolves (`%{accepted_turn_state: turn_state}` for a public `/v1`
   # socket sending `x-codex-turn-state`).
-  def start_peer_session_owner!(%{authorization: authorization, identity: identity} = setup, session_attrs) do
+  def start_peer_session_owner!(%{authorization: authorization, identity: identity} = setup, session_attrs, owner_opts \\ []) do
     BackendCodexTestSupport.register_unboxed_pool_cleanup!(setup)
     {:ok, auth} = Access.authenticate_authorization_header(authorization)
     peer_node = start_bridge_peer!(:current, identity, repo: :real)
-    start_peer_owner_on!(auth, session_attrs, peer_node)
+    start_peer_owner_on!(auth, session_attrs, peer_node, owner_opts)
   end
 
   # `start_peer_window_owner!/2` on the module's shared Repo-backed peer.
@@ -418,8 +482,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport do
     start_peer_owner_on!(auth, session_attrs, peer_node)
   end
 
-  defp start_peer_owner_on!(auth, session_attrs, peer_node) do
-    {session, owner_pid} = start_remote_session_owner!(auth, session_attrs, peer_node, :real)
+  defp start_peer_owner_on!(auth, session_attrs, peer_node, owner_opts \\ []) do
+    {session, owner_pid} = start_remote_session_owner!(auth, session_attrs, peer_node, :real, owner_opts)
     assert node(owner_pid) == peer_node
     assert {:error, :owner_unavailable} = WebsocketOwnerSession.lookup(session.id)
 
