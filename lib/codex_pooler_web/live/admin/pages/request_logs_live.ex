@@ -74,6 +74,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
        request_logs_running?: false,
        request_logs_rerun?: false,
        request_logs_preparation: nil,
+       request_logs_table_held?: false,
+       request_log_selection_generation: 0,
        visible_pool_ids: [],
        request_log_filters: %{},
        request_log_snapshot_at: nil,
@@ -87,16 +89,19 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
 
   @impl true
   def handle_params(params, _uri, socket) do
-    # Opening or closing the detail drawer only changes the selection param;
-    # the list, filter options, and counts are unaffected and must not be
-    # rebuilt (each rebuild costs several queries over large tables).
+    # Selection changes load only the detail. Closing a drawer also catches up
+    # a latest table that held automatic changes while the operator read it.
     if socket.assigns[:request_logs_loaded?] &&
          same_list_params?(params, socket.assigns[:current_params]) do
+      closed? = not is_nil(selected_request_id(socket.assigns.current_params)) and is_nil(selected_request_id(params))
+
       {:noreply,
        socket
        |> assign(:current_params, params)
+       |> assign(:request_log_selection_generation, socket.assigns.request_log_selection_generation + 1)
        |> assign_selected_request_log(params)
-       |> maybe_clear_missing_selected_request_log()}
+       |> maybe_clear_missing_selected_request_log()
+       |> maybe_resume_request_log_table(closed?)}
     else
       {:noreply, request_request_logs(socket, params, :filter_patch)}
     end
@@ -204,10 +209,15 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   def handle_async({:request_logs, generation}, {:ok, result}, socket) do
     socket = assign(socket, :request_logs_running?, false)
 
-    if generation == socket.assigns.request_logs_generation do
-      {:noreply, apply_request_logs_result(socket, result)}
-    else
-      {:noreply, maybe_start_pending_request_logs(socket)}
+    cond do
+      generation != socket.assigns.request_logs_generation ->
+        {:noreply, maybe_start_pending_request_logs(socket)}
+
+      result.preparation.stage == :event_refresh and LiveUpdatesHooks.paused?(socket) ->
+        {:noreply, hold_request_logs_result(socket)}
+
+      true ->
+        {:noreply, apply_request_logs_result(socket, result)}
     end
   end
 
@@ -449,6 +459,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       current_pin_at: socket.assigns.request_log_pin_at,
       scope: socket.assigns.current_scope,
       selected_request_id: selected_request_id(params),
+      selection_generation: socket.assigns.request_log_selection_generation,
       started_at: System.monotonic_time()
     }
 
@@ -498,6 +509,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       current_pin_at: socket.assigns.request_log_pin_at,
       scope: socket.assigns.current_scope,
       selected_request_id: selected_request_id(socket.assigns.current_params),
+      selection_generation: socket.assigns.request_log_selection_generation,
       started_at: System.monotonic_time()
     }
 
@@ -528,10 +540,15 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   end
 
   defp maybe_start_pending_request_logs(socket) do
-    if socket.assigns.request_logs_rerun? do
-      maybe_start_request_logs(socket, socket.assigns.request_logs_generation)
-    else
-      socket
+    cond do
+      not socket.assigns.request_logs_rerun? ->
+        socket
+
+      socket.assigns.request_logs_preparation.stage == :event_refresh and LiveUpdatesHooks.paused?(socket) ->
+        hold_request_logs_result(socket)
+
+      true ->
+        maybe_start_request_logs(socket, socket.assigns.request_logs_generation)
     end
   end
 
@@ -539,6 +556,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
     request_logs =
       case preparation do
         %{stage: :event_refresh, snapshot_at: {%DateTime{}, _request_id}} ->
+          preparation.current_request_logs
+
+        %{stage: :event_refresh, selected_request_id: request_id} when not is_nil(request_id) ->
           preparation.current_request_logs
 
         _preparation ->
@@ -551,7 +571,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       end
 
     pin_at =
-      if preparation.stage == :event_refresh and not is_nil(preparation.snapshot_at) do
+      if preparation.stage == :event_refresh and (not is_nil(preparation.snapshot_at) or not is_nil(preparation.selected_request_id)) do
         preparation.current_pin_at
       else
         preparation.snapshot_at || newest_cursor(request_logs)
@@ -576,12 +596,16 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   defp apply_request_logs_result(socket, result) do
     preparation = result.preparation
     current_selected_request_id = selected_request_id(socket.assigns.current_params)
+    table_held? = preparation.stage == :event_refresh and not is_nil(current_selected_request_id)
+    request_logs = if table_held?, do: socket.assigns.request_logs, else: result.request_logs
+    pin_at = if table_held?, do: socket.assigns.request_log_pin_at, else: result.pin_at
 
     socket =
       socket
       |> assign(
-        request_logs: result.request_logs,
-        request_log_pin_at: result.pin_at,
+        request_logs: request_logs,
+        request_log_pin_at: pin_at,
+        request_logs_table_held?: table_held? and is_nil(preparation.snapshot_at),
         request_log_newer_count: result.newer_count.total,
         request_log_newer_count_exact?: result.newer_count.total_exact?,
         model_filter_options: model_filter_options(result.model_filter_models, socket.assigns.filter_values["model"]),
@@ -590,19 +614,37 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
         request_logs_rerun?: false
       )
       |> maybe_assign_async_selected_request_log(
-        preparation.selected_request_id,
-        current_selected_request_id,
+        {preparation.selected_request_id, preparation.selection_generation},
+        {current_selected_request_id, socket.assigns.request_log_selection_generation},
         result.selected_request_log
       )
       |> notify_request_logs_reload(preparation.stage, preparation.started_at)
       |> normalize_request_log_window(
         preparation.params,
-        result.request_logs,
+        request_logs,
         preparation.snapshot_at
       )
 
     if preparation.selected_request_id == current_selected_request_id do
       maybe_clear_missing_selected_request_log(socket)
+    else
+      socket
+    end
+  end
+
+  # A completed automatic read is still subject to the current pause boundary.
+  # Keep only the invalidation; resume reads fresh state instead of replaying data.
+  defp hold_request_logs_result(socket) do
+    socket
+    |> assign(request_logs_loading?: false, request_logs_rerun?: false)
+    |> LiveUpdatesHooks.hold()
+  end
+
+  defp maybe_resume_request_log_table(socket, closed?) do
+    if closed? and socket.assigns.request_logs_table_held? do
+      if LiveUpdatesHooks.paused?(socket),
+        do: LiveUpdatesHooks.hold(socket),
+        else: request_request_logs_refresh(socket)
     else
       socket
     end
@@ -874,6 +916,11 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   end
 
   defp schedule_request_logs_refresh(socket) do
+    socket =
+      if selected_request_id(socket.assigns.current_params) && is_nil(socket.assigns.request_log_snapshot_at),
+        do: assign(socket, :request_logs_table_held?, true),
+        else: socket
+
     if is_reference(socket.assigns[:request_logs_reload_timer]) do
       socket
     else

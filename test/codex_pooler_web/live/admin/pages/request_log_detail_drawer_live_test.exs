@@ -178,7 +178,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
     refute has_element?(view, "#request-log-detail-upstream-reasoning")
   end
 
-  test "selected request detail remains visible after refresh removes row from table", %{
+  test "selected request detail keeps the table frozen until the drawer closes", %{
     conn: conn,
     scope: scope
   } do
@@ -219,10 +219,16 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
     send(view.pid, :refresh_request_logs_from_events)
     _ = await_request_logs(view)
 
-    assert has_element?(view, "#request-log-row-#{List.last(newer_requests).id}")
-    refute has_element?(view, "#request-log-row-#{selected_request.id}")
+    refute has_element?(view, "#request-log-row-#{List.last(newer_requests).id}")
+    assert has_element?(view, "#request-log-row-#{selected_request.id}")
     assert has_element?(view, "#request-log-detail-drawer[checked]")
     assert has_element?(view, "#request-log-detail-correlation-id", "req-refresh-selected")
+
+    render_click(element(view, "#request-log-detail-sidebar-close"))
+    assert_patch(view)
+    _ = await_request_logs(view)
+    assert has_element?(view, "#request-log-row-#{List.last(newer_requests).id}")
+    refute has_element?(view, "#request-log-row-#{selected_request.id}")
   end
 
   test "missing or unauthorized selected request closes and clears URL state", %{
