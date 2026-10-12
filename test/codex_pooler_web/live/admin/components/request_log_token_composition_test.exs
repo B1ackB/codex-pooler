@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogTokenCompositionTest do
 
   import Phoenix.LiveViewTest
 
+  alias CodexPooler.Accounting.RequestLogs.SettlementPresentation
   alias CodexPoolerWeb.Admin.RequestLogsPresentation.Usage
 
   test "segments partition the recorded total and reasoning stays within output" do
@@ -63,12 +64,83 @@ defmodule CodexPoolerWeb.Admin.RequestLogTokenCompositionTest do
     assert Enum.empty?(LazyHTML.query(inconsistent_cache, "[data-role='cache-rate']"))
   end
 
-  test "unknown or zero total does not look like a completed progress bar" do
-    for counts <- [nil, %{input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, total_tokens: 0}] do
-      document = render_tokens(counts)
-      assert Enum.empty?(LazyHTML.query(document, "[data-role='token-bar']"))
-      assert text(document, "[data-role='usage-placeholder']") == "—"
+  test "absent settlement shows unavailable usage without a composition bar" do
+    assert_unavailable_usage(render_settlement(nil))
+  end
+
+  for usage_status <- ["usage_unknown", "usage_pending"] do
+    test "#{usage_status} hides stored counters and cost instead of presenting measured usage" do
+      settlement = %{
+        usage_status: unquote(usage_status),
+        input_tokens: 80,
+        cached_input_tokens: 40,
+        output_tokens: 20,
+        total_tokens: 100,
+        settled_cost_micros: Decimal.new(12_300),
+        details: %{"pricing_status" => "priced", "settled_cost_micros" => "12300"}
+      }
+
+      assert_unavailable_usage(render_settlement(settlement))
     end
+  end
+
+  test "measured zero retains its recorded amount and priced zero cost without a composition bar" do
+    document = render_settlement(zero_settlement())
+
+    assert_zero_usage(document, "$0.00")
+    assert text(document, "[data-role='cached-tokens']") == "0 cached"
+  end
+
+  test "measured zero remains visible when pricing is unavailable" do
+    settlement = %{zero_settlement() | details: %{"pricing_status" => "unpriced_missing_model"}}
+    document = render_settlement(settlement)
+
+    assert_zero_usage(document, "cost n/a")
+    assert text(document, "[data-role='cached-tokens']") == "0 cached"
+  end
+
+  test "nullable component counts do not hide a measured zero total or invent cached usage" do
+    settlement = %{zero_settlement() | input_tokens: nil, cached_input_tokens: nil, output_tokens: nil}
+    document = render_settlement(settlement)
+
+    assert_zero_usage(document, "$0.00")
+    assert text(document, "[data-role='cached-tokens']") == "cache n/a"
+  end
+
+  defp zero_settlement do
+    %{
+      usage_status: "usage_known",
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      settled_cost_micros: Decimal.new(0),
+      details: %{"pricing_status" => "priced", "settled_cost_micros" => "0"}
+    }
+  end
+
+  defp render_settlement(settlement) do
+    request_log = %{
+      id: "sample-request",
+      token_counts: SettlementPresentation.token_counts(settlement),
+      cost: SettlementPresentation.cost(settlement)
+    }
+
+    tokens = render_component(&Usage.request_log_token_lines/1, request_log: request_log, prefix: "request-log")
+    cost = render_component(&Usage.request_log_cost_lines/1, request_log: request_log, prefix: "request-log")
+    LazyHTML.from_fragment(tokens <> cost)
+  end
+
+  defp assert_unavailable_usage(document) do
+    assert text(document, "[data-role='usage-placeholder']") == "—"
+    assert text(document, "[data-role='cost-placeholder']") == "—"
+    assert Enum.empty?(LazyHTML.query(document, "[data-role='token-totals'], [data-role='cost'], [data-role='token-bar'], [data-role='cache-rate']"))
+  end
+
+  defp assert_zero_usage(document, expected_cost) do
+    assert text(document, "[data-role='token-totals']") == "0"
+    assert text(document, "[data-role='cost']") == expected_cost
+    assert Enum.empty?(LazyHTML.query(document, "[data-role='usage-placeholder'], [data-role='cost-placeholder'], [data-role='token-bar'], [data-role='cache-rate']"))
   end
 
   defp render_tokens(counts) do
