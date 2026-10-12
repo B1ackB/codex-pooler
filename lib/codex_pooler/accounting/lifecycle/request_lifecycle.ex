@@ -883,8 +883,15 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
   defp matching_admitted_attempt?(original_request, original_attempt, request, attempt) do
     original_request.id == attempt.request_id and original_attempt.request_id == request.id and
       original_attempt.replay_generation == attempt.replay_generation and
-      original_request.pool_id == request.pool_id and original_request.api_key_id == request.api_key_id
+      original_request.pool_id == request.pool_id and matching_admitted_key?(original_request, request)
   end
+
+  defp matching_admitted_key?(%Request{api_key_id: key_id}, %Request{api_key_id: key_id}), do: true
+
+  defp matching_admitted_key?(%Request{api_key_id: key_id}, %Request{api_key_id: nil, request_metadata: %{"api_key" => %{"id" => key_id}}}) when is_binary(key_id),
+    do: match?({:ok, ^key_id}, Ecto.UUID.cast(key_id))
+
+  defp matching_admitted_key?(_original_request, _request), do: false
 
   defp newer_attempt?(attempt),
     do: Repo.exists?(from row in Attempt, where: row.request_id == ^attempt.request_id and row.attempt_number > ^attempt.attempt_number)

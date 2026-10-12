@@ -180,9 +180,30 @@ defmodule CodexPooler.Accounting.Metadata do
         sanitize_metadata(request.request_metadata || %{})
       )
 
-    persisted
-    |> Ecto.Changeset.change(%{request_metadata: merged})
-    |> Repo.update()
+    # Admission writes this principal from authenticated scope. Preserve the
+    # database value under the UPDATE lock, including when reload? is false;
+    # neither accumulated metadata nor the caller's struct can replace it.
+    query =
+      from row in Request,
+        where: row.id == ^persisted.id,
+        update: [
+          set: [
+            request_metadata:
+              fragment(
+                "CASE WHEN jsonb_typeof(?->'api_key') = 'object' THEN jsonb_set(?::jsonb, '{api_key}', ?->'api_key') ELSE ?::jsonb END",
+                row.request_metadata,
+                type(^merged, :map),
+                row.request_metadata,
+                type(^merged, :map)
+              )
+          ]
+        ],
+        select: row
+
+    case Repo.update_all(query, []) do
+      {1, [updated]} -> {:ok, updated}
+      {0, []} -> raise Ecto.StaleEntryError, changeset: Ecto.Changeset.change(persisted), action: :update
+    end
   end
 
   def persist_request_metadata(_request, _opts), do: {:error, :invalid_request}
