@@ -6,6 +6,8 @@ defmodule CodexPooler.Events.PostgresBridgeTest do
   alias CodexPooler.Events.{Event, PostgresBridge}
   alias CodexPooler.Repo
   alias CodexPooler.Status.Events, as: StatusEvents
+  alias CodexPooler.UnboxedFixture
+  alias Ecto.Adapters.SQL.Sandbox
 
   # Named detection budget for a NOTIFY committed on another connection to come
   # back through the notifications process, the bridge and PubSub; the green
@@ -30,17 +32,118 @@ defmodule CodexPooler.Events.PostgresBridgeTest do
 
   @tag slow: "starts a real BEAM PubSub peer and observes default bridge de-duplication"
   test "default peer lookup follows the real Phoenix PubSub adapter group", ctx do
+    {owner, peer, remote, peer_name} = start_peer!()
+    {:ok, _} = :peer.call(peer, Application, :ensure_all_started, [:phoenix_pubsub])
+    parent = self()
+    {_pid, _} = :peer.call(peer, Code, :eval_string, ["spawn(fn -> {:ok, _} = Phoenix.PubSub.Supervisor.start_link(name: CodexPooler.PubSub); send(parent, :remote_pubsub_ready); receive do :stop -> :ok end end)", [parent: parent]])
+    assert_receive :remote_pubsub_ready, 10_000
+    notifications = start_notifications!(ctx, :permanent)
+    bridge = start_supervised!(%{id: :bridge, start: {PostgresBridge, :start_link, [[name: ctx.bridge_name, notifications: ctx.notifications]]}})
+    await_bridge_listening!(bridge, notifications)
+    lookup = :sys.get_state(bridge).pubsub_nodes
+    await_pubsub_peer!(lookup, remote, System.monotonic_time(:millisecond) + 10_000)
+    pool_id = subscribe!()
+    {event, payload} = remote_pool_event(pool_id, "real_pubsub_peer", Atom.to_string(remote))
+    {marker, marker_payload} = remote_pool_event(pool_id, "unclustered_marker", "sample-unclustered@127.0.0.1")
+    notify!(ctx.sender, Events.postgres_channel(), payload)
+    notify!(ctx.sender, Events.postgres_channel(), marker_payload)
+    assert_receive {Events, ^marker}, @relay_detection_timeout_ms
+    refute_received {Events, ^event}
+    monitor = Process.monitor(peer)
+    send(owner, :stop)
+    assert_receive {:DOWN, ^monitor, :process, ^peer, _}, 15_000
+    CodexPooler.PeerRegistry.assert_peer_absent!(peer_name, peer_node: remote)
+  end
+
+  for topology <- [:clustered, :unclustered] do
+    @tag slow: "starts a real BEAM and PostgreSQL bridge to prove committed request-log delivery"
+    test "committed request log events reach a real #{topology} peer once and rollback stays silent", ctx do
+      committed_peer_scenario(ctx, unquote(topology))
+    end
+  end
+
+  defp committed_peer_scenario(ctx, topology) do
+    {owner, peer, remote, peer_name} = start_peer!()
+    {:ok, _} = :peer.call(peer, CodexPooler.EventsPeer, :start, [connection_config()])
+    assert Node.connect(remote)
+    notifications = start_notifications!(ctx, :permanent)
+    bridge = start_supervised!(%{id: :bridge, start: {PostgresBridge, :start_link, [[name: ctx.bridge_name, notifications: ctx.notifications]]}})
+    await_bridge_listening!(bridge, notifications)
+    lookup = :sys.get_state(bridge).pubsub_nodes
+    await_pubsub_peer!(lookup, remote, System.monotonic_time(:millisecond) + 10_000)
+    pool_id = Ecto.UUID.generate()
+    assert :ok = Events.subscribe_pool(pool_id, "request_logs")
+    assert true = :peer.call(peer, CodexPooler.EventsPeer, :subscribe, [pool_id])
+
+    if topology == :unclustered do
+      assert true = Node.disconnect(remote)
+      assert remote not in Node.list()
+      # The peer control connection uses stdio and survives distribution loss.
+      assert :peer.call(peer, Node, :list, []) == []
+    end
+
+    parent = self()
+    release = make_ref()
+
+    writer = Task.async(fn -> publish_held_event(pool_id, parent, release) end)
+
+    assert_receive {:peer_transaction_held, event}, @relay_detection_timeout_ms
+    refute_receive {Events, ^event}, 300
+    assert :peer.call(peer, CodexPooler.EventsPeer, :events, []) == []
+    send(writer.pid, release)
+    assert {:ok, ^event} = Task.await(writer, @relay_detection_timeout_ms)
+    assert_receive {Events, ^event}, @relay_detection_timeout_ms
+
+    {:error, rolled_back} =
+      UnboxedFixture.run_unboxed(fn ->
+        Repo.transaction(fn ->
+          {:ok, aborted} = Events.broadcast_request_logs(pool_id, "request_aborted")
+          Repo.rollback(aborted)
+        end)
+      end)
+
+    {:ok, {:ok, marker}} =
+      UnboxedFixture.run_unboxed(fn ->
+        Repo.transaction(fn -> Events.broadcast_request_logs(pool_id, "peer_commit_barrier") end)
+      end)
+
+    assert_receive {Events, ^marker}, @relay_detection_timeout_ms
+    assert await_peer_marker!(peer, marker, System.monotonic_time(:millisecond) + @relay_detection_timeout_ms) == [event, marker]
+
+    if topology == :unclustered do
+      assert remote not in Node.list()
+      assert :peer.call(peer, Node, :list, []) == []
+    end
+
+    refute_received {Events, ^event}
+    refute_received {Events, ^rolled_back}
+    refute_received {Events, ^marker}
+    monitor = Process.monitor(peer)
+    send(owner, :stop)
+    assert_receive {:DOWN, ^monitor, :process, ^peer, _}, @relay_detection_timeout_ms
+    CodexPooler.PeerRegistry.assert_peer_absent!(peer_name, peer_node: remote)
+  end
+
+  defp await_peer_marker!(peer, marker, deadline) do
+    events = :peer.call(peer, CodexPooler.EventsPeer, :events, [])
+
+    if marker in events do
+      events
+    else
+      assert System.monotonic_time(:millisecond) < deadline, "peer received no committed marker"
+
+      receive do
+      after
+        10 -> await_peer_marker!(peer, marker, deadline)
+      end
+    end
+  end
+
+  defp start_peer! do
     if node() == :nonode@nohost do
       previous = Application.fetch_env(:kernel, :prevent_overlapping_partitions)
 
-      on_exit(fn ->
-        :net_kernel.stop()
-
-        case previous do
-          {:ok, value} -> Application.put_env(:kernel, :prevent_overlapping_partitions, value)
-          :error -> Application.delete_env(:kernel, :prevent_overlapping_partitions)
-        end
-      end)
+      on_exit(fn -> restore_distribution(previous) end)
 
       {_, 0} = System.cmd("epmd", ["-daemon"])
       CodexPooler.PeerRegistry.assert_epmd_ready!()
@@ -67,32 +170,44 @@ defmodule CodexPooler.Events.PostgresBridgeTest do
 
     assert_receive {:bridge_peer, peer, remote}, 15_000
     :ok = :peer.call(peer, :code, :add_paths, [:code.get_path()])
-    {:ok, _} = :peer.call(peer, Application, :ensure_all_started, [:phoenix_pubsub])
-    {_pid, _} = :peer.call(peer, Code, :eval_string, ["spawn(fn -> {:ok, _} = Phoenix.PubSub.Supervisor.start_link(name: CodexPooler.PubSub); send(parent, :remote_pubsub_ready); receive do :stop -> :ok end end)", [parent: parent]])
-    assert_receive :remote_pubsub_ready, 10_000
-    notifications = start_notifications!(ctx, :permanent)
-    bridge = start_supervised!(%{id: :bridge, start: {PostgresBridge, :start_link, [[name: ctx.bridge_name, notifications: ctx.notifications]]}})
-    await_bridge_listening!(bridge, notifications)
-    lookup = :sys.get_state(bridge).pubsub_nodes
-    await_pubsub_peer!(lookup, remote, System.monotonic_time(:millisecond) + 10_000)
-    pool_id = subscribe!()
-    {event, payload} = remote_pool_event(pool_id, "real_pubsub_peer", Atom.to_string(remote))
-    {marker, marker_payload} = remote_pool_event(pool_id, "unclustered_marker", "sample-unclustered@127.0.0.1")
-    notify!(ctx.sender, Events.postgres_channel(), payload)
-    notify!(ctx.sender, Events.postgres_channel(), marker_payload)
-    assert_receive {Events, ^marker}, @relay_detection_timeout_ms
-    refute_received {Events, ^event}
-    monitor = Process.monitor(peer)
-    send(owner, :stop)
-    assert_receive {:DOWN, ^monitor, :process, ^peer, _}, 15_000
-    CodexPooler.PeerRegistry.assert_peer_absent!(peer_name, peer_node: remote)
+    {owner, peer, remote, peer_name}
+  end
+
+  defp publish_held_event(pool_id, parent, release) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.transaction(fn ->
+        {:ok, event} = Events.broadcast_request_logs(pool_id, "request_reserved", %{status: "accepted"})
+        send(parent, {:peer_transaction_held, event})
+        await_transaction_release!(release, event)
+      end)
+    end)
+  end
+
+  defp await_transaction_release!(release, event) do
+    receive do
+      ^release -> event
+    after
+      15_000 -> Repo.rollback(:release_timeout)
+    end
+  end
+
+  defp restore_distribution(previous) do
+    :net_kernel.stop()
+
+    case previous do
+      {:ok, value} -> Application.put_env(:kernel, :prevent_overlapping_partitions, value)
+      :error -> Application.delete_env(:kernel, :prevent_overlapping_partitions)
+    end
   end
 
   defp await_pubsub_peer!(lookup, remote, deadline) do
     unless remote in lookup.() do
       assert System.monotonic_time(:millisecond) < deadline, "default PubSub lookup never observed the peer"
-      Process.sleep(10)
-      await_pubsub_peer!(lookup, remote, deadline)
+
+      receive do
+      after
+        10 -> await_pubsub_peer!(lookup, remote, deadline)
+      end
     end
   end
 

@@ -113,7 +113,7 @@ defmodule CodexPooler.Events do
 
   @spec broadcast_request_logs(pool_ref(), reason(), payload()) :: broadcast_result()
   def broadcast_request_logs(pool_or_id, reason, payload \\ %{}) do
-    broadcast_pool_event(pool_or_id, [@request_logs], reason, payload)
+    broadcast_pool_event_after_commit(pool_or_id, [@request_logs], reason, payload)
   end
 
   @spec broadcast_usage(pool_ref(), reason(), payload()) :: broadcast_result()

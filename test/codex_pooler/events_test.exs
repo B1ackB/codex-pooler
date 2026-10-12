@@ -1,11 +1,149 @@
 defmodule CodexPooler.EventsTest do
   use CodexPooler.DataCase, async: false
 
+  alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.RequestLifecycle.Reservation
   alias CodexPooler.Events
   alias CodexPooler.Events.Event
   alias CodexPooler.Events.PostgresBridge
+  alias CodexPooler.Gateway.Persistence.SessionContinuity
+  alias CodexPooler.Gateway.Websocket
+  alias CodexPooler.Pools.Pool
+  alias Ecto.Adapters.SQL.Sandbox
 
+  import CodexPooler.UnboxedFixture
   import CodexPooler.PoolerFixtures
+
+  @commit_detection_timeout_ms 15_000
+
+  test "nested request log publication waits for the outer commit and is visible on another connection" do
+    pool_id = Ecto.UUID.generate()
+    assert :ok = Events.subscribe_pool(pool_id, "request_logs")
+    parent = self()
+    release = make_ref()
+
+    writer =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            {:ok, event} =
+              Repo.transaction(fn ->
+                {:ok, event} = Events.broadcast_request_logs(pool_id, "request_reserved", %{status: "accepted"})
+                event
+              end)
+
+            send(parent, {:nested_finished, event})
+            await_release!(release, event)
+          end)
+        end)
+      end)
+
+    assert_receive {:nested_finished, event}, @commit_detection_timeout_ms
+    # The outer transaction outlives the request-log view's 250 ms debounce.
+    refute_receive {Events, ^event}, 300
+    send(writer.pid, release)
+    assert {:ok, ^event} = Task.await(writer, @commit_detection_timeout_ms)
+    assert_receive {Events, ^event}, @commit_detection_timeout_ms
+    assert_transaction_marker!(pool_id)
+    refute_received {Events, ^event}
+  end
+
+  test "a held nested reservation publishes the committed in-progress row on a separate connection" do
+    pool_slug = "committed-event-#{System.unique_integer([:positive])}"
+
+    register_unboxed_cleanup!(fn ->
+      pool_ids = Repo.all(from pool in Pool, where: pool.slug == ^pool_slug, select: pool.id)
+      delete_committed_pools!(pool_ids)
+    end)
+
+    setup =
+      run_unboxed(fn ->
+        pool = pool_fixture(%{slug: pool_slug})
+        key = active_api_key_fixture(pool)
+        model = model_fixture(pool)
+        {:ok, session} = Websocket.start_codex_session(key, %{accepted_turn_state: Ecto.UUID.generate()})
+        opts = %{codex_session: session, endpoint: "/backend-api/codex/responses", requested_model: model.exposed_model_id, correlation_id: Ecto.UUID.generate(), transport: "websocket"}
+        {:ok, %{request: claim}} = Accounting.claim_websocket_turn(key, model, opts)
+        key |> Map.put(:model, model) |> Map.put(:claim, claim) |> Map.put(:opts, Map.put(opts, :turn_claim, claim))
+      end)
+
+    assert :ok = Events.subscribe_pool(setup.pool, "request_logs")
+    reader = start_supervised!({Postgrex, Keyword.take(Repo.config(), [:hostname, :port, :database, :username, :password, :ssl])})
+    [[reader_backend]] = Postgrex.query!(reader, "SELECT pg_backend_pid()", []).rows
+    parent = self()
+    release = make_ref()
+    writer = Task.async(fn -> held_reservation(setup, parent, release) end)
+    assert_receive {:reservation_held, request, writer_backend}, @commit_detection_timeout_ms
+    assert writer_backend != reader_backend
+    request_id = request.id
+    assert Postgrex.query!(reader, "SELECT status FROM requests WHERE id = $1", [Ecto.UUID.dump!(request_id)]).rows == [["accepted"]]
+    refute_receive {Events, %{payload: %{"request_id" => ^request_id}}}, 300
+    send(writer.pid, release)
+    assert {:ok, %{status: "in_progress"}} = Task.await(writer, @commit_detection_timeout_ms)
+    assert_receive {Events, %{reason: "request_reserved", payload: %{"request_id" => ^request_id}} = event}, @commit_detection_timeout_ms
+    assert Postgrex.query!(reader, "SELECT status FROM requests WHERE id = $1", [Ecto.UUID.dump!(request_id)]).rows == [["in_progress"]]
+    assert_transaction_marker!(setup.pool.id)
+    refute_received {Events, ^event}
+  end
+
+  for rollback <- [:outer, :nested] do
+    test "#{rollback} rollback publishes no request log invalidation" do
+      pool_id = Ecto.UUID.generate()
+      assert :ok = Events.subscribe_pool(pool_id, "request_logs")
+      rollback = unquote(rollback)
+      parent = self()
+
+      result =
+        run_unboxed(fn ->
+          Repo.transaction(fn ->
+            {:ok, event} = Events.broadcast_request_logs(pool_id, "request_reserved")
+            send(parent, {:rolled_back_event, event})
+            rollback_event(rollback)
+          end)
+        end)
+
+      assert match?({:error, _}, result)
+      assert_receive {:rolled_back_event, event}
+      assert_transaction_marker!(pool_id)
+      refute_received {Events, ^event}
+    end
+  end
+
+  defp held_reservation(setup, parent, release) do
+    Sandbox.unboxed_run(Repo, fn ->
+      SessionContinuity.mailbox_admission_transaction(
+        fn -> Reservation.mailbox_admission_session_ids(setup, setup.model, setup.opts) end,
+        fn ->
+          [[writer_backend]] = Repo.query!("SELECT pg_backend_pid()").rows
+          {:ok, %{request: request}} = Accounting.reserve(setup, setup.model, %{}, setup.opts)
+          assert request.status == "in_progress"
+          send(parent, {:reservation_held, request, writer_backend})
+          await_release!(release, request)
+        end,
+        Reservation.mailbox_admission_exhausted_error()
+      )
+    end)
+  end
+
+  defp await_release!(release, result) do
+    receive do
+      ^release -> result
+    after
+      15_000 -> Repo.rollback(:release_timeout)
+    end
+  end
+
+  defp rollback_event(:outer), do: Repo.rollback(:cancelled)
+  defp rollback_event(:nested), do: Repo.transaction(fn -> Repo.rollback(:cancelled) end)
+
+  defp assert_transaction_marker!(pool_id) do
+    {:ok, {:ok, marker}} =
+      run_unboxed(fn ->
+        Repo.transaction(fn -> Events.broadcast_pool_event_after_commit(pool_id, ["request_logs"], "commit_barrier") end)
+      end)
+
+    assert_receive {Events, ^marker}, @commit_detection_timeout_ms
+  end
 
   test "a PostgreSQL notification failure is returned rather than acknowledged" do
     pool = pool_fixture()
@@ -13,7 +151,7 @@ defmodule CodexPooler.EventsTest do
     {result, log} =
       ExUnit.CaptureLog.with_log(fn ->
         Repo.transaction(fn ->
-          result = Events.broadcast_upstreams_after_commit(pool.id, "upstream_account_deleted", %{sample: String.duplicate("x", 8_000)})
+          result = Events.broadcast_request_logs(pool.id, "request_reserved", %{sample: String.duplicate("x", 8_000)})
           Repo.rollback(result)
         end)
       end)
