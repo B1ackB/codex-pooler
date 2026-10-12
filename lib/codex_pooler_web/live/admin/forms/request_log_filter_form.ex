@@ -3,7 +3,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogFilterForm do
 
   alias CodexPoolerWeb.DateTimeInput
 
-  @status_options ~w(in_progress succeeded failed client_cancelled rejected)
+  @status_options ~w(accepted in_progress succeeded failed client_cancelled rejected)
   @filter_keys ~w(pool_id status upstream_identity_id model date_from date_to request_id)
 
   @type filter_error :: %{required(:field) => atom(), required(:message) => String.t()}

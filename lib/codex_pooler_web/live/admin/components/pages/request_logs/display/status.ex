@@ -1,12 +1,15 @@
 defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.Status do
   @moduledoc false
 
-  @status_options ~w(in_progress succeeded failed client_cancelled rejected)
+  @status_options ~w(accepted in_progress succeeded failed client_cancelled rejected)
   # `failed` lists failures without the client cancellations, which have their
   # own option (`RequestOutcome`); the menu says so where the choice is made.
+  @accepted_description "Accepted; execution reservation is pending."
+  @client_cancelled_description "An automatic client interruption or connection loss can produce this outcome. It does not imply zero usage. Excluded from failure totals."
   @status_option_details %{
+    "accepted" => %{detail: "reservation pending", title: @accepted_description},
     "failed" => %{detail: "excl. client cancelled", title: "Failed requests, not counting requests the client cancelled"},
-    "client_cancelled" => %{detail: "not a failure", title: "Requests the client closed before the response finished; recorded as failed, not counted as failures"}
+    "client_cancelled" => %{detail: "excl. failure totals", title: @client_cancelled_description}
   }
   @default_request_status_presentation %{
     icon: "hero-question-mark-circle",
@@ -14,6 +17,11 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.Status do
     filter_icon_color: "text-base-content/60"
   }
   @request_status_presentations %{
+    "accepted" => %{
+      icon: "hero-clock",
+      icon_class: "mx-auto size-5 text-info",
+      filter_icon_color: "text-info"
+    },
     "succeeded" => %{
       icon: "hero-check-circle",
       icon_class: "mx-auto size-5 text-success",
@@ -77,6 +85,11 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.Status do
   def selected_model_filter_option(model) do
     %{label: model_filter_label(model), value: model || "", icon: "hero-cpu-chip"}
   end
+
+  @spec status_description(String.t() | nil) :: String.t() | nil
+  def status_description("accepted"), do: @accepted_description
+  def status_description("client_cancelled"), do: @client_cancelled_description
+  def status_description(_status), do: nil
 
   def status_label("client_cancelled"), do: "Client cancelled"
   def status_label(status), do: status |> String.replace("_", " ") |> String.capitalize()

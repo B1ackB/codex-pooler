@@ -17,6 +17,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
     ]
 
   alias CodexPooler.ServiceTier
+  alias CodexPoolerWeb.Admin.RequestLogsDisplay.Status
 
   @serving_mode_configured_key "model_serving_mode_configured"
   @serving_mode_effective_key "model_serving_mode"
@@ -39,6 +40,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
       detail("request-log-detail-request-id", "Request id", log.id, mono: true),
       detail("request-log-detail-correlation-id", "Correlation id", log.correlation_id, mono: true),
       detail("request-log-detail-status", "Status", status_detail(log)),
+      detail("request-log-detail-status-meaning", "Status meaning", Status.status_description(Map.get(log, :display_status) || log.status)),
       detail("request-log-detail-endpoint", "Endpoint", log.endpoint, mono: true),
       detail("request-log-detail-model", "Model", log.requested_model),
       model_rows(log),

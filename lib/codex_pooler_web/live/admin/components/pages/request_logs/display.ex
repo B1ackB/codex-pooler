@@ -204,7 +204,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
 
   def usage_line_applicable?(log) do
     case total_token_count(log.token_counts) do
-      total when is_integer(total) and total > 0 -> true
+      total when is_integer(total) and total >= 0 -> true
       _total -> cost_applicable?(log.cost)
     end
   end

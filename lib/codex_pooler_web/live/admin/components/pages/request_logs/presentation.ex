@@ -7,6 +7,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.LogPagination
   alias CodexPoolerWeb.Admin.RequestLogFilterForm
+  alias CodexPoolerWeb.Admin.RequestLogsDisplay.Status
   alias CodexPoolerWeb.Admin.RequestLogsPresentation.Issues
   alias CodexPoolerWeb.Admin.RequestLogsPresentation.Metrics
   alias CodexPoolerWeb.Admin.RequestLogsPresentation.Usage
@@ -355,6 +356,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
       </span>
       <span
         data-role="status-label"
+        title={Status.status_description(@display_status)}
         class="flex min-w-0 items-center gap-1 whitespace-nowrap text-[11px]"
       >
         <span class="sr-only">{"Status: "}</span>
@@ -537,6 +539,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
   defp request_log_tone("succeeded"), do: "success"
   defp request_log_tone(status) when status in ["failed", "rejected"], do: "error"
   defp request_log_tone("client_cancelled"), do: "warning"
-  defp request_log_tone("in_progress"), do: "info"
+  defp request_log_tone(status) when status in ["accepted", "in_progress"], do: "info"
   defp request_log_tone(_status), do: nil
 end

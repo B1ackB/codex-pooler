@@ -132,6 +132,85 @@ defmodule CodexPoolerWeb.Admin.RequestLogsClientCancelledLiveTest do
     assert has_element?(view, "#request-log-detail-response-status", "200")
   end
 
+  test "accepted is selectable and URL-valid with an execution reservation explanation", %{conn: conn, pool: pool} do
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    request = request_fixture(%{pool: pool, api_key: api_key}, %{status: "accepted", completed_at: nil, usage_status: "usage_unknown"})
+    {:ok, view, _html} = live_request_logs(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+
+    assert has_element?(view, "#request-log-status-filter [data-status='accepted'] .hero-clock")
+    view |> element("#request-log-status-filter [data-role='status-filter-option'][data-status='accepted']") |> render_click()
+    assert_patch(view, ~p"/admin/request-logs?pool_id=#{pool.id}&status=accepted")
+    _ = await_request_logs(view)
+    assert has_element?(view, "#filters_status[value='accepted']")
+    assert has_element?(view, "#request-log-row-#{request.id}[data-status='accepted'] [data-role='status-text'].text-info", "Accepted")
+    assert has_element?(view, "#request-log-row-#{request.id} [data-role='status-label'][title*='execution reservation is pending']")
+    refute has_element?(view, "#request-log-filter-errors")
+
+    {:ok, url_view, _html} = live_request_logs(conn, ~p"/admin/request-logs?pool_id=#{pool.id}&status=accepted&selected_request_id=#{request.id}")
+    assert has_element?(url_view, "#request-log-detail-status", "Accepted")
+    assert has_element?(url_view, "#request-log-detail-status-meaning", "execution reservation is pending")
+    assert has_element?(url_view, "#request-log-detail-sidebar header span.text-info", "Accepted")
+  end
+
+  test "cancellation copy permits automatic interruption and connection loss without inferring zero usage", %{conn: conn, pool: pool, rows: rows} do
+    {:ok, view, _html} = live_request_logs(conn, ~p"/admin/request-logs?pool_id=#{pool.id}&status=client_cancelled&selected_request_id=#{rows.cancelled_stream.id}")
+    assert has_element?(view, "#request-log-status-filter [data-role='status-filter-detail']", "excl. failure totals")
+    assert has_element?(view, "#request-log-detail-status-meaning", "automatic client interruption or connection loss")
+    assert has_element?(view, "#request-log-detail-status-meaning", "does not imply zero usage")
+    assert has_element?(view, "#request-log-detail-status-meaning", "Excluded from failure totals")
+  end
+
+  test "corrected measured cancellation and known zero stay distinct from unknown usage", %{conn: conn, pool: pool} do
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    context = %{pool: pool, api_key: api_key, assignment: assignment}
+
+    for {state, usage_status, tokens, micros, pricing} <- [
+          {:corrected, "usage_known", 120, 12_300, "priced"},
+          {:zero, "usage_known", 0, 0, "priced"},
+          {:zero_unpriced, "usage_known", 0, 0, "unpriced_missing_model"},
+          {:unknown, "usage_unknown", 0, 0, "priced"}
+        ] do
+      request = log_row!(context, %{status: "failed", last_error_code: "client_disconnected", usage_status: "usage_unknown"})
+
+      if state == :corrected do
+        ledger_entry_fixture(request, %{amount_status: "voided", usage_status: "usage_unknown", total_tokens: 0})
+      end
+
+      ledger_entry_fixture(request, %{
+        usage_status: usage_status,
+        input_tokens: tokens,
+        output_tokens: 0,
+        total_tokens: tokens,
+        settled_cost_micros: micros,
+        details: %{"pricing_status" => pricing, "settled_cost_micros" => if(usage_status == "usage_known" and pricing == "priced", do: to_string(micros))}
+      })
+
+      {:ok, view, _html} = live_request_logs(conn, ~p"/admin/request-logs?pool_id=#{pool.id}&request_id=#{request.id}&selected_request_id=#{request.id}")
+      row = "#request-log-row-#{request.id}"
+      assert has_element?(view, "#{row}[data-status='failed'][data-display-status='client_cancelled']", "Client cancelled")
+      assert has_element?(view, "#request-log-detail-status", "Client cancelled (recorded as failed)")
+
+      if usage_status == "usage_known" do
+        assert has_element?(view, "#{row} [data-role='token-totals']", to_string(tokens))
+        refute has_element?(view, "#{row} [data-role='usage-placeholder']")
+
+        if pricing == "priced" do
+          expected = if state == :corrected, do: "$0.0123", else: "$0.00"
+          assert has_element?(view, "#{row} [data-role='cost']", expected)
+        else
+          assert has_element?(view, "#{row} [data-role='cost']", "cost n/a")
+          refute has_element?(view, "#{row} [data-role='cost']", "$0")
+        end
+      else
+        assert has_element?(view, "#{row} [data-role='usage-placeholder']", "—")
+        assert has_element?(view, "#{row} [data-role='cost-placeholder']", "—")
+        refute has_element?(view, "#{row} [data-role='token-totals']")
+        refute has_element?(view, "#{row} [data-role='cost']")
+      end
+    end
+  end
+
   defp listed(view, rows) do
     rows
     |> Enum.filter(fn {_key, request} -> has_element?(view, "#request-log-row-#{request.id}") end)
@@ -145,6 +224,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsClientCancelledLiveTest do
     request =
       request_fixture(%{pool: pool, api_key: api_key}, %{
         status: status,
+        usage_status: Map.get(attrs, :usage_status, "usage_known"),
         transport: Map.get(attrs, :transport, "http_json"),
         response_status_code: Map.get(attrs, :response_status_code, 200),
         last_error_code: Map.get(attrs, :last_error_code),
