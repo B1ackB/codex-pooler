@@ -5271,7 +5271,11 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
       record_downstream_delivery_receipt(cleanup, evidence, state, receipt_outcome, {:response_task, ack_pid, token, outcome})
     else
       acknowledge_response_task_delivery(ack_pid, token, outcome)
-      record_downstream_delivery_receipt(state, pid, receipt_outcome)
+
+      unless recorded_legacy_termination_receipt?(state, pid, cleanup, evidence, receipt_outcome),
+        do: record_downstream_delivery_receipt(state, pid, receipt_outcome)
+
+      :ok
     end
   end
 
@@ -5452,26 +5456,22 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
 
       {:ok, token, ack_pid, status} when status in [:cancelling, :socket_state] ->
         acknowledge_and_record_termination(state, registry, pid, token, ack_pid)
-        state
 
       {:ok, token, ack_pid, _running} ->
         ResponseTask.acknowledge_delivery(ack_pid, token, :aborted)
         put_termination_receipt_pending(state, pid)
 
       :unknown ->
-        :ok = record_downstream_delivery_receipt(state, pid, termination_receipt_outcome(state, pid, :aborted))
-
-        # No token can be acknowledged yet. Remember only the bound receipt:
-        # a later local-owner handoff still receives its ACK from the drain.
-        if is_binary(get_in(state, [:direct_cleanup_receipts, pid, :attempt_id])),
-          do: Map.update(state, :terminate_acknowledged_tasks, MapSet.new([pid]), &MapSet.put(&1, pid)),
-          else: state
+        record_termination_receipt(state, pid, termination_receipt_outcome(state, pid, :aborted))
     end
   end
 
   defp acknowledge_and_remember(state, registry, pid, token) do
-    acknowledge_and_record_termination(state, registry, pid, token, pid)
-    Map.update(state, :terminate_acknowledged_tasks, MapSet.new([pid]), &MapSet.put(&1, pid))
+    result = acknowledge_and_record_termination(state, registry, pid, token, pid)
+    cleanup = get_in(state, [:direct_cleanup_receipts, pid])
+    state = if is_map(cleanup), do: resolve_delivery_handoff(state, cleanup), else: state
+    request_id = if is_map(cleanup), do: cleanup.request_id
+    if Map.has_key?(Map.get(state, :receipt_handoffs, %{}), request_id), do: remember_termination_receipt(result, pid), else: result
   end
 
   defp receipt_recorded_at_termination?(state, pid) do
@@ -5489,9 +5489,63 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp acknowledge_and_record_termination(state, registry, pid, token, ack_pid) do
+    original_state = state
     outcome = response_task_cleanup_outcome(state, pid, token, ack_pid, registry)
-    handoff_response_task_delivery(state, pid, ack_pid, token, outcome, termination_receipt_outcome(state, pid, outcome))
+    cleanup = get_in(state, [:direct_cleanup_receipts, pid])
+    state = if is_map(cleanup), do: resolve_delivery_handoff(state, cleanup), else: state
+
+    if is_map(cleanup) and Map.has_key?(Map.get(state, :receipt_handoffs, %{}), cleanup.request_id) do
+      :ok = handoff_response_task_delivery(state, pid, ack_pid, token, outcome, termination_receipt_outcome(state, pid, outcome))
+      original_state
+    else
+      acknowledge_response_task_delivery(ack_pid, token, outcome)
+      record_termination_receipt(state, pid, termination_receipt_outcome(state, pid, outcome))
+    end
   end
+
+  defp record_termination_receipt(state, pid, outcome) do
+    original_state = state
+    cleanup = get_in(state, [:direct_cleanup_receipts, pid])
+    state = if is_map(cleanup), do: resolve_delivery_handoff(state, cleanup), else: state
+    evidence = written_delivery_evidence(pid, downstream_delivery_evidence(state, pid))
+
+    cond do
+      is_map(cleanup) and Map.has_key?(Map.get(state, :receipt_handoffs, %{}), cleanup.request_id) ->
+        :ok = record_downstream_delivery_receipt(cleanup, evidence, state, outcome)
+        remember_termination_receipt(original_state, pid)
+
+      legacy_receipt_context?(cleanup) ->
+        packet = downstream_delivery_packet(cleanup, evidence, state, outcome)
+        {context, receipt} = packet
+
+        case DeliveryReceipt.record_result(context, receipt) do
+          :ok -> state |> Map.update(:terminate_legacy_receipt_proofs, %{pid => packet}, &Map.put(&1, pid, packet)) |> remember_termination_receipt(pid)
+          {:error, _reason} -> state
+        end
+
+      true ->
+        :ok = record_downstream_delivery_receipt(state, pid, outcome)
+        original_state
+    end
+  end
+
+  defp legacy_receipt_context?(%{attempt_id: attempt} = cleanup) when is_binary(attempt), do: is_nil(Map.get(cleanup, :replay_generation))
+  defp legacy_receipt_context?(_cleanup), do: false
+
+  defp remember_termination_receipt(state, pid),
+    do: Map.update(state, :terminate_acknowledged_tasks, MapSet.new([pid]), &MapSet.put(&1, pid))
+
+  # The transient proof is bounded by this terminating socket's tasks. An ACK or
+  # log alone proves no SQL write; only the exact successfully persisted legacy
+  # metadata packet may suppress a repeat operation while a late task still
+  # receives its ACK. Generation-authorized persistence can return a no-write
+  # disposition, so it never creates this legacy proof.
+  defp recorded_legacy_termination_receipt?(state, pid, cleanup, evidence, outcome) when is_map(cleanup) do
+    MapSet.member?(Map.get(state, :terminate_acknowledged_tasks, MapSet.new()), pid) and
+      get_in(state, [:terminate_legacy_receipt_proofs, pid]) == downstream_delivery_packet(cleanup, evidence, state, outcome)
+  end
+
+  defp recorded_legacy_termination_receipt?(_state, _pid, _cleanup, _evidence, _outcome), do: false
 
   # A terminating socket acknowledges a task whose result it never saw
   # `:aborted` (it cannot certify a settlement it did not observe, findings#225
@@ -6175,10 +6229,26 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   # Preserve the server write observation even when a response task exits
   # without handing over its settlement result. This is not a client ack.
   defp record_unreported_task_receipt(state, pid) do
-    unless Map.has_key?(Map.get(state, :response_task_cleanup_results, %{}), pid),
+    unless Map.has_key?(Map.get(state, :response_task_cleanup_results, %{}), pid) or accepted_task_delivery_receipt?(state, pid),
       do: record_downstream_delivery_receipt(state, pid, termination_receipt_outcome(state, pid, :aborted))
 
     :ok
+  end
+
+  # Task-removal fallback has no ACK recipient and no new write evidence. An
+  # exact accepted packet already belongs to its responsible actor; do not
+  # replace it with the empty evidence left after handling that delivery.
+  defp accepted_task_delivery_receipt?(state, pid) do
+    with false <- Map.has_key?(Map.get(state, :downstream_delivery_evidence, %{}), pid),
+         %{} = cleanup <- get_in(state, [:direct_cleanup_receipts, pid]),
+         registry = response_task_activity_registry(state),
+         {:ok, token} <- ActivityRegistry.delivery_receipt_token(Map.take(cleanup, [:request_id, :attempt_id, :replay_generation]), name: registry),
+         {context, _receipt} <- downstream_delivery_packet(cleanup, downstream_delivery_evidence(state, pid), state, :aborted),
+         {:accepted, _phase} <- ActivityRegistry.accepted_delivery_receipt(token, context, name: registry) do
+      true
+    else
+      _not_accepted -> false
+    end
   end
 
   defp clear_direct_cleanup(state, pid) do

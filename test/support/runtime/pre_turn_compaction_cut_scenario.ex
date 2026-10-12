@@ -31,7 +31,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   alias CodexPooler.Gateway.Transports.Websocket.{RolloutDrain, UpstreamWebsocketSession, WebsocketOwnerAdmissionControlV1}
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Persistence, as: OwnerPersistence
   alias CodexPooler.Gateway.Websocket.DeliveryReceipt
-  alias CodexPooler.Platform.{ExecutionRegistry, ExecutionTerminalProof, ExecutionTerminalProofs}
+  alias CodexPooler.Platform.{ExecutionIdentity, ExecutionRegistry, ExecutionTerminalProof, ExecutionTerminalProofs}
   alias CodexPooler.Repo
   alias CodexPoolerWeb.Runtime.BackendCodexWebsocketSupport
   alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
@@ -82,9 +82,10 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   # nothing of the compaction, and resends it as full history on a new
   # connection: the first resend is the cut request's successor (findings#270
   # row 270-352). With the owner on the socket's node its own drain settles
-  # the cut request `owner_drained`; with the owner on another node nothing
-  # settles it, and the resend recovers it once the end of its executor, the
-  # socket node's response task, is proven.
+  # the cut request `owner_drained`; with the owner on another node and its
+  # proxy stopped before it finalizes the owner's answer, the resend recovers
+  # it once the end of that exact executor is proven. The opposite ordering
+  # preserves the original executor's `owner_drained` settlement below.
   def expected(cut, topology) when cut in [:drain_before_output, :drain_after_output] do
     code = if topology == :peer, do: "dead_execution_recovered", else: "owner_drained"
     [turn, _cut, successor, resume] = expected(:before_output).rows
@@ -113,6 +114,12 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     }
 
   def expected(cut, _topology), do: expected(cut)
+
+  def expected(:drain_no_resend, :peer, :finalized) do
+    %{expected(:drain_no_resend, :peer) | rows: [{@turn_endpoint, "websocket", "succeeded", nil, false}, {@compact_endpoint, "websocket", "failed", "owner_drained", false}], retries: %{before_eligible: {"failed", "owner_drained", :reservation_released}, eligible: {"failed", "owner_drained", :reservation_released}}}
+  end
+
+  def expected(cut, :peer, :finalized) when cut in [:drain_before_output, :drain_after_output], do: expected(cut, :forwarded)
 
   defp expected(:no_cut),
     do: %{
@@ -213,7 +220,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
   def run_scenario(mode, shape, topology, cut, dispatch \\ :on_arrival, opts \\ []) do
     put_owner_forwarding!(topology in [:forwarded, :peer])
     release_ref = make_ref()
-    ctx = %{mode: mode, shape: shape, topology: topology, before_drain: Keyword.get(opts, :before_drain), after_drain: Keyword.get(opts, :after_drain), proof_cleanup_probe: Keyword.get(opts, :proof_cleanup_probe)}
+    ctx = %{mode: mode, shape: shape, topology: topology, before_drain: Keyword.get(opts, :before_drain), after_drain: Keyword.get(opts, :after_drain), proof_cleanup_probe: Keyword.get(opts, :proof_cleanup_probe), execution_order: Keyword.get(opts, :execution_order), execution_order_gate: make_ref()}
 
     upstream = start_upstream(FakeUpstream.strict_sequence(upstream_sequence(ctx, cut, topology, release_ref)))
 
@@ -236,6 +243,7 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     # The owner arms the admission only once the turn's response task is done:
     # a compaction queued behind that task is admitted at its dequeue.
     if dispatch == :on_arrival, do: await_armed!(topology, setup)
+    install_cut_execution_order!(ctx, first)
     # The strict upstream expects this compaction anchored on the admitted
     # response: it is dispatched on its first send.
     first = send_frame!(first, anchored_compaction_frame(ctx))
@@ -252,6 +260,13 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
       upstream_compactions: upstream |> FakeUpstream.requests() |> Enum.count(&compaction_request?/1),
       live_rows: Enum.count(rows, &(&1.status in ["accepted", "in_progress"]))
     }
+
+    if ctx.execution_order in [:stopped, :finalized] do
+      physical = FakeUpstream.physical_counts(upstream)
+      assert physical.websocket_generation == length(rows)
+      assert physical.http_generation == 0
+      CodexPooler.TestDiagnostics.puts(fn -> "compaction_physical_generations " <> CodexPooler.JSON.encode!(%{order: ctx.execution_order, websocket_generations: physical.websocket_generation, request_count: length(rows), http_generations: 0, compaction_charges: measured.compaction_charges}) end)
+    end
 
     CodexPooler.TestDiagnostics.puts(fn -> "206-330 #{mode} #{shape} #{topology} #{cut}: #{inspect(measured)}" end)
     assert :ok = FakeUpstream.verify!(upstream)
@@ -1205,10 +1220,12 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     drains = drain_socket_node!(ctx, client)
     {client, frame} = receive_frame!(client)
     assert %{"type" => "error", "status" => 503, "error" => %{"code" => "owner_drained"}} = frame
+    await_cut_finalization!(ctx)
     # The released client drops the connection its compaction failed on.
     Mint.HTTP.close(client.conn)
     Enum.each(drains, &Task.await(&1, @detection_timeout_ms))
     assert_proxy_drain_separation!(ctx, client.cleanup_socket, :after_proxy_drain)
+    assert_cut_execution_order!(ctx, publisher)
     if is_function(ctx.after_drain, 0), do: ctx.after_drain.()
     if publisher, do: await_cut_execution_proof!(ctx, publisher)
     retries = released_client_retries!(ctx, port, fn -> :ok end)
@@ -1234,9 +1251,11 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     drains = drain_socket_node!(ctx, client)
     {client, frame} = receive_frame!(client)
     assert %{"type" => "error", "status" => 503, "error" => %{"code" => "owner_drained"}} = frame
+    await_cut_finalization!(ctx)
     Mint.HTTP.close(client.conn)
     Enum.each(drains, &Task.await(&1, @detection_timeout_ms))
     assert_proxy_drain_separation!(ctx, client.cleanup_socket, :after_proxy_drain)
+    assert_cut_execution_order!(ctx, publisher)
     publisher = await_cut_execution_proof!(ctx, publisher)
     attempt = publisher.attempt
 
@@ -1341,6 +1360,22 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
     entry = Enum.find(ActivityRegistry.activities(), &(&1.pid == task))
     refute Map.get(entry, :terminal_delivered?, false), "the compaction's terminal went out before the drain"
     assert_proxy_drain_separation!(ctx, client.cleanup_socket, :before_proxy_drain)
+
+    if ctx.execution_order == :stopped do
+      on_exit(fn ->
+        try do
+          :erlang.resume_process(task)
+        rescue
+          ArgumentError -> :ok
+        end
+      end)
+
+      # The actual provider barrier proves admission and DB work finished.
+      # Hold only the proxy awaiting its remote owner's answer, so the real
+      # watcher wins the stop before this executor can finalize that answer.
+      assert :erlang.suspend_process(task)
+    end
+
     if is_function(ctx.before_drain, 2), do: ctx.before_drain.(state, entry)
     policy = %{now_ms: fn -> System.monotonic_time(:millisecond) end, schedule_wait: &schedule_drain_wait/3, cancel_wait: &cancel_drain_wait/2, owner_post_deadline_call_budget_ms: 5_000}
     task_drain = Task.async(fn -> ActivityDrain.drain(entry, System.monotonic_time(:millisecond) - 1, policy, ActivityRegistry) end)
@@ -1352,6 +1387,84 @@ defmodule CodexPoolerWeb.Runtime.PreTurnCompactionCutScenario do
       [task_drain]
     end
   end
+
+  defp install_cut_execution_order!(%{execution_order: order} = ctx, client) when order in [:stopped, :finalized] do
+    parent = self()
+    gate = ctx.execution_order_gate
+    pool_id = ctx.setup.pool.id
+
+    # Both orders observe the actual watcher after receipt COMMIT and before
+    # the original executor ends. The finalized arm additionally lets the
+    # original executor settle the owner's answer first.
+    options = [
+      before_cancelled_coordinator_termination: fn _token, task ->
+        monitor = Process.monitor(parent)
+        if order == :finalized, do: await_compaction_settled!(pool_id, ["failed"])
+        [request] = Enum.filter(pool_requests(pool_id), &compaction_row?/1)
+        attempt = Repo.get_by!(Attempt, request_id: request.id)
+        receipt = attempt.response_metadata["downstream_delivery"]
+        facts = %{original_actor_matches: attempt.owner_process_id == List.to_string(:erlang.pid_to_list(task)), original_alive: ExecutionIdentity.status(attempt) == :alive, proof_absent: not ExecutionTerminalProofs.terminal?(attempt), receipt: Map.take(receipt || %{}, ["outcome", "terminal_class"]), outside_transaction: not Repo.in_transaction?(), request_status: request.status, error_code: request.last_error_code}
+        send(parent, {:compaction_cut_receipt_committed, gate, self(), facts})
+
+        receive do
+          {:release_compaction_cut, ^gate} -> :ok
+          {:DOWN, ^monitor, :process, ^parent, _reason} -> :ok
+        after
+          @detection_timeout_ms -> flunk("compaction cut receipt observation was not released")
+        end
+
+        Process.demonitor(monitor, [:flush])
+      end
+    ]
+
+    :sys.replace_state(client.cleanup_socket, fn {name, data} ->
+      state = Map.put(data.connection.websock_state, :response_task_start_options, options)
+      {name, %{data | connection: %{data.connection | websock_state: state}}}
+    end)
+  end
+
+  defp install_cut_execution_order!(_ctx, _client), do: :ok
+
+  defp await_cut_finalization!(%{execution_order: order, execution_order_gate: gate}) when order in [:stopped, :finalized] do
+    assert_receive {:compaction_cut_receipt_committed, ^gate, watcher, facts}, @detection_timeout_ms
+
+    try do
+      assert facts.original_actor_matches and facts.original_alive and facts.proof_absent and facts.outside_transaction
+      assert facts.receipt == %{"outcome" => "aborted", "terminal_class" => "error"}
+      assert {facts.request_status, facts.error_code} == if(order == :stopped, do: {"in_progress", nil}, else: {"failed", "owner_drained"})
+      CodexPooler.TestDiagnostics.puts(fn -> "compaction_receipt_before_executor_end " <> CodexPooler.JSON.encode!(Map.put(facts, :order, order)) end)
+    after
+      send(watcher, {:release_compaction_cut, gate})
+    end
+  end
+
+  defp await_cut_finalization!(_ctx), do: :ok
+
+  defp assert_cut_execution_order!(%{execution_order: order}, %{attempt: attempt}) when order in [:stopped, :finalized] do
+    request = Repo.get!(Request, attempt.request_id)
+    attempt = Repo.reload!(attempt)
+    turn = Repo.get_by!(CodexTurn, request_id: request.id)
+    receipt = attempt.response_metadata["downstream_delivery"]
+    assert receipt["outcome"] == "aborted"
+    assert receipt["terminal_class"] == "error"
+    assert charges(request) == 0
+    assert ExecutionIdentity.status(attempt) == :dead
+    refute ExecutionTerminalProofs.terminal?(attempt)
+
+    if order == :stopped do
+      assert request.status == "in_progress"
+      assert request.last_error_code == nil
+      assert attempt.status == "in_progress"
+    else
+      assert {request.status, request.last_error_code, turn.status} == {"failed", "owner_drained", "interrupted"}
+      assert request.usage_status == "usage_unknown"
+      assert attempt.status == "failed"
+    end
+
+    CodexPooler.TestDiagnostics.puts(fn -> "compaction_executor_order " <> CodexPooler.JSON.encode!(%{order: order, request_id: request.id, attempt_id: attempt.id, execution_id: attempt.owner_execution_id, request_status: request.status, attempt_status: attempt.status, error_code: request.last_error_code, original_executor_dead: true, receipt_committed_before_proof: true, receipt_terminal: receipt["terminal_class"], proof_not_yet_published: true, charges: 0}) end)
+  end
+
+  defp assert_cut_execution_order!(_ctx, _publisher), do: :ok
 
   defp assert_proxy_drain_separation!(%{topology: :peer} = ctx, socket, phase) do
     owner = owner_pid!(ctx.setup)

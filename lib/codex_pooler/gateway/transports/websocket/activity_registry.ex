@@ -109,6 +109,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   @spec delivery_receipt_token(receipt_identity(), keyword()) :: {:ok, token()} | :unknown
   def delivery_receipt_token(identity, opts \\ []), do: GenServer.call(server(opts), {:delivery_receipt_token, identity})
 
+  @doc false
+  @spec accepted_delivery_receipt(token(), map(), keyword()) :: {:accepted, :pending | :finished} | :unpublished | {:error, atom()}
+  def accepted_delivery_receipt(token, context, opts \\ []), do: GenServer.call(server(opts), {:accepted_delivery_receipt, token, context})
+
   @spec publish_delivery_receipt(token(), map(), map(), term(), keyword()) :: :ok | {:error, atom()}
   def publish_delivery_receipt(token, context, receipt, recipient, opts \\ []), do: GenServer.call(server(opts), {:publish_delivery_receipt, token, context, receipt, recipient})
 
@@ -271,6 +275,28 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
         {token, %{socket: ^socket, identity: ^identity}} -> {:ok, token}
         _ -> nil
       end)
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:accepted_delivery_receipt, token, context}, {socket, _}, state) do
+    result =
+      case Map.get(state.delivery_receipts, token) do
+        %{socket: ^socket, envelope: %{context: ^context}, finished?: false} ->
+          {:accepted, :pending}
+
+        %{socket: ^socket, envelope: %{context: ^context}, finished?: true, result: :ok} ->
+          {:accepted, :finished}
+
+        %{socket: ^socket, envelope: %{context: ^context}, finished?: true} ->
+          {:error, :receipt_not_persisted}
+
+        %{socket: ^socket, identity: identity, envelope: nil} ->
+          if Map.take(context, [:request_id, :attempt_id, :replay_generation]) == identity, do: :unpublished, else: {:error, :identity_mismatch}
+
+        _ ->
+          {:error, :unknown_delivery}
+      end
 
     {:reply, result, state}
   end

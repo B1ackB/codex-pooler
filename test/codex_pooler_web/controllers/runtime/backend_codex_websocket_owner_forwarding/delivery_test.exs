@@ -12,10 +12,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
 
   alias CodexPooler.Access
   alias CodexPooler.Accounting.Attempt
+  alias CodexPooler.Accounting.LedgerEntry
   alias CodexPooler.Accounting.Request
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.BridgeDemotion
+  alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Websocket, as: Gateway
@@ -94,9 +96,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
                      state
                    )
 
+          task_monitors = Map.new(state.tasks, &{&1, Process.monitor(&1)})
           assert {:push, {:text, ^delta_frame}, state} = receive_owner_socket_push(state)
           assert {:push, {:text, ^terminal_frame}, state} = receive_owner_socket_push(state)
-          settle_owner_socket_turn(state)
+          state = settle_owner_socket_turn(state)
+          await_owner_delivery_receipt!(task_monitors)
+          state
         end)
 
       assert MapSet.size(state.tasks) == 0
@@ -124,6 +129,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
                "websocket downstream terminal pushed request_id=#{request_log.id} " <>
                  "codex_session_id=#{state.codex_session.id} outcome=delivered " <>
                  "terminal_class=response.completed frames_after_visible=2"
+
+      assert length(Regex.scan(~r/websocket downstream terminal pushed request_id=#{request_log.id} /, logs)) == 1
+      assert Repo.aggregate(from(e in LedgerEntry, where: e.request_id == ^request_log.id and e.entry_kind == "settlement"), :count) == 1
 
       assert_no_leak!(
         "owner delivery receipt",
@@ -777,6 +785,50 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
     case CodexResponsesSocket.handle_info(message, state) do
       {:ok, state} -> state
       {:push, {:text, _frame}, state} -> state
+    end
+  end
+
+  # Socket bookkeeping ends when it hands delivery to the registered actor.
+  # Keep capture open until that exact receipt finishes, including a fallback
+  # actor if the original response task exits before persisting it.
+  defp await_owner_delivery_receipt!(task_monitors) do
+    socket = self()
+    deadline = System.monotonic_time(:millisecond) + @handoff_detection_timeout_ms
+
+    assert [{token, %{identity: identity, task: task}}] =
+             for(
+               {token, entry} <- :sys.get_state(ActivityRegistry).delivery_receipts,
+               entry.socket == socket and is_map_key(task_monitors, entry.task),
+               do: {token, entry}
+             )
+
+    actor = await_owner_delivery_receipt!(token, identity, task, deadline)
+    actor_monitor = Process.monitor(actor)
+
+    for {pid, monitor} <- Map.put_new(task_monitors, actor, actor_monitor) do
+      assert_receive {:DOWN, ^monitor, :process, ^pid, _reason}, max(deadline - System.monotonic_time(:millisecond), 0)
+    end
+
+    Process.demonitor(actor_monitor, [:flush])
+  end
+
+  defp await_owner_delivery_receipt!(token, identity, task, deadline) do
+    assert %{identity: ^identity, task: ^task, socket: socket, actor: actor} = receipt = :sys.get_state(ActivityRegistry).delivery_receipts[token]
+    assert socket == self()
+    assert is_pid(actor)
+
+    case receipt do
+      %{finished?: true, result: result, actor: ^actor} ->
+        assert result == :ok
+        actor
+
+      _pending ->
+        assert System.monotonic_time(:millisecond) < deadline, "expected the registered downstream receipt to finish"
+
+        receive do
+        after
+          1 -> await_owner_delivery_receipt!(token, identity, task, deadline)
+        end
     end
   end
 

@@ -224,6 +224,56 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ReceiptSettlementDrainTest do
     assert :sys.get_state(ctx.registry).delivery_receipts[token].result == {:error, :receipt_not_persisted}
   end
 
+  test "accepted receipt lookup preserves the original packet and pending actor through late fallback checks", ctx do
+    {:ok, token} = ActivityRegistry.enroll_delivery_receipt(self(), ctx.identity, name: ctx.registry)
+    context = Map.put(ctx.identity, :codex_session_id, Ecto.UUID.generate())
+    receipt = DeliveryReceipt.build(%{outcome: "aborted", terminal_class: "error", highest_frame_class: "terminal"})
+    assert :unpublished = ActivityRegistry.accepted_delivery_receipt(token, context, name: ctx.registry)
+    :ok = ActivityRegistry.publish_delivery_receipt(token, context, receipt, {:native, self(), ctx.identity, :aborted}, name: ctx.registry)
+    assert_receive {:"$gen_cast", {:delivery_complete, _, :aborted, envelope}}
+    before = :sys.get_state(ctx.registry)
+    assert {:accepted, :pending} = ActivityRegistry.accepted_delivery_receipt(token, context, name: ctx.registry)
+    assert :sys.get_state(ctx.registry) == before
+    assert {:ok, remaining} = ActivityRegistry.claim_delivery_receipt(token, name: ctx.registry, envelope: envelope)
+    assert remaining > 0
+    weaker = DeliveryReceipt.build(%{outcome: "aborted"})
+    stronger = DeliveryReceipt.build(%{outcome: "delivered", terminal_class: "response.completed"})
+
+    for replacement <- [weaker, stronger] do
+      assert {:error, :unknown_delivery} = ActivityRegistry.publish_delivery_receipt(token, context, replacement, :fallback, name: ctx.registry)
+      assert {:error, :stale_delivery} = ActivityRegistry.claim_delivery_receipt(token, name: ctx.registry, envelope: %{envelope | receipt: replacement})
+    end
+
+    assert :sys.get_state(ctx.registry) == before
+    :ok = ActivityRegistry.finish_delivery_receipt(token, :ok, name: ctx.registry)
+    assert {:accepted, :finished} = ActivityRegistry.accepted_delivery_receipt(token, context, name: ctx.registry)
+    next_identity = %{ctx.identity | request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate()}
+    {:ok, next_token} = ActivityRegistry.enroll_delivery_receipt(self(), next_identity, name: ctx.registry)
+    assert {:error, :unknown_delivery} = ActivityRegistry.accepted_delivery_receipt(token, context, name: ctx.registry)
+    assert {:error, :unknown_delivery} = ActivityRegistry.publish_delivery_receipt(token, context, receipt, :fallback, name: ctx.registry)
+    :ok = ActivityRegistry.abandon_delivery_receipt(next_token, name: ctx.registry)
+  end
+
+  test "accepted receipt lookup rejects every foreign context and caller without completing pending work", ctx do
+    {:ok, token} = ActivityRegistry.enroll_delivery_receipt(self(), ctx.identity, name: ctx.registry)
+    context = Map.put(ctx.identity, :codex_session_id, Ecto.UUID.generate())
+    receipt = DeliveryReceipt.build(%{outcome: "aborted"})
+    :ok = ActivityRegistry.publish_delivery_receipt(token, context, receipt, {:native, self(), ctx.identity, :aborted}, name: ctx.registry)
+
+    for field <- [:request_id, :attempt_id, :replay_generation, :codex_session_id] do
+      value = if field == :replay_generation, do: 1, else: Ecto.UUID.generate()
+      assert {:error, :unknown_delivery} = ActivityRegistry.accepted_delivery_receipt(token, Map.put(context, field, value), name: ctx.registry)
+    end
+
+    assert {:error, :unknown_delivery} = ActivityRegistry.accepted_delivery_receipt(make_ref(), context, name: ctx.registry)
+    assert {:error, :unknown_delivery} = ActivityRegistry.accepted_delivery_receipt(token, Map.put(context, :extra, :field), name: ctx.registry)
+    caller = Task.async(fn -> ActivityRegistry.accepted_delivery_receipt(token, context, name: ctx.registry) end)
+    assert {:error, :unknown_delivery} = Task.await(caller)
+    assert {:accepted, :pending} = ActivityRegistry.accepted_delivery_receipt(token, context, name: ctx.registry)
+    assert :ok = ActivityRegistry.finish_delivery_receipt(token, {:error, :actual_persistence_failure}, name: ctx.registry)
+    assert {:error, :receipt_not_persisted} = ActivityRegistry.accepted_delivery_receipt(token, context, name: ctx.registry)
+  end
+
   test "an initially empty receipt cohort waits for the accepted producer handoff", ctx do
     %{registry: registry, identity: identity} = ctx
     assert {:ok, producer} = ActivityRegistry.begin_receipt_producer(identity, name: registry)

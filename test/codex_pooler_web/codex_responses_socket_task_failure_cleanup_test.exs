@@ -8,7 +8,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
   alias CodexPooler.Gateway.Runtime.Finalization.Interruption
   alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
   alias CodexPooler.Gateway.Websocket, as: Gateway
-  alias CodexPooler.Gateway.Websocket.DirectCleanup
+  alias CodexPooler.Gateway.Websocket.{DeliveryReceiptHandoff, DirectCleanup}
   alias CodexPooler.Platform.ExecutionIdentity
   alias CodexPoolerWeb.CodexResponsesSocket
   alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
@@ -16,7 +16,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
 
   test "delivery cleanup preserves a failed task after database finalization recovers" do
     fixture = fixture()
-    {context, token, state} = cleanup_fixture(fixture)
+    {context, token, state, monitor} = cleanup_fixture(fixture)
     send(context.task, :fail_finalization)
     assert_receive {:finalization_failed, task}, 15_000
     assert Repo.reload!(fixture.request).status == "in_progress"
@@ -32,6 +32,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
     assert_receive {:websocket_response_delivery_complete, _, ^token} = delivery
     assert {:ok, state} = CodexResponsesSocket.handle_info(delivery, state)
     assert state.tasks == MapSet.new()
+    await_cleanup_delivery!(context, monitor, fixture)
     assert {:ok, %ClientRetry.SuccessorClaim{}} = claim(fixture)
     assert Repo.reload!(fixture.request).last_error_code == "owner_task_exception"
     assert Repo.reload!(fixture.attempt).network_error_code == "owner_task_exception"
@@ -91,7 +92,8 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
 
   test "ordinary cancellation preserves its settlement and admits an identical successor" do
     fixture = fixture()
-    {context, token, state} = cleanup_fixture(fixture)
+    {context, token, state, monitor} = cleanup_fixture(fixture)
+    state = Map.put(state, :response_task_delivery_outcomes, %{context.task => :aborted})
 
     assert {:ok, _state} =
              CodexResponsesSocket.handle_info(
@@ -99,6 +101,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
                state
              )
 
+    await_cleanup_delivery!(context, monitor, fixture)
     assert Repo.reload!(fixture.request).last_error_code == "client_disconnected"
     assert {:ok, %ClientRetry.SuccessorClaim{predecessor_request_id: predecessor_id, link: link}} = claim(fixture)
     assert predecessor_id == fixture.request.id
@@ -108,7 +111,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
 
   test "a prior durable terminal is not rewritten by delayed task failure cleanup" do
     fixture = fixture()
-    {context, token, state} = cleanup_fixture(fixture)
+    {context, token, state, monitor} = cleanup_fixture(fixture)
     assert :ok = DirectCleanup.interrupt(fixture.receipt, "client_disconnected")
     before = Repo.reload!(fixture.request)
     state = Map.put(state, :response_task_cleanup_results, %{context.task => :task_exception})
@@ -119,6 +122,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
                state
              )
 
+    await_cleanup_delivery!(context, monitor, fixture)
     assert Repo.reload!(fixture.request) == before
     assert {:ok, %ClientRetry.SuccessorClaim{predecessor_request_id: predecessor_id, link: link}} = claim(fixture)
     assert predecessor_id == fixture.request.id
@@ -136,7 +140,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
 
   test "failed cleanup releases socket tracking without rewriting the request" do
     fixture = fixture()
-    {context, token, state} = cleanup_fixture(fixture)
+    {context, token, state, monitor} = cleanup_fixture(fixture)
 
     state =
       state
@@ -158,6 +162,8 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
           assert cleaned.direct_cleanup_contexts == %{}
           Repo.rollback(:injected_failure)
         end)
+
+        await_cleanup_delivery!(context, monitor, fixture, :unassigned)
       end)
 
     assert logs =~ "websocket response task exception finalization failed"
@@ -169,19 +175,17 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
   for opts_kind <- [:normalized, :plain_map] do
     test "socket termination retains the verified task exception cause with #{opts_kind} options" do
       fixture = fixture()
-      {context, _token, state} = cleanup_fixture(fixture)
+      {context, _token, state, monitor} = cleanup_fixture(fixture)
       state = if unquote(opts_kind) == :plain_map, do: %{state | opts: %{}}, else: state
       send(context.task, :fail_finalization)
       assert_receive {:finalization_failed, task}, 15_000
       state = Map.put(state, :response_task_cleanup_results, %{task => :task_exception})
-      monitor = Process.monitor(task)
       # The fixture obeys the real delivery acknowledgement instead of waiting
       # for the socket's cancellation budget to kill an unresponsive fake task.
       # The exception cause is written by the session cleanup, which can
       # outlast terminate/2.
       assert :ok = WebsocketCleanupFence.terminate_and_await!(:normal, state)
-      assert_receive {:cleanup_delivery_acknowledged, ^task}, 15_000
-      assert_receive {:DOWN, ^monitor, :process, ^task, :normal}, 15_000
+      await_cleanup_delivery!(context, monitor, fixture)
       assert Repo.reload!(fixture.request).last_error_code == "owner_task_exception"
       assert {:ok, %ClientRetry.SuccessorClaim{}} = claim(fixture)
     end
@@ -192,52 +196,36 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
     parent = self()
 
     task =
-      start_supervised!({Task,
-       fn ->
-         context = %DirectCleanup{
-           registry: registry,
-           task: self(),
-           parent: parent,
-           ref: make_ref(),
-           session_id: fixture.session.id
-         }
+      start_supervised!(
+        {Task,
+         fn ->
+           context = %DirectCleanup{
+             registry: registry,
+             task: self(),
+             parent: parent,
+             ref: make_ref(),
+             session_id: fixture.session.id
+           }
 
-         {:ok, token} =
-           ActivityRegistry.register(:direct, self(),
-             name: registry,
-             direct_cleanup_ref: context.ref,
-             direct_cleanup_parent: parent
-           )
+           {:ok, token} =
+             ActivityRegistry.register(:direct, self(),
+               name: registry,
+               direct_cleanup_ref: context.ref,
+               direct_cleanup_parent: parent
+             )
 
-         :ok = ActivityRegistry.admit(token, name: registry)
-         :ok = ActivityRegistry.begin_direct_cleanup(context)
-         :ok = DirectCleanup.bind(context, fixture.request)
-         :ok = DirectCleanup.attempt_callback(context, fixture.request).(fixture.attempt)
-         :ok = ActivityRegistry.ready_direct_cleanup(context)
-         send(parent, {:cleanup_ready, context, token})
+           :ok = ActivityRegistry.admit(token, name: registry)
+           :ok = ActivityRegistry.begin_direct_cleanup(context)
+           :ok = DirectCleanup.bind(context, fixture.request)
+           :ok = DirectCleanup.attempt_callback(context, fixture.request).(fixture.attempt)
+           :ok = ActivityRegistry.ready_direct_cleanup(context)
+           send(parent, {:cleanup_ready, context, token})
 
-         receive do
-           :fail_finalization ->
-             # The transaction restores the relation even when finalization raises.
-             assert_raise Postgrex.Error, fn ->
-               Repo.transaction(fn ->
-                 Repo.query!("ALTER TABLE requests RENAME TO task_failure_unavailable_requests")
-                 DirectCleanup.fail_task_exception(context, "owner_task_exception")
-               end)
-             end
+           cleanup_delivery_loop(context, token, parent)
+         end}
+      )
 
-             send(parent, {:finalization_failed, self()})
-         end
-
-         receive do
-           {:websocket_response_delivery_ack, ^token, :aborted} ->
-             send(parent, {:cleanup_delivery_acknowledged, self()})
-
-           :stop ->
-             :ok
-         end
-       end})
-
+    monitor = Process.monitor(task)
     assert_receive {:cleanup_ready, context, token}, 15_000
 
     state = %{
@@ -253,7 +241,66 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTaskFailureCleanupTest do
       direct_cleanup_receipts: %{task => fixture.receipt}
     }
 
-    {context, token, state}
+    {context, token, state, monitor}
+  end
+
+  defp cleanup_delivery_loop(context, token, parent) do
+    receive do
+      :fail_finalization ->
+        # The transaction restores the relation even when finalization raises.
+        assert_raise Postgrex.Error, fn ->
+          Repo.transaction(fn ->
+            Repo.query!("ALTER TABLE requests RENAME TO task_failure_unavailable_requests")
+            DirectCleanup.fail_task_exception(context, "owner_task_exception")
+          end)
+        end
+
+        send(parent, {:finalization_failed, self()})
+        cleanup_delivery_loop(context, token, parent)
+
+      {:websocket_response_delivery_ack, ^token, _outcome, envelope} ->
+        assert envelope.registry == context.registry
+        assert :ok = DeliveryReceiptHandoff.settle(envelope)
+        send(parent, {:cleanup_delivery_acknowledged, self()})
+
+      {:websocket_response_delivery_ack, ^token} ->
+        # The missing-receipt failure case takes the socket's legacy ACK path.
+        # No actor was assigned; retire only this task's unused enrollment.
+        {receipt_token, entry} = cleanup_receipt(context)
+        assert %{envelope: nil, actor: nil, finished?: false} = entry
+        assert :ok = DeliveryReceiptHandoff.abandon(receipt_token, name: context.registry)
+        send(parent, {:cleanup_delivery_unassigned, self()})
+    end
+  end
+
+  defp await_cleanup_delivery!(context, monitor, fixture, expected \\ :persisted) do
+    task = context.task
+
+    case expected do
+      :persisted ->
+        assert_receive {:cleanup_delivery_acknowledged, ^task}, 15_000
+        {_receipt_token, entry} = cleanup_receipt(context)
+        assert %{actor: ^task, finished?: true, result: :ok} = entry
+        assert entry.identity == Map.take(fixture.receipt, [:request_id, :attempt_id, :replay_generation])
+        assert is_map(Repo.reload!(fixture.attempt).response_metadata["downstream_delivery"])
+
+      :unassigned ->
+        assert_receive {:cleanup_delivery_unassigned, ^task}, 15_000
+        assert :sys.get_state(context.registry).delivery_receipts == %{}
+        refute Map.has_key?(Repo.reload!(fixture.attempt).response_metadata, "downstream_delivery")
+    end
+
+    assert_receive {:DOWN, ^monitor, :process, ^task, :normal}, 15_000
+    # The private registry is outside the global sandbox cleanup fence.
+    # Its real receipt and actor are finished before either owner can stop.
+    stop_supervised!({ActivityRegistry, nil})
+  end
+
+  defp cleanup_receipt(context) do
+    [{token, entry}] = Map.to_list(:sys.get_state(context.registry).delivery_receipts)
+    assert entry.task == context.task
+    assert entry.socket == context.parent
+    {token, entry}
   end
 
   defp fixture(claim_kind \\ :turn) do

@@ -123,6 +123,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.TerminateD
       assert_receive {:local_completion_held, ^task, gate_ref}, @detection_timeout_ms
       assert gate_ref == gate.ref
       assert ActivityRegistry.delivery_target(task) == :unknown
+      receipt_fence = observe_receipt_completion!(socket, task, request_id, attempt_id)
 
       {:ok, log} =
         with_info_log(fn ->
@@ -133,6 +134,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.TerminateD
           WebsocketCleanupFence.await_listener_socket_cleanup!(socket)
           assert_receive {:DOWN, ^socket_monitor, :process, ^socket, _reason}, @detection_timeout_ms
           assert_receive {:DOWN, ^task_monitor, :process, ^task, _reason}, @detection_timeout_ms
+          await_receipt_completion!(receipt_fence)
           :ok
         end)
 
@@ -176,6 +178,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.TerminateD
     refute Map.has_key?(Map.get(state, :response_task_activities, %{}), task)
     task_monitor = Process.monitor(task)
     socket_monitor = Process.monitor(socket)
+    receipt_fence = observe_receipt_completion!(socket, task, request_id, attempt_id)
 
     {:ok, log} =
       with_info_log(fn ->
@@ -186,6 +189,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.TerminateD
         assert_receive {:DOWN, ^task_monitor, :process, ^task, :normal}, @detection_timeout_ms
         WebsocketCleanupFence.await_listener_socket_cleanup!(socket)
         assert_receive {:DOWN, ^socket_monitor, :process, ^socket, _reason}, @detection_timeout_ms
+        await_receipt_completion!(receipt_fence)
         :ok
       end)
 
@@ -334,6 +338,60 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.TerminateD
   defp assert_exact_ledger!(request_id) do
     kinds = Repo.all(from entry in LedgerEntry, where: entry.request_id == ^request_id, select: entry.entry_kind)
     assert Enum.sort(kinds) == ["release", "reservation", "settlement"]
+  end
+
+  # A closing socket removes its registry receipt after the writer finishes.
+  # Observe that exact actor's accepted claim and successful finish reply before
+  # the entry disappears; socket/original-task DOWN does not fence a fallback.
+  defp observe_receipt_completion!(socket, task, request_id, attempt_id) do
+    assert [{token, %{identity: identity}}] =
+             for(
+               {token, entry} <- :sys.get_state(ActivityRegistry).delivery_receipts,
+               entry.socket == socket and entry.task == task and entry.identity.request_id == request_id and entry.identity.attempt_id == attempt_id,
+               do: {token, entry}
+             )
+
+    ref = make_ref()
+    registry = Process.whereis(ActivityRegistry)
+    on_exit(fn -> :sys.remove(registry, ref) end)
+    observer = %{test: self(), ref: ref, token: token, identity: identity, socket: socket, task: task, actor: nil, pending: nil}
+    :ok = :sys.install(registry, {ref, &observe_receipt_completion/3, observer})
+    %{ref: ref, token: token, identity: identity}
+  end
+
+  defp observe_receipt_completion(%{token: token} = observer, {:in, {:"$gen_call", from, {:claim_delivery_receipt, token, _envelope}}}, _name),
+    do: %{observer | pending: {:claim, from}}
+
+  defp observe_receipt_completion(%{pending: {:claim, from}, token: token, identity: identity, socket: socket, task: task} = observer, {:out, {:ok, _budget}, from, state}, _name) do
+    {actor, _reply_ref} = from
+
+    case state.delivery_receipts[token] do
+      %{identity: ^identity, socket: ^socket, task: ^task, actor: ^actor, finished?: false} -> %{observer | actor: actor, pending: nil}
+      _unaccepted -> observer
+    end
+  end
+
+  defp observe_receipt_completion(%{token: token, actor: actor} = observer, {:in, {:"$gen_call", {actor, _reply_ref} = from, {:finish_delivery_receipt, token, result}}}, _name),
+    do: %{observer | pending: {:finish, from, result}}
+
+  defp observe_receipt_completion(%{pending: {:finish, from, result}} = observer, {:out, :ok, from, state}, _name) do
+    completed =
+      case state.delivery_receipts[observer.token] do
+        nil -> not Process.alive?(observer.socket)
+        entry -> entry.identity == observer.identity and entry.actor == observer.actor and entry.finished? and entry.result == :ok
+      end
+
+    send(observer.test, {:registered_receipt_finished, observer.ref, observer.token, observer.identity, observer.actor, result, completed})
+    :done
+  end
+
+  defp observe_receipt_completion(observer, _event, _name), do: observer
+
+  defp await_receipt_completion!(%{ref: ref, token: token, identity: identity}) do
+    assert_receive {:registered_receipt_finished, ^ref, ^token, ^identity, actor, :ok, true}, @detection_timeout_ms
+    monitor = Process.monitor(actor)
+    assert_receive {:DOWN, ^monitor, :process, ^actor, reason}, @detection_timeout_ms
+    assert reason in [:normal, :noproc]
   end
 
   defp turn_payload(setup, turn_id, content) do

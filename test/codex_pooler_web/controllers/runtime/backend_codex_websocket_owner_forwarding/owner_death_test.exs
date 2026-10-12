@@ -24,6 +24,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerDeath
   alias CodexPooler.Gateway.Persistence.BridgeSessionAlias
   alias CodexPooler.Gateway.Persistence.CodexSession
   alias CodexPooler.Gateway.Persistence.CodexTurn
+  alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.TerminalDiscriminator
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
@@ -1312,28 +1313,36 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerDeath
       owner = socket_connection_state!(socket).websocket_owner_pid
       if peer, do: assert(node(owner) == peer.node and node(owner) != node())
       owner_ref = Process.monitor(owner)
+      upstream_pid = if peer, do: :sys.get_state(owner).upstream_pid
+      upstream_monitor = if peer, do: Process.monitor(upstream_pid)
 
-      if unquote(control) == :remote_502 do
-        execution_ids = Repo.all(from a in Attempt, join: r in Request, on: r.id == a.request_id, where: r.pool_id == ^setup.pool.id, select: a.owner_execution_id)
-        on_exit(fn -> Repo.delete_all(from p in ExecutionTerminalProof, where: p.execution_id in ^execution_ids) end)
-        :ok = :sys.suspend(socket)
+      receipt_hold =
+        if unquote(control) == :remote_502 do
+          execution_ids = Repo.all(from a in Attempt, join: r in Request, on: r.id == a.request_id, where: r.pool_id == ^setup.pool.id, select: a.owner_execution_id)
+          on_exit(fn -> Repo.delete_all(from p in ExecutionTerminalProof, where: p.execution_id in ^execution_ids) end)
+          :ok = :sys.suspend(socket)
 
-        on_exit(fn ->
-          try do
-            :sys.resume(socket)
-          catch
-            :exit, _gone -> :ok
-          end
-        end)
+          on_exit(fn ->
+            try do
+              :sys.resume(socket)
+            catch
+              :exit, _gone -> :ok
+            end
+          end)
 
-        Process.exit(owner, :kill)
-        assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, @detection_timeout_ms
-        await_proven_owner_502!(setup.pool.id)
-        :ok = :sys.resume(socket)
-      else
-        Process.exit(:sys.get_state(owner).upstream_pid, :kill)
-        assert_receive {:DOWN, ^owner_ref, :process, ^owner, :owner_crashed}, @detection_timeout_ms
-      end
+          Process.exit(owner, :kill)
+          assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, @detection_timeout_ms
+          await_proven_owner_502!(setup.pool.id)
+          predecessor = Repo.one!(from r in Request, where: r.pool_id == ^setup.pool.id and r.last_error_code == "owner_crashed")
+          attempt = Repo.get_by!(Attempt, request_id: predecessor.id)
+          hold = hold_owner_receipt!(attempt, socket)
+          :ok = :sys.resume(socket)
+          hold
+        else
+          Process.exit(:sys.get_state(owner).upstream_pid, :kill)
+          assert_receive {:DOWN, ^owner_ref, :process, ^owner, :owner_crashed}, @detection_timeout_ms
+          nil
+        end
 
       {conn, _websocket, frames} = receive_frames_until_close!(conn, websocket, ref)
       assert List.last(frames) == {:close, 1011, "websocket owner crashed"}
@@ -1347,6 +1356,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerDeath
       expected_status = if unquote(control) == :remote_502, do: 502, else: 499
       assert {predecessor.status, predecessor.last_error_code, predecessor.response_status_code} == {"failed", "owner_crashed", expected_status}
       attempt = Repo.get_by!(Attempt, request_id: predecessor.id)
+
+      if peer do
+        assert_receive {:DOWN, ^upstream_monitor, :process, ^upstream_pid, _reason}, @detection_timeout_ms
+        prove_held_owner_receipt!(receipt_hold, attempt, socket)
+      end
+
       :ok = await_execution_proof!(attempt, System.monotonic_time(:millisecond) + 2_000)
       assert ExecutionTerminalProofs.terminal?(attempt)
       assert attempt.replay_generation == 0
@@ -1502,12 +1517,109 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerDeath
     end
   end
 
+  defp hold_owner_receipt!(attempt, socket) do
+    assert attempt.owner_instance_id == Atom.to_string(node())
+    executor = attempt.owner_process_id |> String.to_charlist() |> :erlang.list_to_pid()
+    assert ExecutionRegistry.status(attempt.owner_execution_id, executor) == :alive
+    hold = make_ref()
+    test_pid = self()
+    claim = :atomics.new(1, [])
+    handler = {__MODULE__, :receipt_commit_hold, hold}
+
+    on_exit(fn ->
+      :telemetry.detach(handler)
+      send(executor, {hold, :release})
+    end)
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if self() == executor and metadata.query == "begin" and :atomics.compare_exchange(claim, 1, 0, 1) == :ok do
+            {token, entry} = Enum.find(:sys.get_state(ActivityRegistry).delivery_receipts, fn {_token, entry} -> entry.identity.attempt_id == attempt.id end)
+            send(test_pid, {hold, :receipt_transaction, self(), token, Map.take(entry, [:task, :actor, :socket, :identity, :finished?]), elem(metadata.result, 1).connection_id})
+
+            receive do
+              {^hold, :release} -> :ok
+            after
+              @detection_timeout_ms -> raise "owner receipt transaction was not released"
+            end
+          end
+
+          if self() == executor and metadata.query == "commit" and :atomics.get(claim, 1) == 1 do
+            send(test_pid, {hold, :receipt_commit, self()})
+          end
+        end,
+        nil
+      )
+
+    %{ref: hold, executor: executor, monitor: Process.monitor(executor), socket: socket}
+  end
+
+  defp prove_held_owner_receipt!(%{ref: hold, executor: executor, monitor: monitor}, attempt, socket) do
+    assert_receive {^hold, :receipt_transaction, ^executor, token, entry, backend}, @detection_timeout_ms
+    assert is_reference(token)
+    assert %{rows: [["idle in transaction", true]]} = Repo.query!("SELECT state, xact_start IS NOT NULL FROM pg_stat_activity WHERE pid = $1", [backend])
+    assert entry == %{task: executor, actor: executor, socket: socket, identity: %{request_id: attempt.request_id, attempt_id: attempt.id, replay_generation: attempt.replay_generation}, finished?: false}
+    assert ExecutionIdentity.status(attempt) == :alive
+    assert ExecutionRegistry.pending_proofs([attempt.owner_execution_id]) == []
+    refute ExecutionTerminalProofs.terminal?(attempt)
+    refute Map.has_key?(Repo.reload!(attempt).response_metadata, "downstream_delivery")
+    CodexPooler.TestDiagnostics.puts("owner_receipt_boundary phase=held real_transaction=true exact_actor=true exact_task=true exact_generation=true socket_close=1011 upstream_down=true execution=alive proof=false receipt_committed=false")
+    # The same deadline bounds an executor that remains alive. A socket close
+    # alone must neither publish its proof nor authorize another attempt.
+    started_at = System.monotonic_time(:millisecond)
+    assert_raise ExUnit.AssertionError, ~r/terminal proof was not available before the deadline/, fn -> await_execution_proof!(attempt, started_at + 2_000) end
+    assert System.monotonic_time(:millisecond) - started_at >= 2_000
+    assert ExecutionIdentity.status(attempt) == :alive
+    assert ExecutionRegistry.pending_proofs([attempt.owner_execution_id]) == []
+    refute ExecutionTerminalProofs.terminal?(attempt)
+    assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^attempt.request_id), :count) == 1
+    CodexPooler.TestDiagnostics.puts("owner_receipt_boundary phase=deadline alive=true proof=false attempt_count=1 original_budget_ms=2000")
+
+    # Observe two real registry calls by this waiter. The second proves it
+    # consumed :alive and kept waiting before the receipt is allowed to commit.
+    registry = Process.whereis(ExecutionRegistry)
+    assert {:flags, []} = :erlang.trace_info(registry, :flags)
+    on_exit(fn -> :erlang.trace(registry, false, [:receive]) end)
+    assert 1 = :erlang.trace(registry, true, [:receive])
+    waiter = Task.async(fn -> await_execution_proof!(attempt, System.monotonic_time(:millisecond) + 2_000) end)
+    execution_id = attempt.owner_execution_id
+    waiter_pid = waiter.pid
+
+    try do
+      for _observation <- 1..2 do
+        assert_receive {:trace, ^registry, :receive, {:"$gen_call", {^waiter_pid, _reply}, {:status, ^execution_id, ^executor}}}, @detection_timeout_ms
+      end
+
+      send(executor, {hold, :release})
+      assert :ok = Task.await(waiter, @detection_timeout_ms)
+    after
+      :erlang.trace(registry, false, [:receive])
+      send(executor, {hold, :release})
+    end
+
+    assert_receive {^hold, :receipt_commit, ^executor}, @detection_timeout_ms
+    assert_receive {:DOWN, ^monitor, :process, ^executor, :normal}, @detection_timeout_ms
+    assert ExecutionIdentity.status(attempt) == :dead
+    assert %{"outcome" => "aborted"} = Repo.reload!(attempt).response_metadata["downstream_delivery"]
+    CodexPooler.TestDiagnostics.puts("owner_receipt_boundary phase=released real_commit=true original_executor_down=true execution=dead receipt_committed=true")
+  end
+
   defp await_execution_proof!(attempt, deadline) do
     registry_node = Enum.find([node() | Node.list(:connected)], &(Atom.to_string(&1) == attempt.owner_instance_id))
     assert registry_node, "the actual executor's registry node is unavailable"
     registry = {ExecutionRegistry, registry_node}
-    assert ExecutionIdentity.status(attempt) == :dead
 
+    case ExecutionIdentity.status(attempt) do
+      :alive -> await_execution_proof_retry!(attempt, deadline)
+      :dead -> publish_execution_proof!(attempt, deadline, registry_node, registry)
+      :unknown -> flunk("the actual executor's execution identity is unknown")
+    end
+  end
+
+  defp publish_execution_proof!(attempt, deadline, registry_node, registry) do
     case ExecutionRegistry.pending_proofs([attempt.owner_execution_id], registry) do
       [proof] ->
         fields = [:owner_execution_id, :owner_instance_id, :owner_instance_boot_id, :owner_process_id]
@@ -1522,17 +1634,21 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerDeath
         if ExecutionTerminalProofs.terminal?(attempt) do
           :ok
         else
-          remaining = deadline - System.monotonic_time(:millisecond)
-          assert remaining > 0, "the actual executor's retained terminal proof was not available before the deadline"
-
-          receive do
-          after
-            min(5, remaining) -> await_execution_proof!(attempt, deadline)
-          end
+          await_execution_proof_retry!(attempt, deadline)
         end
 
       :unknown ->
         flunk("the actual executor's registry is unavailable")
+    end
+  end
+
+  defp await_execution_proof_retry!(attempt, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+    assert remaining > 0, "the actual executor's retained terminal proof was not available before the deadline"
+
+    receive do
+    after
+      min(5, remaining) -> await_execution_proof!(attempt, deadline)
     end
   end
 

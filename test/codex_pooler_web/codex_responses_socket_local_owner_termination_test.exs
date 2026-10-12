@@ -17,10 +17,11 @@ defmodule CodexPoolerWeb.CodexResponsesSocketLocalOwnerTerminationTest do
 
   alias CodexPooler.Accounting.Attempt
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Persistence.CodexSession
+  alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
   alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Websocket, as: Gateway
+  alias CodexPooler.Gateway.Websocket.DeliveryReceipt
   alias CodexPooler.Gateway.Websocket.ResponseTask
   alias CodexPooler.Platform.{ExecutionIdentity, ExecutionRegistry}
   alias CodexPooler.Repo
@@ -34,6 +35,30 @@ defmodule CodexPoolerWeb.CodexResponsesSocketLocalOwnerTerminationTest do
   @drain_budget_ms 5_000
 
   setup do
+    counter = :ets.new(:local_owner_receipt_updates, [:set, :public])
+    handler = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, table ->
+          if is_binary(metadata.query) and String.starts_with?(metadata.query, "UPDATE \"attempts\"") and Enum.any?(metadata.params, fn param -> is_map(param) and Map.has_key?(param, "downstream_delivery") end) do
+            case metadata.result do
+              {:ok, %{num_rows: count}} ->
+                :ets.update_counter(table, :writes, {2, 1}, {:writes, 0})
+                :ets.update_counter(table, :rows, {2, count}, {:rows, 0})
+
+              _ ->
+                :ok
+            end
+          end
+        end,
+        counter
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    Process.put({__MODULE__, :receipt_updates}, counter)
     reset_bootstrap_state_fixture!()
     %{user: owner} = bootstrap_owner_fixture()
     pool = pool_fixture(%{created_by_user_id: owner.id})
@@ -91,6 +116,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketLocalOwnerTerminationTest do
     # One receipt for the attempt: the terminal was pushed, but the socket
     # closed before it handled the turn's completion.
     assert length(Regex.scan(~r/websocket downstream terminal pushed/, logs)) == 1
+    assert_receipt_updates(1, 1)
 
     assert %{
              "outcome" => "aborted",
@@ -185,6 +211,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketLocalOwnerTerminationTest do
     assert [proof] = Enum.filter(ExecutionRegistry.pending(10_000), &(&1.owner_execution_id == execution.owner_execution_id))
     assert proof.end_kind == "completed"
 
+    assert_receipt_updates(1, 1)
     assert [[receipt]] = Regex.scan(~r/websocket downstream terminal pushed [^\n]*/, logs)
     assert receipt =~ "outcome=delivered terminal_class=response.completed"
     assert Repo.get!(Attempt, attempt.id).response_metadata["downstream_delivery"]["outcome"] == "delivered"
@@ -261,6 +288,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketLocalOwnerTerminationTest do
 
     receipts = Regex.scan(~r/websocket downstream terminal pushed [^\n]*/, logs)
     assert length(receipts) == 1, "expected one delivery receipt, got #{length(receipts)}"
+    assert_receipt_updates(1, 1)
     assert [[receipt]] = receipts
     assert receipt =~ "outcome=delivered terminal_class=response.completed"
     assert Repo.get!(Attempt, attempt.id).response_metadata["downstream_delivery"]["outcome"] == "delivered"
@@ -342,6 +370,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketLocalOwnerTerminationTest do
 
     receipts = Regex.scan(~r/websocket downstream terminal pushed [^\n]*/, logs)
     assert length(receipts) == 1, "expected one delivery receipt, got #{length(receipts)}"
+    assert_receipt_updates(1, 1)
     assert [[receipt]] = receipts
     assert receipt =~ "outcome=delivered terminal_class=response.completed"
 
@@ -350,7 +379,44 @@ defmodule CodexPoolerWeb.CodexResponsesSocketLocalOwnerTerminationTest do
     Logger.configure(level: previous_level)
   end
 
-  defp assert_late_completion(auth, ordering) do
+  test "a failed first metadata write does not suppress the later valid attempt receipt", %{auth: auth} do
+    assert_late_completion(auth, :both_after, failed_first?: true)
+  end
+
+  test "an authority no-write without a capability does not suppress a later valid original receipt" do
+    setup = CodexPooler.AccountingTestSupport.accounting_setup()
+    assert {:ok, reserved} = CodexPooler.Accounting.reserve(setup.auth, setup.model, %{"model" => setup.model.exposed_model_id, "input" => []}, %{transport: "websocket", endpoint: "/backend-api/codex/responses", correlation_id: Ecto.UUID.generate()})
+    assert {:ok, attempt} = CodexPooler.Accounting.create_attempt(reserved.request, setup.assignment)
+    assert_late_completion(setup.auth, :both_after, authority_noop_first?: true, receipt_fixture: {reserved.request, attempt})
+  end
+
+  for marker <- [:no_context, :pending_only, :different_attempt, :unrelated_task] do
+    test "#{marker} cannot suppress a genuine legacy delivery receipt", %{auth: auth} do
+      registry = start_supervised!({ActivityRegistry, name: nil})
+      {request, attempt} = receipt_fixture(auth)
+      task = self()
+      token = make_ref()
+      state = auth |> local_owner_state(task, registry) |> put_delivery_receipt_context(task, request, attempt)
+      context = %{request_id: request.id, attempt_id: attempt.id, replay_generation: nil, delivery_failure: nil, codex_session_id: state.codex_session.id}
+      packet = {context, DeliveryReceipt.build(%{outcome: "delivered", terminal_class: "response.completed", pushed_at: state.downstream_delivery_evidence[task].pushed_at, frames_after_visible: 2, highest_frame_class: "terminal"})}
+
+      proofs =
+        case unquote(marker) do
+          :different_attempt -> %{task => {Map.put(context, :attempt_id, Ecto.UUID.generate()), elem(packet, 1)}}
+          :unrelated_task -> %{spawn(fn -> :ok end) => packet}
+          _ -> %{}
+        end
+
+      state = state |> Map.put(:response_task_activities, %{task => token}) |> Map.put(:terminate_acknowledged_tasks, MapSet.new([task])) |> Map.put(:terminate_legacy_receipt_proofs, proofs)
+      state = if unquote(marker) == :pending_only, do: Map.put(state, :terminate_pending_receipts, MapSet.new([task])), else: state
+      assert {:ok, _state} = CodexResponsesSocket.handle_info({:websocket_response_delivery_complete, task, token}, state)
+      assert_receive {:websocket_response_delivery_ack, ^token}
+      assert_receipt_updates(1, 1)
+      assert Repo.get!(Attempt, attempt.id).response_metadata["downstream_delivery"]["outcome"] == "delivered"
+    end
+  end
+
+  defp assert_late_completion(auth, ordering, opts \\ []) do
     previous_level = Logger.level()
     on_exit(fn -> Logger.configure(level: previous_level) end)
     Logger.configure(level: :info)
@@ -378,32 +444,48 @@ defmodule CodexPoolerWeb.CodexResponsesSocketLocalOwnerTerminationTest do
     monitor = Process.monitor(task)
     assert_receive {:completion_held, ^task}, @detection_timeout_ms
 
-    {request, attempt} = receipt_fixture(auth)
+    {request, attempt} = Keyword.get_lazy(opts, :receipt_fixture, fn -> receipt_fixture(auth) end)
 
     state =
       local_owner_state(auth, task, registry)
       |> put_delivery_receipt_context(task, request, attempt)
 
-    owner =
-      start_supervised!({WebsocketOwnerSession, codex_session_id: state.codex_session.id, owner_lease_token: state.websocket_owner_lease_token, owner_instance_id: state.codex_session.owner_instance_id})
-
-    assert {:ok, downstream} =
-             WebsocketOwnerSession.attach_downstream(owner, %{
-               pid: socket,
-               correlation_id: "late-local-completion"
-             })
-
-    state = %{state | websocket_owner_downstream: downstream}
+    state = attach_late_completion_owner(state, socket, opts)
+    state = if opts[:authority_noop_first?], do: put_in(state.direct_cleanup_receipts[task][:replay_generation], 0), else: state
+    if opts[:failed_first?], do: Repo.delete!(attempt)
     send(socket, {:terminate, state})
     await_post_cleanup_wait(socket, System.monotonic_time(:millisecond) + @detection_timeout_ms)
+    if opts[:failed_first?], do: Repo.insert!(Ecto.put_meta(attempt, state: :built))
+
+    if opts[:authority_noop_first?] do
+      assert is_nil(Repo.reload!(attempt).response_metadata["downstream_delivery"])
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      Repo.insert!(%CodexTurn{codex_session_id: state.codex_session.id, request_id: request.id, turn_sequence: 1, transport_kind: "websocket", status: "in_progress", started_at: now, created_at: now, updated_at: now})
+    end
+
     send(task, :release_completion)
 
     assert_receive {:DOWN, ^monitor, :process, ^task, reason}, @detection_timeout_ms
     assert reason == :normal
     assert_receive {:socket_terminated, logs}, @detection_timeout_ms
-    assert length(Regex.scan(~r/websocket downstream terminal pushed/, logs)) == 1
+    expected_logs = if opts[:failed_first?] || opts[:authority_noop_first?], do: 2, else: 1
+    expected_writes = if opts[:failed_first?], do: 2, else: 1
+    assert length(Regex.scan(~r/websocket downstream terminal pushed/, logs)) == expected_logs
+    assert_receipt_updates(expected_writes, 1)
+    assert is_map(Repo.get!(Attempt, attempt.id).response_metadata["downstream_delivery"])
+    if opts[:failed_first?], do: assert(logs =~ "receipt not persisted")
     assert ActivityRegistry.activities(name: registry) == []
     Logger.configure(level: previous_level)
+  end
+
+  defp attach_late_completion_owner(state, socket, opts) do
+    if opts[:authority_noop_first?] do
+      state
+    else
+      owner = start_supervised!({WebsocketOwnerSession, codex_session_id: state.codex_session.id, owner_lease_token: state.websocket_owner_lease_token, owner_instance_id: state.codex_session.owner_instance_id})
+      assert {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, %{pid: socket, correlation_id: "late-local-completion"})
+      %{state | websocket_owner_downstream: downstream}
+    end
   end
 
   defp start_held_completion(socket, registry, parent, :both_after) do
@@ -535,6 +617,12 @@ defmodule CodexPoolerWeb.CodexResponsesSocketLocalOwnerTerminationTest do
       })
 
     {request, attempt}
+  end
+
+  defp assert_receipt_updates(writes, rows) do
+    table = Process.get({__MODULE__, :receipt_updates})
+    assert :ets.lookup(table, :writes) == [{:writes, writes}]
+    assert :ets.lookup(table, :rows) == [{:rows, rows}]
   end
 
   defp with_info_log(fun) when is_function(fun, 0) do

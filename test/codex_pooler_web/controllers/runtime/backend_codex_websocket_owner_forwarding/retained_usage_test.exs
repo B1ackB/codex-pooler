@@ -112,6 +112,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RetainedUs
     on_exit(fn -> send(writer, {:discard_terminal_writer, hold}) end)
     pending = await_pending!(owner, deadline())
     request_id = pending.active_turn.admission_request_id
+    attempt_id = pending.active_turn.admission_attempt_id
+    refute pending.active_turn.terminal_forwarded?
     assert {:ok, %{response_usage: %{total_tokens: 120}}} = pending.active_turn.pending_result
     {:ok, lock} = Postgrex.start_link(Keyword.take(Repo.config(), [:hostname, :port, :username, :password, :database]))
     Process.unlink(lock)
@@ -120,7 +122,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RetainedUs
     %{rows: [[backend]]} = Postgrex.query!(lock, "SELECT pg_backend_pid() FROM requests WHERE id=$1 FOR UPDATE", [Ecto.UUID.dump!(request_id)])
     drain = Task.async(fn -> RolloutDrain.start_drain([name: harness.name, timeout_ms: 5_000] ++ WebsocketRolloutDrainSupport.deadline_options(harness.deadline)) end)
     await_owner_and_receipt_poll!(harness.deadline, deadline())
-    assert :sys.get_state(owner).compact_activity_deadline != nil
+    drain_deadline = :sys.get_state(harness.name).deadline_ms
+    assert :sys.get_state(owner).compact_activity_deadline.at == drain_deadline
+    observation = observe_competing_completion(owner, ending)
     owner_monitor = Process.monitor(owner)
 
     if ending == :receipt_failure, do: fail_receipt_completion_after_commit(owner)
@@ -164,19 +168,65 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RetainedUs
     assert_receive {:DOWN, ^owner_monitor, :process, ^owner, ^expected_exit}, @timeout
     Task.await(cleanup, @timeout)
     if duplicate, do: assert(Task.await(duplicate, @timeout) == :ok)
+    private_completion = assert_competing_completion(observation)
     :erlang.trace_pattern(mfa, false, [:local])
     assert await_settlement!(request_id, deadline()).total_tokens == 120
     assert %DateTime{} = Repo.get!(CodexSession, session.id).disconnected_at
     assert Repo.get_by!(BridgeOwnerLease, codex_session_id: session.id, lease_token: session.owner_lease_token).status == "released"
     VirtualDeadline.advance(harness.deadline, 200)
     summary = Task.await(drain, @timeout)
+    assert :sys.get_state(harness.name).deadline_ms == drain_deadline
     send(writer, {:discard_terminal_writer, hold})
     Mint.HTTP.close(conn)
     WebsocketCleanupFence.await_session_cleanups!()
     assert :ok = WebsocketRolloutDrainSupport.await_rollout_drain_harness(harness)
-    record_evidence(%{scenario: "competing_local_cleanup_owner_exit", mode: mode, ending: ending, request_id: request_id, actual_drain_caller_observed: true, actual_drain_return: if(ending == :kill_with_stale_ack, do: nil, else: "ok"), owner_exit: expected_exit, sql_blocker_observed: true, original_lease_released: true, session_disconnected: true, total_tokens: 120, summary: summary})
+    snapshot = assert_competing_original!(ending, request_id, attempt_id, backend)
+    record_evidence(%{scenario: "competing_local_cleanup_owner_exit", mode: mode, ending: ending, request_id: request_id, actual_drain_caller_observed: true, actual_drain_return: if(ending == :kill_with_stale_ack, do: nil, else: "ok"), private_completion: private_completion, terminal_forwarded: false, shared_deadline_ms: drain_deadline, postgres_snapshot: snapshot, owner_exit: expected_exit, sql_blocker_observed: true, original_lease_released: true, session_disconnected: true, total_tokens: 120, summary: summary})
     assert_competing_owner_outcome(summary, ending)
   end
+
+  defp observe_competing_completion(owner, :graceful) do
+    [{observer, %{ref: ref}}] = Map.to_list(:sys.get_state(owner).drain_observers)
+    :erlang.trace(observer, true, [:receive, {:tracer, self()}])
+    on_exit(fn -> if Process.alive?(observer), do: :erlang.trace(observer, false, [:receive]) end)
+    %{owner: owner, observer: observer, ref: ref}
+  end
+
+  defp observe_competing_completion(_owner, _ending), do: nil
+
+  defp assert_competing_completion(%{owner: owner, observer: observer, ref: ref}) do
+    receive do
+      {:trace, ^observer, :receive, {:websocket_owner_drain_finished, ^owner, ^ref, reply}} ->
+        assert reply == :ok
+        %{owner: inspect(owner), observer: inspect(observer), ref: inspect(ref), reply: "ok"}
+    after
+      @timeout -> flunk("exact private owner drain completion missing")
+    end
+  end
+
+  defp assert_competing_completion(nil), do: nil
+
+  defp assert_competing_original!(:graceful, request_id, attempt_id, lock_backend) do
+    {:ok, db} = Postgrex.start_link(Keyword.take(Repo.config(), [:hostname, :port, :username, :password, :database]))
+
+    try do
+      sql = "SELECT pg_backend_pid() AS observer_backend, r.status AS request_status, r.last_error_code, r.response_status_code, a.id::text AS attempt_id, a.status AS attempt_status, a.replay_generation, t.status AS turn_status, t.final_attempt_id::text, l.id::text AS settlement_id, l.usage_status, l.input_tokens, l.output_tokens, l.total_tokens, l.settled_cost_micros::text, f.latest_settled_cost_micros, (SELECT count(*) FROM ledger_entries e WHERE e.request_id=r.id AND e.entry_kind='settlement' AND e.amount_status='recorded') AS effective_settlements FROM requests r JOIN attempts a ON a.request_id=r.id JOIN codex_turns t ON t.request_id=r.id JOIN ledger_entries l ON l.request_id=r.id AND l.attempt_id=a.id JOIN request_log_facts f ON f.request_id=r.id WHERE r.id=$1 AND l.entry_kind='settlement' AND l.amount_status='recorded'"
+      %{columns: columns, rows: [row]} = Postgrex.query!(db, sql, [Ecto.UUID.dump!(request_id)])
+      snapshot = Map.new(Enum.zip(columns, row))
+      assert snapshot["observer_backend"] != lock_backend
+      assert {snapshot["request_status"], snapshot["attempt_status"], snapshot["turn_status"]} == {"failed", "failed", "interrupted"}
+      assert {snapshot["last_error_code"], snapshot["response_status_code"]} == {"owner_drained", 499}
+      assert {snapshot["attempt_id"], snapshot["final_attempt_id"], snapshot["replay_generation"]} == {attempt_id, attempt_id, 0}
+      assert {snapshot["usage_status"], snapshot["input_tokens"], snapshot["output_tokens"], snapshot["total_tokens"], snapshot["effective_settlements"]} == {"usage_known", 100, 20, 120, 1}
+      assert Decimal.equal?(Decimal.new(snapshot["settled_cost_micros"]), Decimal.new(1_400))
+      assert snapshot["latest_settled_cost_micros"] == 1_400
+      Map.put(snapshot, "lock_backend", lock_backend)
+    after
+      GenServer.stop(db)
+    end
+  end
+
+  defp assert_competing_original!(_ending, _request_id, _attempt_id, _lock_backend), do: nil
 
   defp disrupt_owner_observation(owner, :kill_with_stale_ack) do
     [{observer, %{ref: observation}}] = Map.to_list(:sys.get_state(owner).drain_observers)
@@ -203,7 +253,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RetainedUs
     end
   end
 
-  defp assert_competing_owner_outcome(summary, :graceful), do: assert(%{result: :ok, owners_seen: 1, owners_drained: 1, owners_failed: 0, turns_completed: 1, receipt_settlements_seen: 1, receipt_settlements_completed: 1} = summary)
+  defp assert_competing_owner_outcome(summary, :graceful), do: assert(%{result: :ok, owners_seen: 1, owners_drained: 1, owners_failed: 0, turns_completed: 0, turns_aborted: 1, receipt_settlements_seen: 1, receipt_settlements_completed: 1} = summary)
   defp assert_competing_owner_outcome(summary, :receipt_failure), do: assert(%{result: :error, owners_seen: 1, owners_failed: 1, receipt_settlements_seen: 1, receipt_settlements_failed: 1} = summary)
   defp assert_competing_owner_outcome(summary, :kill_with_stale_ack), do: assert(%{result: :error, owners_seen: 1, owners_failed: 1, receipt_settlements_seen: 1, receipt_settlements_completed: 1} = summary)
 

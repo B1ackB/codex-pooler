@@ -44,9 +44,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketPreTurnCompactionCutPeerTe
   end
 
   for order <- [:before_publication, :after_publication] do
-    @tag compaction_owned_cleanup: true, cleanup_order: order
+    @tag compaction_owned_cleanup: true, compaction_cut_order: true, cleanup_order: order
     test "exact compact proof cleanup preserves committed foreign proof and same-model fixture #{order}", %{peer_node: peer_node, cleanup_order: order} do
-      assert Scenario.run_scenario("full", :pre_turn, :peer, :drain_no_resend, :on_arrival, peer_node: peer_node, proof_cleanup_probe: order) == Scenario.expected(:drain_no_resend, :peer)
+      assert Scenario.run_scenario("full", :pre_turn, :peer, :drain_no_resend, :on_arrival, peer_node: peer_node, proof_cleanup_probe: order, execution_order: :stopped) == Scenario.expected(:drain_no_resend, :peer)
     end
   end
 
@@ -105,24 +105,37 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketPreTurnCompactionCutPeerTe
 
   # The production shape of findings#270 row 270-352: the rollout drain of the
   # socket's node cuts the compaction while its owner, on the other node, is
-  # not draining. Nothing settles the cut request until the end of its
-  # executor, the socket node's response task, is proven; the first resend
-  # recovers it and is its successor. It used to meet the dead request as a
+  # not draining. Hold the original proxy before it can settle the owner's
+  # cancellation answer: the real watcher stops it after receipt COMMIT and
+  # the first resend recovers its proven-dead request as its successor.
+  # The explicit finalized controls below exercise the other ordering.
+  # It used to meet the dead request as a
   # live turn the owner no longer held and was refused `409 duplicate_turn`
   # twice, after which the HTTPS fallback bought the compaction again.
   # And the provider's stream dying after the Pooler collected the compaction
   # item, with the owner and its provider connection on the peer (row
   # 270-365).
   for cut <- [:drain_before_output, :drain_after_output, :provider_cut_after_output] do
-    @tag mode: "full", shape: :pre_turn, topology: :peer, cut: cut
+    @tag mode: "full", shape: :pre_turn, topology: :peer, cut: cut, compaction_cut_order: true
     test "full pre_turn peer admitted compaction #{cut}: the released client's first websocket retry is its successor",
          %{mode: mode, shape: shape, topology: topology, cut: cut, peer_node: peer_node} do
-      assert Scenario.run_scenario(mode, shape, topology, cut, :on_arrival, peer_node: peer_node) == Scenario.expected(cut, topology)
+      order = if cut in [:drain_before_output, :drain_after_output], do: :stopped
+      assert Scenario.run_scenario(mode, shape, topology, cut, :on_arrival, peer_node: peer_node, execution_order: order) == Scenario.expected(cut, topology)
     end
   end
 
+  @tag compaction_cut_order: true
   test "never resent: the dead-execution scan settles it once the attempt is eligible", %{peer_node: peer_node} do
-    assert Scenario.run_scenario("full", :pre_turn, :peer, :drain_no_resend, :on_arrival, peer_node: peer_node) == Scenario.expected(:drain_no_resend, :peer)
+    log = ExUnit.CaptureLog.capture_log(fn -> assert Scenario.run_scenario("full", :pre_turn, :peer, :drain_no_resend, :on_arrival, peer_node: peer_node, execution_order: :stopped) == Scenario.expected(:drain_no_resend, :peer) end)
+    refute log =~ "websocket delivery receipt handoff failed"
+  end
+
+  for cut <- [:drain_before_output, :drain_after_output, :drain_no_resend] do
+    @tag compaction_executor_finalized: true, compaction_cut_order: true, cut: cut
+    test "full pre_turn peer drain preserves the original executor's committed failure for #{cut}", %{peer_node: peer_node, cut: cut} do
+      log = ExUnit.CaptureLog.capture_log(fn -> assert Scenario.run_scenario("full", :pre_turn, :peer, cut, :on_arrival, peer_node: peer_node, execution_order: :finalized) == Scenario.expected(cut, :peer, :finalized) end)
+      refute log =~ "websocket delivery receipt handoff failed"
+    end
   end
 
   for mode <- ["full", "lite"], cut <- [:no_cut, :before_output, :after_output, :after_completion, :unobserved_cut] do
