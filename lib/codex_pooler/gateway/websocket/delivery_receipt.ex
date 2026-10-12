@@ -82,7 +82,9 @@ defmodule CodexPooler.Gateway.Websocket.DeliveryReceipt do
   @type context :: %{
           required(:request_id) => term(),
           optional(:attempt_id) => Ecto.UUID.t() | nil,
-          optional(:codex_session_id) => term()
+          optional(:codex_session_id) => term(),
+          optional(:replay_generation) => non_neg_integer() | nil,
+          optional(:delivery_failure) => CodexPooler.Gateway.Runtime.Finalization.RetainedUsage.failure() | nil
         }
 
   @spec metadata_key() :: String.t()

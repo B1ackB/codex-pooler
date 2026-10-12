@@ -27,7 +27,8 @@ defmodule CodexPooler.Dev.CodexRetainedUsageFixtureData do
     %{type: :directory, mode: mode} = File.lstat!(root)
     true = Bitwise.band(mode, 0o777) == 0o700
     run = System.fetch_env!("RETAINED_RUN_ID")
-    {:ok, origin} = LocalTarget.upstream_base_url(System.fetch_env!("RETAINED_UPSTREAM_URL"), nil)
+    upstream_url = System.fetch_env!("RETAINED_UPSTREAM_URL")
+    {:ok, origin} = LocalTarget.upstream_base_url(upstream_url, upstream_url)
     password = Base.url_encode64(:crypto.strong_rand_bytes(32))
     email = "retained-operator@example.com"
     {:ok, _} = Accounts.bootstrap_owner(%{email: email, display_name: "Synthetic operator", password: password, password_confirmation: password})
