@@ -5,9 +5,9 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
 
   require Logger
 
-  alias CodexPooler.Accounting.ClientRetry
+  alias CodexPooler.Accounting.{ClientRetry, ModelObservation}
   alias CodexPooler.Gateway.OperationalSettings
-  alias CodexPooler.Gateway.Runtime.Finalization.ExpiredOwnerGenerationCleanup
+  alias CodexPooler.Gateway.Runtime.Finalization.{ExpiredOwnerGenerationCleanup, ResponseUsage}
 
   alias CodexPooler.Gateway.Payloads.{
     CompactionTrigger,
@@ -1399,7 +1399,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         do: response,
         else: ExpiredOwnerGenerationCleanup.strip(response)
 
-    {:error, Map.put_new(response, :headers, [])}
+    {:error, response |> Map.put_new(:headers, []) |> normalize_owner_failure_usage()}
   end
 
   defp owner_request_result({:error, reason}, _identity, _request, _attempt, _request_options) do
@@ -1408,6 +1408,24 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
 
   defp owner_request_result(:ok, _identity, _request, _attempt, _request_options),
     do: {:error, %{body: "", reason: :owner_unavailable, headers: [], started: false}}
+
+  # Failure receipts cross the same node boundary as successful results. Only
+  # validated measured counters and bounded attribution may enter accounting.
+  defp normalize_owner_failure_usage(%{response_usage: usage} = response) when is_map(usage) do
+    counters = Map.take(usage, [:input_tokens, :cached_input_tokens, :cache_write_tokens, :output_tokens, :reasoning_tokens, :total_tokens])
+    required? = Enum.all?([:input_tokens, :output_tokens, :total_tokens], &Map.has_key?(counters, &1))
+    integers? = Enum.all?(counters, fn {_key, value} -> is_integer(value) and value >= 0 and value <= 9_223_372_036_854_775_807 end)
+    measured? = usage[:status] == "usage_known" and required? and integers?
+    envelope = %{"usage" => if(measured?, do: Map.new(counters, fn {key, value} -> {Atom.to_string(key), value} end)), "model" => usage[:served_model], "service_tier" => usage[:service_tier]}
+    normalized = ResponseUsage.from_stream_event(if(measured?, do: envelope, else: Map.delete(envelope, "usage")))
+    observation = ModelObservation.normalize(usage[:model_observation], normalized[:served_model])
+    Map.put(response, :response_usage, Map.put(normalized, :model_observation, observation))
+  end
+
+  defp normalize_owner_failure_usage(%{response_usage: _invalid} = response),
+    do: Map.put(response, :response_usage, %{status: "usage_unknown", source: "invalid_usage_tokens"})
+
+  defp normalize_owner_failure_usage(response), do: response
 
   # The observer tells the socket that the owner's `:complete` will follow the
   # result, and the socket waits for it before it releases the response task.

@@ -10,11 +10,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.FinalizationTest do
   alias CodexPooler.Access
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestReplay}
+  alias CodexPooler.Accounting.RequestLifecycle.LedgerEntries
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexSession, CodexTurn}
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization
+  alias CodexPooler.Gateway.Runtime.Finalization.ResponseUsage
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Repo
   alias Ecto.Adapters.SQL.Sandbox
@@ -624,6 +626,70 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.FinalizationTest do
 
       refute_received {:stream_outcome, _metadata}
     end)
+  end
+
+  for usage <- [
+        %{"input_tokens" => 100, "output_tokens" => 20, "total_tokens" => 120},
+        %{"input_tokens" => 0, "output_tokens" => 0, "total_tokens" => 0},
+        %{"input_tokens" => -1, "output_tokens" => 20},
+        nil
+      ] do
+    test "disconnect retains normalized usage #{inspect(usage)} without promoting delivery" do
+      setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+      {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+      {context, finalization} = completed_websocket_finalization_context!(setup, auth, session, "")
+      normalized = ResponseUsage.from_stream_event(%{"response" => %{"usage" => unquote(Macro.escape(usage))}})
+      failed = finalization |> Map.drop([:callbacks, :status]) |> Map.merge(%{reason: :client_disconnected, response_usage: normalized})
+
+      for _ <- 1..2 do
+        assert {:error, %{status: 499, code: "client_disconnected"}} = Finalization.finalize_failed_websocket_response(context, failed)
+      end
+
+      request = Repo.reload!(context.reserved.request)
+      attempt = Repo.reload!(context.attempt)
+      turn = Repo.get_by!(CodexTurn, request_id: request.id)
+      assert [settlement] = Repo.all(from l in LedgerEntry, where: l.request_id == ^request.id and l.entry_kind == "settlement")
+      assert request.status == "failed"
+      assert attempt.status == "failed"
+      assert turn.status == "interrupted"
+      assert request.last_error_code == "client_disconnected"
+      assert request.usage_status == normalized.status
+      assert attempt.usage_status == normalized.status
+      assert settlement.usage_status == normalized.status
+
+      if normalized.status == "usage_known" do
+        window = LedgerEntries.window_usages(setup.api_key.id, [window: request.admitted_at], DateTime.utc_now()).window
+        assert window.known_total_tokens == normalized.total_tokens
+        assert window.provisional_total_tokens == 0
+      end
+    end
+  end
+
+  for {reason, status, stored_code, turn_status} <- [
+        {:upstream_websocket_terminal_delivery_timeout, 502, "upstream_stream_error", "failed"},
+        {:owner_drained, 503, "owner_drained", "interrupted"},
+        {:owner_crashed, 502, "owner_crashed", "failed"},
+        {:owner_forward_timeout, 504, "owner_forward_timeout", "failed"}
+      ] do
+    test "measured owner failure #{reason} preserves existing stored disposition" do
+      setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+      {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+      {context, finalization} = completed_websocket_finalization_context!(setup, auth, session, "")
+      normalized = ResponseUsage.from_stream_event(%{"usage" => %{"input_tokens" => 100, "output_tokens" => 20, "total_tokens" => 120}})
+      failed = finalization |> Map.drop([:callbacks, :status]) |> Map.merge(%{reason: unquote(reason), response_usage: normalized})
+      assert {:error, %{status: unquote(status)}} = Finalization.finalize_failed_websocket_response(context, failed)
+      request = Repo.reload!(context.reserved.request)
+      assert request.status == "failed"
+      assert request.response_status_code == unquote(status)
+      assert request.last_error_code == unquote(stored_code)
+      assert request.usage_status == "usage_known"
+      assert Repo.get_by!(CodexTurn, request_id: request.id).status == unquote(turn_status)
+      assert [settlement] = Repo.all(from l in LedgerEntry, where: l.request_id == ^request.id and l.entry_kind == "settlement")
+      assert settlement.total_tokens == 120
+      IO.puts(CodexPooler.JSON.encode!(%{scenario: "failure_disposition", reason: unquote(reason), status: request.response_status_code, stored_code: request.last_error_code, turn_status: unquote(turn_status), total_tokens: settlement.total_tokens}))
+    end
   end
 
   test "websocket failed finalization stays silent for reused and usage-replaced settlements" do

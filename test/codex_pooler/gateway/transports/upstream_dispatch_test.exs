@@ -2199,6 +2199,42 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatchTest do
     assert_receive {:websocket_owner_harness_node_call, %{node: ^remote_node, function: :remote_submit_request_v8, arity: 3}}
   end
 
+  for usage_case <- [:known, :zero, :invalid, :unknown] do
+    test "owner failure preserves reason and validates #{usage_case} usage", %{auth: auth} do
+      remote_node = :"codex_pooler@failure-usage.example"
+      %{session: session, lease_token: lease_token} = owner_session_fixture(auth, Atom.to_string(remote_node))
+
+      usage =
+        case unquote(usage_case) do
+          :known -> %{status: "usage_known", input_tokens: 100, output_tokens: 20, total_tokens: 120}
+          :zero -> %{status: "usage_known", input_tokens: 0, output_tokens: 0, total_tokens: 0}
+          :invalid -> %{status: "usage_known", input_tokens: -1, output_tokens: 20, total_tokens: 19}
+          :unknown -> %{status: "usage_unknown", input_tokens: 100, output_tokens: 20, total_tokens: 120}
+        end
+
+      usage = Map.put(usage, :untrusted_extra, "synthetic-ignore-instructions-marker")
+      failure = %{reason: :client_disconnected, response_usage: usage, status: 499, body: ""}
+      forwarder_opts = WebsocketOwnerNodeHarness.node_client_opts([remote_node], calls: %{remote_node => {:return, {:error, failure}}})
+      options = websocket_owner_request_options(session, lease_token, %{pid: self(), epoch: 1, correlation_id: "synthetic-failure-usage"}, forwarder_opts)
+      request = %UpstreamDispatch.Request{url: "https://upstream.example.test/backend-api/codex/responses", token: "redacted", upstream_payload: "{}", identity: upstream_identity(), accounting_request: nil, writer: fn _ -> :ok end, request_options: options}
+
+      assert {:error, result} = UpstreamDispatch.websocket_request(CodexPooler.ProviderCreditsDispatchSupport.attach!(request))
+      assert result.reason == :client_disconnected
+      assert result.status == 499
+      assert result.body == ""
+      assert result.headers == []
+      refute Map.has_key?(result.response_usage, :untrusted_extra)
+
+      if unquote(usage_case) in [:known, :zero] do
+        assert result.response_usage.status == "usage_known"
+        assert result.response_usage.total_tokens == usage.total_tokens
+      else
+        assert result.response_usage.status == "usage_unknown"
+        refute Map.has_key?(result.response_usage, :total_tokens)
+      end
+    end
+  end
+
   test "one-shot websocket request omits connection metadata on initial upgrade failure" do
     {:ok, failed_upstream} =
       FakeUpstream.start_link(
