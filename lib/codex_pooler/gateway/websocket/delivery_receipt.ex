@@ -17,6 +17,7 @@ defmodule CodexPooler.Gateway.Websocket.DeliveryReceipt do
   alias CodexPooler.Accounting.Attempt
   alias CodexPooler.Gateway.Payloads.WebsocketTurnIdentity
   alias CodexPooler.Gateway.Persistence.SessionContinuity
+  alias CodexPooler.Gateway.Runtime.Finalization.InterruptionOutcome
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser
   alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
@@ -379,7 +380,7 @@ defmodule CodexPooler.Gateway.Websocket.DeliveryReceipt do
         status =
           cond do
             request.status == "succeeded" -> "succeeded"
-            request.last_error_code in ["client_disconnected", "owner_drained"] -> "interrupted"
+            InterruptionOutcome.interrupted_error_code?(request.last_error_code) -> "interrupted"
             true -> "failed"
           end
 

@@ -12,9 +12,13 @@ defmodule CodexPooler.Accounting.AttemptFinalizationDeliveryReceiptTest do
   import CodexPooler.AccountingTestSupport
 
   alias CodexPooler.Accounting
-  alias CodexPooler.Accounting.Attempt
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry}
+  alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, CodexTurn}
+  alias CodexPooler.Gateway.Persistence.SessionContinuity
+  alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
   alias CodexPooler.Gateway.Runtime.Finalization.ExpiredOwnerGenerationCleanup, as: Cleanup
+  alias CodexPooler.Gateway.Websocket
   alias CodexPooler.Gateway.Websocket.DeliveryReceipt
   alias CodexPooler.Platform.ExecutionIdentity
   alias CodexPooler.Platform.InstancePresence.Identity
@@ -147,20 +151,11 @@ defmodule CodexPooler.Accounting.AttemptFinalizationDeliveryReceiptTest do
     end
   end
 
-  for order <- [:receipt_first, :accounting_first] do
-    test "authoritative failed delivery #{order} preserves measured charge and interrupted outcome" do
-      %{attempt: attempt, request: request} = websocket_attempt!()
-      context = %{request_id: request.id, attempt_id: attempt.id, replay_generation: 0, delivery_failure: %{status: "failed", response_status_code: 499, error_code: "client_disconnected"}}
-      receipt = aborted_partial_receipt()
-      usage = %{status: "usage_known", input_tokens: 10, output_tokens: 2, total_tokens: 12}
-      if unquote(order) == :receipt_first, do: assert(:ok = DeliveryReceipt.persist(attempt.id, receipt, context))
-      assert {:ok, settled} = Accounting.finalize_success(request, attempt, usage)
-      if unquote(order) == :accounting_first, do: assert(:ok = DeliveryReceipt.persist(attempt.id, receipt, context))
-      assert :ok = DeliveryReceipt.persist(attempt.id, receipt, context)
-      assert Repo.reload!(settled.settlement) == settled.settlement
-      assert Repo.reload!(request).status == "failed"
-      assert Repo.reload!(attempt).network_error_code == "client_disconnected"
-      assert Repo.reload!(attempt).usage_status == "usage_known"
+  for {code, expected_turn} <- [{"owner_crashed", "interrupted"}, {"owner_unavailable", "interrupted"}, {"owner_drained", "interrupted"}, {"client_disconnected", "interrupted"}, {"upstream_stream_error", "failed"}], order <- [:receipt_first, :accounting_first] do
+    @tag :unboxed_writers
+    @tag code: code, expected_turn: expected_turn, receipt_order: order
+    test "authoritative #{code} delivery #{order} preserves measured charge and canonical turn outcome", context do
+      assert_authoritative_delivery(context)
     end
   end
 
@@ -204,6 +199,89 @@ defmodule CodexPooler.Accounting.AttemptFinalizationDeliveryReceiptTest do
     assert corrected.request.status == "succeeded"
     assert Repo.reload!(settled.settlement) == settled.settlement
     refute Map.has_key?(Repo.reload!(attempt).response_metadata, "delivery_failure")
+  end
+
+  defp assert_authoritative_delivery(%{code: code, expected_turn: expected_turn, receipt_order: order}) do
+    fixture = committed_turn_fixture!()
+    %{attempt: attempt, request: request, turn: turn} = fixture
+    observer = start_supervised!({Postgrex, Keyword.take(Repo.config(), [:hostname, :port, :username, :password, :database])})
+    context = %{request_id: request.id, attempt_id: attempt.id, replay_generation: attempt.replay_generation, delivery_failure: %{status: "failed", response_status_code: 499, error_code: code}}
+    receipt = aborted_partial_receipt()
+    usage = %{status: "usage_known", input_tokens: 10, output_tokens: 2, total_tokens: 12}
+
+    {settled, before_state} =
+      UnboxedFixture.run_unboxed(fn ->
+        if order == :receipt_first, do: assert(:ok = DeliveryReceipt.persist(attempt.id, receipt, context))
+        assert {:ok, settled} = AttemptSettlement.finalize_success(request, attempt, usage, %{response_status_code: 200})
+
+        if order == :accounting_first do
+          assert Repo.reload!(turn).status == "succeeded"
+          assert {:ok, ordinary} = AttemptSettlement.finalize_partial_stream_failure(request, attempt, %{status: "usage_unknown"}, %{last_error_code: code, response_status_code: 499})
+          assert ordinary.request.status == "succeeded"
+          assert ordinary.settlement == settled.settlement
+          assert :ok = DeliveryReceipt.persist(attempt.id, receipt)
+          assert Repo.reload!(request).status == "succeeded"
+          assert Repo.reload!(turn).status == "succeeded"
+        end
+
+        {settled, {Repo.reload!(request).status, Repo.reload!(turn).status}}
+      end)
+
+    UnboxedFixture.run_unboxed(fn ->
+      assert :ok = DeliveryReceipt.persist(attempt.id, receipt, context)
+      first_turn = Repo.reload!(turn)
+      ledger = Repo.all(from entry in LedgerEntry, where: entry.request_id == ^request.id, order_by: entry.id)
+      assert :ok = DeliveryReceipt.persist(attempt.id, receipt, context)
+      assert Repo.reload!(turn) == first_turn
+      assert Repo.all(from entry in LedgerEntry, where: entry.request_id == ^request.id, order_by: entry.id) == ledger
+      assert Repo.reload!(settled.settlement) == settled.settlement
+      assert settled.settlement.total_tokens == 12
+      assert Repo.reload!(request).status == "failed"
+      assert Repo.reload!(request).last_error_code == code
+      assert Repo.reload!(attempt).status == "failed"
+      assert Repo.reload!(attempt).network_error_code == code
+      assert Repo.reload!(attempt).usage_status == "usage_known"
+      assert Repo.reload!(attempt).response_metadata["downstream_delivery"] == receipt
+      assert first_turn.final_attempt_id == attempt.id
+      assert first_turn.error_code == code
+    end)
+
+    [[database, backend, request_status, attempt_status, turn_status, tokens, settlements, attempts]] =
+      Postgrex.query!(observer, "SELECT current_database(), pg_backend_pid(), r.status, a.status, t.status, e.total_tokens, (SELECT count(*) FROM ledger_entries l WHERE l.request_id = r.id AND l.entry_kind = 'settlement' AND l.amount_status = 'recorded'), (SELECT count(*) FROM attempts x WHERE x.request_id = r.id) FROM requests r JOIN attempts a ON a.id = $2 AND a.request_id = r.id JOIN codex_turns t ON t.id = $3 AND t.request_id = r.id JOIN ledger_entries e ON e.id = $4 WHERE r.id = $1", Enum.map([request.id, attempt.id, turn.id, settled.settlement.id], &Ecto.UUID.dump!/1)).rows
+
+    assert database == Repo.config()[:database]
+    CodexPooler.TestDiagnostics.puts("authoritative delivery code=#{code} order=#{order} database=#{database} observer_backend=#{backend} before=#{inspect(before_state)} request=#{request_status} attempt=#{attempt_status} turn=#{turn_status} expected_turn=#{expected_turn} tokens=#{tokens} recorded_settlements=#{settlements} attempts=#{attempts} settlement_id=#{settled.settlement.id} ledger_unchanged=true repeat_unchanged=true")
+    assert {request_status, attempt_status, turn_status, tokens, settlements, attempts} == {"failed", "failed", expected_turn, 12, 1, 1}
+  end
+
+  defp committed_turn_fixture! do
+    holder = String.to_atom("receipt-turn-fixture-#{System.unique_integer([:positive])}")
+
+    on_exit(fn ->
+      if pid = Process.whereis(holder) do
+        try do
+          if fixture = Agent.get(pid, & &1), do: UnboxedFixture.cleanup_unboxed!(fn -> cleanup_unboxed_pool!(fixture.setup) end)
+        after
+          Agent.stop(pid)
+        end
+      end
+    end)
+
+    {:ok, _holder} = Agent.start(fn -> nil end, name: holder)
+
+    UnboxedFixture.run_unboxed(fn ->
+      {:ok, fixture} = Repo.transaction(fn -> insert_turn_fixture!(holder) end)
+      fixture
+    end)
+  end
+
+  defp insert_turn_fixture!(holder) do
+    fixture = websocket_attempt!()
+    Agent.update(holder, fn _ -> fixture end)
+    assert {:ok, session} = Websocket.start_codex_session(fixture.setup.auth, %{accepted_turn_state: Ecto.UUID.generate()})
+    opts = RequestOptions.for_websocket(%{}) |> RequestOptions.put_continuity(semantic_turn_key: :crypto.strong_rand_bytes(32))
+    assert {:ok, turn} = SessionContinuity.start_codex_turn(session, fixture.request, opts)
+    Map.merge(fixture, %{session: session, turn: turn})
   end
 
   defp start_ordered_writer(supervisor, fixture, receipt, kind, parent, release, hold?) do
