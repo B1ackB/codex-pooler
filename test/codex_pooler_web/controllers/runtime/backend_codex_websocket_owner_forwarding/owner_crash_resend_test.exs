@@ -1,17 +1,13 @@
 defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerCrashResendTest do
-  # A session's owner ends without its `terminate/2` while a turn it runs for
-  # a socket has shown output: killed by a new socket's reuse check once it
-  # has renewed nothing for longer than the lease TTL, or crashed. The turn is
-  # settled by whichever of two finalizations reaches its rows first. The
-  # socket's crash cleanup interrupts it (499, turn interrupted); the socket's
-  # response task fails it with the answer it got (502, turn failed). The
-  # released client closes on the socket's 1011 and resends the turn whole on
-  # a new socket. Its resend was admitted only against the interrupted shape
-  # and met `409 duplicate_turn` against the failed one: always after a kill,
-  # whose lease takeover leaves the crash cleanup stale, and in about four
-  # plain crashes out of nine (findings#270 row 270-313). Both shapes now
-  # admit the resend once the proof of the attempt's executor's end exists.
-  # The stale crash cleanup after a takeover stands down at info.
+  # A session's owner ends without its `terminate/2` while its turn has
+  # shown output. The socket's cleanup settles HTTP 499; its response task
+  # settles HTTP 502. Both now leave a canonically interrupted turn, while
+  # persisted rows from older versions can retain the response task's failed
+  # turn. The released client closes on 1011 and resends the turn whole on a
+  # new socket. Each disposition needs the exact executor's durable terminal
+  # proof before it can admit that resend once. Lease takeover leaves the old
+  # socket's crash cleanup stale, so that path must keep the response task's
+  # settlement and let the stale cleanup stand down at info.
   #
   # One node: the real public listener, owner forwarding on, the session's
   # owner on this node, the Pool's serving mode forced to Full, FakeUpstream
@@ -78,7 +74,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerCrash
     assert frames == [@crashed_close]
     assert Task.await(busy, @detection_timeout_ms) == :owner_gone
     killed = await_request!(live.turn_request_id, &match?(%Request{status: "failed", response_status_code: 502, last_error_code: "owner_crashed"}, &1))
-    assert %CodexTurn{status: "failed", error_code: "owner_crashed"} = Repo.get_by!(CodexTurn, request_id: killed.id)
+    assert %CodexTurn{status: "interrupted", error_code: "owner_crashed"} = Repo.get_by!(CodexTurn, request_id: killed.id)
 
     # The takeover released the killed owner's lease, once, and the crash
     # cleanup that found it released stood down at info.
@@ -100,7 +96,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerCrash
     assert_resend_served_once!(live, crashed, release_ref)
   end
 
-  # Without the proof of the executor's end the failed shape admits nothing:
+  # Without the proof of the executor's end the settled shape admits nothing:
   # its executor might still settle the attempt.
   @tag slow: "crashes an owner while it runs a turn that showed output, with no execution proof published"
   test "a turn settled by the response task after its owner crashed is not resent without the proof of its executor's end" do
@@ -177,7 +173,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerCrash
     Process.exit(live.owner, :kill)
     assert_receive {:DOWN, ^owner_monitor, :process, _owner, :killed}, @detection_timeout_ms
     crashed = await_request!(live.turn_request_id, &match?(%Request{status: "failed", response_status_code: 502, last_error_code: "owner_crashed"}, &1))
-    assert %CodexTurn{status: "failed", error_code: "owner_crashed"} = Repo.get_by!(CodexTurn, request_id: crashed.id)
+    assert %CodexTurn{status: "interrupted", error_code: "owner_crashed"} = Repo.get_by!(CodexTurn, request_id: crashed.id)
 
     :sys.resume(live.client.socket)
     {conn, _websocket, frames} = receive_frames_until_close!(live.conn, live.websocket, live.client.ref)

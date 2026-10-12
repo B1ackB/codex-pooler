@@ -669,7 +669,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.FinalizationTest do
   for {reason, status, stored_code, turn_status} <- [
         {:upstream_websocket_terminal_delivery_timeout, 502, "upstream_stream_error", "failed"},
         {:owner_drained, 503, "owner_drained", "interrupted"},
-        {:owner_crashed, 502, "owner_crashed", "failed"},
+        {:owner_crashed, 502, "owner_crashed", "interrupted"},
         {:owner_forward_timeout, 504, "owner_forward_timeout", "failed"}
       ] do
     test "measured owner failure #{reason} preserves existing stored disposition" do

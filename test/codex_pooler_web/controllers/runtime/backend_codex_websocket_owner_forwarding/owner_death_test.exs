@@ -604,7 +604,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerDeath
     assert [turn] =
              Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^remote_state.codex_session.id))
 
-    assert turn.status == "failed"
+    assert turn.status == "interrupted"
 
     assert Repo.all(
              from(alias_record in BridgeSessionAlias,
@@ -1164,7 +1164,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerDeath
         # answers the task (findings#270 row 270-167): the same record on every
         # run, the shape a released client's resend is admitted against, where
         # the owner's exit and the task used to race for it (499 with the turn
-        # interrupted, or 502 with the turn failed).
+        # interrupted, or 502 with the same interrupted turn).
         assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
         assert {request.status, request.last_error_code, request.response_status_code} == {"failed", "owner_crashed", 499}
         assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))

@@ -25,10 +25,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RemoteOwne
   # the crash.
   use CodexPoolerWeb.ConnCase, async: false
 
+  import Ecto.Query
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport
   import CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport, only: [enter_peer_owner_topology!: 0, start_shared_bridge_peer!: 0, start_shared_peer_window_owner!: 3]
 
+  alias CodexPooler.Accounting.{LedgerEntry, RequestClientRetryLink}
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
+  alias CodexPooler.Repo
   alias CodexPoolerWeb.Runtime.OwnerCrashAfterSendScenario, as: Crash
   alias CodexPoolerWeb.Runtime.OwnerLossScenario, as: Scenario
   alias CodexPoolerWeb.Runtime.PeerLogRelay
@@ -101,6 +104,41 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RemoteOwne
         assert %{"type" => "response.completed", "response" => %{"id" => "resp_remote_owner_unsent_first_send"}} = served
         :ok = Crash.assert_resend_served_once!(setup, upstream, ctx.route, request_id)
       end
+    end
+  end
+
+  for mode <- ["full", "lite"] do
+    @tag mode: mode, route: Scenario.native_route()
+    test "native #{mode}: a sent remote owner's turn admits one proven resend with one measured charge", ctx do
+      publisher = Crash.start_proof_publisher!(:committed)
+      release_ref = make_ref()
+      upstream = Crash.upstream!(:after_receipt, "resp_remote_sent_resend", release_ref)
+      %{setup: setup, client: client, peer_owner: peer_owner, port: port, window: window} = connect!(upstream, ctx)
+      :ok = Crash.stop_session_owner_on_exit(ctx.peer_node, peer_owner.session.id)
+      frame = Crash.frame(setup, client, "the held turn")
+      client = Crash.send_frame!(client, frame)
+      :ok = Crash.await_kill_point!(:after_receipt, upstream, "resp_remote_sent_resend", release_ref)
+      assert Crash.generations(upstream) == 1
+      request_id = Crash.turn_request_id!(setup)
+      :ok = Crash.hold_socket!(client.socket)
+      :ok = Crash.kill_owner!(peer_owner.owner_pid)
+      assert Crash.await_outcome!(upstream, request_id, 1) == :settled
+      :ok = Crash.assert_settled_on_crash!(request_id, peer_owner.session.id)
+      assert List.last(Crash.close_client!(client)) == @crashed_close
+      assert Process.alive?(publisher)
+
+      {served, _answers} = Crash.resend_like_released_client!(port, setup, ctx.route, window, frame)
+      assert %{"type" => "response.completed", "response" => %{"id" => "resp_remote_sent_resend_written_again"}} = served
+      assert [predecessor, successor] = Crash.await_settled!(setup, 2)
+      assert predecessor.id == request_id
+      assert {predecessor.status, successor.status} == {"failed", "succeeded"}
+      assert Crash.generations(upstream) == 2
+      assert [%RequestClientRetryLink{successor_request_id: successor_id}] = Repo.all(from(l in RequestClientRetryLink, where: l.predecessor_request_id == ^request_id))
+      assert successor_id == successor.id
+      assert [zero] = Repo.all(from(e in LedgerEntry, where: e.request_id == ^request_id and e.entry_kind == "settlement" and e.amount_status == "recorded", select: e.settled_cost_micros))
+      assert Decimal.equal?(zero, 0)
+      assert [%LedgerEntry{total_tokens: 5, settled_cost_micros: cost}] = Repo.all(from(e in LedgerEntry, where: e.request_id == ^successor_id and e.entry_kind == "settlement" and e.amount_status == "recorded"))
+      assert Decimal.gt?(cost, 0)
     end
   end
 

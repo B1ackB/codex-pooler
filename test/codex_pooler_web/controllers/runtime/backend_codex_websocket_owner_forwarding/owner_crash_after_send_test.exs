@@ -287,34 +287,36 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.OwnerCrash
   # on a new socket. Once the proof of the attempt's executor's end exists the
   # duplicate-turn fence serves it once, linked to the settled turn, which stays
   # at no charge: the provider has the turn twice, once for each request.
-  test "native full: the client's resend of a turn settled owner_crashed after its payload left is served once" do
-    _publisher = CodexPooler.ExecutionProofSupport.start_publisher!()
-    release_ref = make_ref()
-    upstream = Crash.upstream!(:after_receipt, "resp_owner_sent", release_ref)
-    %{setup: setup, client: client, port: port, window: window} = connect!(upstream, %{route: Scenario.native_route(), mode: "full"})
-    frame = Crash.frame(setup, client, "the turn the provider holds")
-    client = Crash.send_frame!(client, frame)
+  for mode <- ["full", "lite"] do
+    test "native #{mode}: the client's resend of a turn settled owner_crashed after its payload left is served once" do
+      _publisher = CodexPooler.ExecutionProofSupport.start_publisher!()
+      release_ref = make_ref()
+      upstream = Crash.upstream!(:after_receipt, "resp_owner_sent", release_ref)
+      %{setup: setup, client: client, port: port, window: window} = connect!(upstream, %{route: Scenario.native_route(), mode: unquote(mode)})
+      frame = Crash.frame(setup, client, "the turn the provider holds")
+      client = Crash.send_frame!(client, frame)
 
-    :ok = Crash.await_kill_point!(:after_receipt, upstream, "resp_owner_sent", release_ref)
-    %{owner: owner, session_id: session_id, request_id: request_id} = turn!(client, setup)
-    :ok = Crash.hold_socket!(client.socket)
-    :ok = Crash.kill_owner!(owner)
-    assert Crash.await_outcome!(upstream, request_id, 1) == :settled
-    :ok = Crash.assert_settled_on_crash!(request_id, session_id)
-    assert List.last(Crash.close_client!(client)) == @crashed_close
-    :ok = await_executor_proof!(request_id)
+      :ok = Crash.await_kill_point!(:after_receipt, upstream, "resp_owner_sent", release_ref)
+      %{owner: owner, session_id: session_id, request_id: request_id} = turn!(client, setup)
+      :ok = Crash.hold_socket!(client.socket)
+      :ok = Crash.kill_owner!(owner)
+      assert Crash.await_outcome!(upstream, request_id, 1) == :settled
+      :ok = Crash.assert_settled_on_crash!(request_id, session_id)
+      assert List.last(Crash.close_client!(client)) == @crashed_close
+      :ok = await_executor_proof!(request_id)
 
-    retry = Scenario.connect!(port, setup, Scenario.native_route(), window)
-    retry = Crash.send_frame!(retry, frame)
-    {conn, websocket, served} = receive_native_terminal!(retry.conn, retry.websocket, retry.ref)
-    Scenario.close!(%{retry | conn: conn, websocket: websocket})
+      retry = Scenario.connect!(port, setup, Scenario.native_route(), window)
+      retry = Crash.send_frame!(retry, frame)
+      {conn, websocket, served} = receive_native_terminal!(retry.conn, retry.websocket, retry.ref)
+      Scenario.close!(%{retry | conn: conn, websocket: websocket})
 
-    assert %{"type" => "response.completed", "response" => %{"id" => "resp_owner_sent_written_again"}} = served
-    assert [%RequestClientRetryLink{successor_request_id: successor_id}] = Repo.all(from(link in RequestClientRetryLink, where: link.predecessor_request_id == ^request_id))
-    assert Scenario.settled_statuses!(setup, 2) == ["failed", "succeeded"]
-    assert Crash.generations(upstream) == 2
-    assert settled_cost(request_id) == Decimal.new(0)
-    assert Decimal.gt?(settled_cost(successor_id), 0)
+      assert %{"type" => "response.completed", "response" => %{"id" => "resp_owner_sent_written_again"}} = served
+      assert [%RequestClientRetryLink{successor_request_id: successor_id}] = Repo.all(from(link in RequestClientRetryLink, where: link.predecessor_request_id == ^request_id))
+      assert Scenario.settled_statuses!(setup, 2) == ["failed", "succeeded"]
+      assert Crash.generations(upstream) == 2
+      assert settled_cost(request_id) == Decimal.new(0)
+      assert Decimal.gt?(settled_cost(successor_id), 0)
+    end
   end
 
   # Kills the owner, in the order the schedulers give, with the socket held so

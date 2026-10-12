@@ -15,10 +15,11 @@ defmodule CodexPooler.Accounting.DeadExecutionResendRecoveryTest do
 
   alias CodexPooler.Accounting.RequestLifecycle
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, CodexTurn}
-  alias CodexPooler.Gateway.Runtime.Finalization.Interruption
+  alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, CodexTurn, SessionContinuity}
+  alias CodexPooler.Gateway.Runtime.Finalization.{AttemptSettlement, Interruption}
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Persistence, as: OwnerPersistence
-  alias CodexPooler.Gateway.Websocket.OwnerCleanup
+  alias CodexPooler.Gateway.Websocket.{DeliveryReceipt, OwnerCleanup}
+  alias CodexPooler.Platform.ExecutionTerminalProofs
   alias CodexPooler.Platform.InstancePresence
   alias CodexPooler.Platform.InstancePresence.Identity
   alias CodexPooler.Repo
@@ -374,6 +375,114 @@ defmodule CodexPooler.Accounting.DeadExecutionResendRecoveryTest do
     assert successor.predecessor_request_id == fixture.request.id
     assert ClientRetry.reserved_successor_claim?(successor.correlation_id)
   end
+
+  for {code, status} <- [{"owner_crashed", 502}, {"owner_unavailable", 503}], turn_status <- ["interrupted", "failed"] do
+    @tag :proven_owner_response_task
+    test "proven #{code} response-task failure permits one successor with #{turn_status} turn" do
+      fixture = response_task_owner_loss_fixture!(unquote(code), unquote(status), unquote(turn_status))
+      input = retry_input(fixture)
+      assert {:error, :terminal_predecessor} = owner_loss_preflight(fixture, input)
+      CodexPooler.ExecutionProofSupport.publish_terminal!(fixture.attempt)
+      assert ExecutionTerminalProofs.terminal?(fixture.attempt)
+      assert {:ok, %{client_retry_predecessor_request_id: predecessor_id}} = owner_loss_preflight(fixture, input)
+      assert predecessor_id == fixture.request.id
+
+      assert {:ok, %ClientRetry.SuccessorClaim{} = successor} =
+               Accounting.claim_client_retry_successor(
+                 fixture.setup.auth,
+                 fixture.setup.model,
+                 %{"model" => fixture.setup.model.exposed_model_id, "input" => []},
+                 Map.merge(input, %{
+                   codex_session: fixture.session,
+                   owner_idle_validated?: true,
+                   owner_lease_token: fixture.session.owner_lease_token,
+                   owner_instance_id: fixture.session.owner_instance_id
+                 })
+               )
+
+      assert successor.predecessor_request_id == fixture.request.id
+      assert ClientRetry.reserved_successor_claim?(successor.correlation_id)
+      assert Repo.aggregate(Ecto.Query.from(l in RequestClientRetryLink, where: l.predecessor_request_id == ^fixture.request.id), :count) == 1
+      assert {:error, _refusal} = owner_loss_preflight(fixture, input)
+      assert Repo.reload!(fixture.request).usage_status == "usage_unknown"
+      assert Repo.reload!(fixture.turn).status == unquote(turn_status)
+    end
+  end
+
+  for {code, status} <- [{"owner_crashed", 502}, {"owner_unavailable", 503}], control <- [:wrong_boot, :wrong_generation, :wrong_epoch, :wrong_witness, :foreign_key, :foreign_pool, :known_usage] do
+    @tag :proven_owner_response_task
+    test "canonical #{code} response-task failure rejects #{control}" do
+      fixture = response_task_owner_loss_fixture!(unquote(code), unquote(status), "interrupted", unquote(control))
+      CodexPooler.ExecutionProofSupport.publish_terminal!(fixture.attempt)
+      input = retry_input(fixture)
+      {fixture, input} = owner_loss_control(fixture, input, unquote(control))
+      assert {:error, _refusal} = owner_loss_preflight(fixture, input)
+      assert Repo.aggregate(Ecto.Query.from(l in RequestClientRetryLink, where: l.predecessor_request_id == ^fixture.request.id), :count) == 0
+    end
+  end
+
+  @tag :proven_owner_response_task
+  test "a terminal execution proof does not make an arbitrary interrupted failure retryable" do
+    fixture = active_dead_execution_fixture!()
+    assert {:ok, _settled} = AttemptSettlement.finalize_partial_stream_failure(fixture.request, fixture.attempt, %{status: "usage_unknown"}, %{response_status_code: 502, last_error_code: "other_owner_failure"})
+    assert Repo.reload!(fixture.turn).status == "failed"
+    fixture.turn |> Ecto.Changeset.change(status: "interrupted") |> Repo.update!()
+    CodexPooler.ExecutionProofSupport.publish_terminal!(fixture.attempt)
+    assert {:error, :terminal_predecessor} = owner_loss_preflight(fixture, retry_input(fixture))
+  end
+
+  @tag :proven_owner_response_task
+  test "a delivered measured success keeps its distinct identical-resend authority and recorded charge" do
+    fixture = active_dead_execution_fixture!()
+    assert :ok = SessionContinuity.mark_codex_turn_visible(fixture.request, fixture.attempt)
+    receipt = DeliveryReceipt.build(%{outcome: "delivered", terminal_class: "response.completed", highest_frame_class: "terminal", frames_after_visible: 1})
+    assert :ok = DeliveryReceipt.persist(fixture.attempt.id, receipt)
+    assert {:ok, _settled} = AttemptSettlement.finalize_success(fixture.request, fixture.attempt, %{status: "usage_known", input_tokens: 2, output_tokens: 1, total_tokens: 3}, %{})
+    CodexPooler.ExecutionProofSupport.publish_terminal!(fixture.attempt)
+    refute ClientRetry.verified_owner_crash?(Repo.reload!(fixture.turn), Repo.reload!(fixture.request), Repo.reload!(fixture.attempt))
+    assert {:ok, %{client_retry_predecessor_request_id: predecessor_id}} = owner_loss_preflight(fixture, retry_input(fixture))
+    assert predecessor_id == fixture.request.id
+    assert Repo.reload!(fixture.turn).status == "succeeded"
+    assert Repo.reload!(fixture.turn).first_visible_output_at != nil
+    assert Repo.reload!(fixture.attempt).response_metadata["downstream_delivery"] == receipt
+    assert [%LedgerEntry{total_tokens: 3}] = Repo.all(Ecto.Query.from(e in LedgerEntry, where: e.request_id == ^fixture.request.id and e.entry_kind == "settlement" and e.amount_status == "recorded"))
+  end
+
+  defp response_task_owner_loss_fixture!(code, status, turn_status, control \\ :none) do
+    fixture = active_dead_execution_fixture!()
+    usage = if control == :known_usage, do: %{status: "usage_known", input_tokens: 2, output_tokens: 1, total_tokens: 3}, else: %{status: "usage_unknown"}
+    assert {:ok, _settled} = AttemptSettlement.finalize_partial_stream_failure(fixture.request, fixture.attempt, usage, %{response_status_code: status, last_error_code: code})
+    assert Repo.reload!(fixture.turn).status == "interrupted"
+    turn = if turn_status == "failed", do: fixture.turn |> Ecto.Changeset.change(status: "failed") |> Repo.update!(), else: Repo.reload!(fixture.turn)
+    %{fixture | request: Repo.reload!(fixture.request), attempt: Repo.reload!(fixture.attempt), turn: turn}
+  end
+
+  defp owner_loss_preflight(fixture, input), do: Accounting.client_retry_preflight_snapshot(fixture.session, fixture.setup.api_key, fixture.setup.model, input)
+
+  defp owner_loss_control(fixture, input, :wrong_boot) do
+    fixture.attempt |> Ecto.Changeset.change(owner_instance_boot_id: "other-test-boot") |> Repo.update!()
+    {fixture, input}
+  end
+
+  defp owner_loss_control(fixture, input, :wrong_generation) do
+    fixture.attempt |> Ecto.Changeset.change(replay_generation: 1) |> Repo.update!()
+    {fixture, input}
+  end
+
+  defp owner_loss_control(fixture, input, :wrong_epoch), do: {fixture, Map.update!(input, :runtime_revocation_epoch, &(&1 + 1))}
+  defp owner_loss_control(fixture, input, :wrong_witness), do: {fixture, %{input | replay_claim_digest: :crypto.strong_rand_bytes(32)}}
+
+  defp owner_loss_control(fixture, input, :foreign_key) do
+    %{api_key: key} = CodexPooler.PoolerFixtures.active_api_key_fixture(fixture.setup.pool)
+    {%{fixture | setup: %{fixture.setup | api_key: key}}, input}
+  end
+
+  defp owner_loss_control(fixture, input, :foreign_pool) do
+    foreign = accounting_setup()
+    {%{fixture | setup: %{fixture.setup | api_key: foreign.api_key, model: foreign.model}}, input}
+  end
+
+  defp owner_loss_control(fixture, input, _control), do: {fixture, input}
 
   defp create_dead_attempt!(setup, request) do
     parent = self()

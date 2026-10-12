@@ -2156,16 +2156,16 @@ defmodule CodexPooler.Accounting.ClientRetry do
 
   # The same owner crash, settled by the socket's response task instead of
   # the socket's crash cleanup: the task records the failure it was answered,
-  # 502 `owner_crashed`, on a failed turn. Whichever of the two reaches the
-  # rows first decides the shape; a plain crash landed here in about four
+  # 502 `owner_crashed`, on a canonically interrupted turn (failed in older
+  # rows). Whichever of the two reaches the rows first decides the shape; a plain crash landed here in about four
   # cases out of nine, and after an owner killed by a new socket's reuse check
   # (whose lease takeover leaves the crash cleanup stale) always
   # (findings#270 row 270-313). The client's resend met `409 duplicate_turn`
   # and its turn was lost. The executor's proven end admits it, as for the
-  # interrupted shape.
+  # 499 cleanup shape.
   defp verified_proven_owner_crash_failure?(
          %CodexTurn{
-           status: "failed",
+           status: turn_status,
            error_code: "owner_crashed",
            final_attempt_id: attempt_id,
            transport_kind: "websocket",
@@ -2188,7 +2188,7 @@ defmodule CodexPooler.Accounting.ClientRetry do
            completed_at: %DateTime{}
          } = attempt
        )
-       when is_binary(attempt_id),
+       when turn_status in ["interrupted", "failed"] and is_binary(attempt_id),
        do: ExecutionTerminalProofs.terminal?(attempt)
 
   defp verified_proven_owner_crash_failure?(_turn, _request, _attempt), do: false
@@ -2200,14 +2200,14 @@ defmodule CodexPooler.Accounting.ClientRetry do
 
   # The owner's node cut off by a partition: the socket's response task, whose
   # forward to the cut owner failed, settles the turn with that answer, 503
-  # `owner_unavailable` on a failed turn, when it reaches the rows before the
-  # socket's crash cleanup (which writes the interrupted shape above). The
+  # `owner_unavailable` on an interrupted turn (failed in older rows), when
+  # it reaches the rows before the socket's crash cleanup (which writes the interrupted shape above). The
   # client's resend met `409 duplicate_turn` and its turn was lost
   # (findings#270 row 270-349). The executor's proven end admits it, as for
   # the other two shapes.
   defp verified_proven_owner_unavailable_failure?(
          %CodexTurn{
-           status: "failed",
+           status: turn_status,
            error_code: "owner_unavailable",
            final_attempt_id: attempt_id,
            transport_kind: "websocket",
@@ -2230,7 +2230,7 @@ defmodule CodexPooler.Accounting.ClientRetry do
            completed_at: %DateTime{}
          } = attempt
        )
-       when is_binary(attempt_id),
+       when turn_status in ["interrupted", "failed"] and is_binary(attempt_id),
        do: ExecutionTerminalProofs.terminal?(attempt)
 
   defp verified_proven_owner_unavailable_failure?(_turn, _request, _attempt), do: false

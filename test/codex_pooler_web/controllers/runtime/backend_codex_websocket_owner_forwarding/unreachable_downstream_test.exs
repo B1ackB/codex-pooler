@@ -496,7 +496,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.Unreachabl
     # turn still `in_progress`, and that task's settlement then raised
     # `Ecto.NoResultsError` in `lock_finalization_rows/2` (findings#270 row
     # 270-288).
-    assert {{"failed", 503, "owner_unavailable"}, {"failed", "owner_unavailable"}} == await_turn_settled!(turn.request_id)
+    assert {{"failed", 503, "owner_unavailable"}, {"interrupted", "owner_unavailable"}} == await_turn_settled!(turn.request_id)
 
     # The owner received the provider's `response.completed` and its usage
     # but had nobody to deliver it to. Its answer to that node's task keeps
@@ -689,7 +689,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.Unreachabl
   end
 
   defp settled_shape(:socket_first), do: {{"failed", 499, "owner_crashed"}, %{status: "interrupted", error_code: "owner_crashed"}}
-  defp settled_shape(:task_first), do: {{"failed", 503, "owner_unavailable"}, %{status: "failed", error_code: "owner_unavailable"}}
+  defp settled_shape(:task_first), do: {{"failed", 503, "owner_unavailable"}, %{status: "interrupted", error_code: "owner_unavailable"}}
 
   # The owner's upstream session, on the cut peer, closed the turn's
   # connection.

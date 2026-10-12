@@ -777,7 +777,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerProtocolIntegra
     assert_unchanged_owner_lease!(fixture.session, fixture.lease_token)
     refute_received {:websocket_owner_runtime_recovered, "corr-bound-probe", 1, _recovery}
     refute_received {:websocket_owner_frame, "corr-bound-probe", 1, _payload}
-    assert_failed_accounting!(fixture.accounting, "failed", "owner_crashed")
+    assert_failed_accounting!(fixture.accounting, "interrupted", "owner_crashed")
   end
 
   test "bound reset probe scope mismatches refuse a missing owner without generation", %{auth: auth} do
@@ -896,7 +896,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerProtocolIntegra
     assert FakeUpstream.count(recovery_upstream) == 0
     assert {:error, :owner_unavailable} = WebsocketOwnerSession.lookup(fixture.session.id)
     assert_unchanged_owner_lease!(fixture.session, fixture.lease_token)
-    assert_failed_accounting!(fixture.accounting, "failed", "owner_unavailable")
+    assert_failed_accounting!(fixture.accounting, "interrupted", "owner_unavailable")
     refute_received {:websocket_owner_runtime_recovered, ^correlation_id, 1, _recovery}
     refute_received {:websocket_owner_frame, ^correlation_id, 1, _payload}
   end
