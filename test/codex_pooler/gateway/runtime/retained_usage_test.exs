@@ -270,7 +270,7 @@ defmodule CodexPooler.Gateway.Runtime.RetainedUsageTest do
       assert state.recorded == 1
       assert state.window.known_total_tokens == 12
       assert state.request_status == if(order == :delivered, do: "succeeded", else: "failed")
-      assert state.turn_status == if(order == :delivered, do: "succeeded", else: "failed")
+      assert state.turn_status == if(order == :delivered, do: "succeeded", else: "interrupted")
       assert corrected.request.last_error_code == if(order == :delivered, do: nil, else: "owner_crashed")
       assert Decimal.equal?(corrected.settlement.settled_cost_micros, Decimal.new(140))
       CodexPooler.TestDiagnostics.puts("owner_crashed order=#{order} original=#{fixture.request.id}/#{fixture.attempt.id} database=#{Repo.config()[:database]} charge_reused=true committed_projection=#{inspect(state)} outcome=passed")
@@ -290,6 +290,56 @@ defmodule CodexPooler.Gateway.Runtime.RetainedUsageTest do
       refute Map.has_key?(ignored.attempt.response_metadata, "delivery_failure")
     end
 
+    assert projection(fixture) == before_state
+  end
+
+  for {code, status, turn_status} <- [{"owner_crashed", 499, "interrupted"}, {"owner_unavailable", 502, "interrupted"}, {"upstream_stream_error", 502, "failed"}, {"stream_idle_timeout", 504, "failed"}, {"owner_forward_timeout", 504, "failed"}], path <- [:retained, :ordinary] do
+    @tag canonical_turn_boundary: true, failure_code: code, failure_status: status, expected_turn: turn_status, completion_path: path
+    test "#{path} completion uses canonical turn disposition for #{code}", %{fixture: fixture, failure_code: code, failure_status: status, expected_turn: expected_turn, completion_path: path} do
+      failure = %{status: "failed", response_status_code: status, error_code: code}
+
+      result =
+        case path do
+          :retained ->
+            assert {:ok, snapshot} = RetainedUsage.capture(fixture.witness, fixture.principal, @usage, failure)
+            assert {:ok, result} = Sandbox.unboxed_run(Repo, fn -> RetainedUsage.finalize(snapshot) end)
+            assert {:ok, duplicate} = Sandbox.unboxed_run(Repo, fn -> RetainedUsage.finalize(snapshot) end)
+            assert result.settlement == duplicate.settlement
+            result
+
+          :ordinary ->
+            assert {:ok, result} = Sandbox.unboxed_run(Repo, fn -> AttemptSettlement.finalize_partial_stream_failure(fixture.request, fixture.attempt, @usage, %{response_status_code: status, last_error_code: code}) end)
+            result
+        end
+
+      state = projection(fixture)
+      assert state.turn_status == expected_turn
+      assert {result.request.status, result.request.last_error_code, result.request.response_status_code} == {"failed", code, status}
+      assert {result.attempt.status, result.attempt.network_error_code, result.attempt.upstream_status_code} == {"failed", code, status}
+      assert state.recorded == 1
+      assert state.window.known_total_tokens == 12
+      assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(140))
+      assert result.settlement.pricing_snapshot_id == fixture.pricing.id
+      CodexPooler.TestDiagnostics.puts("canonical turn path=#{path} code=#{code} status=#{status} turn=#{state.turn_status} request=#{fixture.request.id} attempt=#{fixture.attempt.id} measured_tokens=12 charge_count=1 result=passed")
+    end
+  end
+
+  @tag canonical_turn_boundary: true, generation: 1
+  test "closed replay owner-unavailable correction preserves authority and its known charge", %{fixture: fixture} do
+    first = Sandbox.unboxed_run(Repo, fn -> settle_first(fixture, :known_first) end)
+    closure = Sandbox.unboxed_run(Repo, fn -> Repo.get_by!(RequestReplayEntitlement, request_id: fixture.request.id) end)
+    assert closure.closed_at
+    failure = %{status: "failed", response_status_code: 502, error_code: "owner_unavailable"}
+    assert {:ok, snapshot} = RetainedUsage.capture(fixture.witness, fixture.principal, @usage, failure)
+    assert {:ok, result} = Sandbox.unboxed_run(Repo, fn -> RetainedUsage.finalize(snapshot) end)
+    assert result.settlement == first.settlement
+    assert result.request.last_error_code == "owner_unavailable"
+    assert result.request.response_status_code == 502
+    assert projection(fixture).turn_status == "interrupted"
+    assert Sandbox.unboxed_run(Repo, fn -> Repo.reload!(closure) end) == closure
+    assert {:ok, stale} = RetainedUsage.capture(fixture.original_witness, fixture.principal, @usage, failure)
+    before_state = projection(fixture)
+    assert {:stale_generation, _} = Sandbox.unboxed_run(Repo, fn -> RetainedUsage.finalize(stale) end)
     assert projection(fixture) == before_state
   end
 

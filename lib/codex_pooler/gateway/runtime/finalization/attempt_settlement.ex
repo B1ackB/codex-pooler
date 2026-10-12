@@ -15,7 +15,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement do
   alias CodexPooler.Gateway.Persistence.CodexTurn
   alias CodexPooler.Gateway.Persistence.SessionContinuity
   alias CodexPooler.Gateway.Persistence.SessionContinuity.OwnerWitness
-  alias CodexPooler.Gateway.Runtime.Finalization.SettlementRetry
+  alias CodexPooler.Gateway.Runtime.Finalization.{InterruptionOutcome, SettlementRetry}
   alias CodexPooler.Repo
 
   @type attrs :: %{optional(atom()) => term()}
@@ -276,12 +276,9 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement do
     FailureResponse.accounting_failure(operation, request, attempt, reason)
   end
 
-  defp partial_stream_turn_status("client_disconnected"), do: CodexTurn.interrupted_status()
-  defp partial_stream_turn_status(:client_disconnected), do: CodexTurn.interrupted_status()
-  # A rollout drain ends the turn the same way owner-side drain finalization
-  # does (`Finalization.Interruption.terminal_turn_status/1`): interrupted, not
-  # failed. The upstream did nothing wrong.
-  defp partial_stream_turn_status("owner_drained"), do: CodexTurn.interrupted_status()
-  defp partial_stream_turn_status(:owner_drained), do: CodexTurn.interrupted_status()
-  defp partial_stream_turn_status(_error_code), do: CodexTurn.failed_status()
+  defp partial_stream_turn_status(error_code) do
+    if InterruptionOutcome.interrupted_error_code?(error_code),
+      do: CodexTurn.interrupted_status(),
+      else: CodexTurn.failed_status()
+  end
 end
