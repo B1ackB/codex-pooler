@@ -141,7 +141,7 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
       token
     )
 
-    watcher =
+    watcher_control =
       start_cancellation_watcher(
         parent,
         coordinator,
@@ -151,23 +151,29 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
         Keyword.get(opts, :before_cancelled_coordinator_termination)
       )
 
-    :ok = ActivityRegistry.set_cancel_recipient(token, watcher, name: registry)
+    {watcher, watcher_monitor, _ownership} = watcher_control
 
-    case settle_admission_cancellation(token, registry, watcher) do
-      :active ->
-        run_callback_and_await_delivery(
-          parent,
-          coordinator,
-          token,
-          watcher,
-          registry,
-          run_callback,
-          cancel_callback,
-          opts
-        )
+    try do
+      :ok = ActivityRegistry.set_cancel_recipient(token, watcher, name: registry)
 
-      :cancelled ->
-        :ok
+      case settle_admission_cancellation(token, registry, watcher_control) do
+        :active ->
+          run_callback_and_await_delivery(
+            parent,
+            coordinator,
+            token,
+            watcher_control,
+            registry,
+            run_callback,
+            cancel_callback,
+            opts
+          )
+
+        :cancelled ->
+          :ok
+      end
+    after
+      Process.demonitor(watcher_monitor, [:flush])
     end
   end
 
@@ -175,7 +181,7 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
          parent,
          coordinator,
          token,
-         watcher,
+         {watcher, watcher_monitor, ownership},
          registry,
          run_callback,
          cancel_callback,
@@ -191,26 +197,33 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
            name: registry
          ) do
       :ok ->
+        Process.demonitor(watcher_monitor, [:flush])
         stop_cancellation_watcher(watcher, token)
         send(parent, {:websocket_response_activity, coordinator, token})
         send(parent, {:codex_response_done, coordinator, result})
         await_delivery(parent, token, registry, cancel_callback, outcome)
 
       {:cancelled, :owner_drained, ^watcher} ->
-        receive do
-          {:websocket_response_cancellation_settled, ^token} -> :ok
+        await_cancellation_settled(token, watcher, watcher_monitor)
+
+      {:error, :unknown_activity} = error ->
+        # Only this task's watcher can claim this private capability before
+        # removing its activity. Absence alone is never cancellation proof.
+        if :atomics.get(ownership, 1) == 1 do
+          await_cancellation_settled(token, watcher, watcher_monitor)
+        else
+          raise CaseClauseError, term: error
         end
     end
   end
 
-  defp settle_admission_cancellation(token, registry, watcher) do
+  defp settle_admission_cancellation(token, registry, {watcher, watcher_monitor, _ownership}) do
     case ActivityRegistry.status(token, name: registry) do
       {:active, :cancelling} ->
         forward_queued_admission_cancellation(token, watcher)
 
-        receive do
-          {:websocket_response_cancellation_settled, ^token} -> :cancelled
-        end
+        await_cancellation_settled(token, watcher, watcher_monitor)
+        :cancelled
 
       {:active, _status} ->
         :active
@@ -220,6 +233,15 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
 
       :unknown ->
         :cancelled
+    end
+  end
+
+  defp await_cancellation_settled(token, watcher, monitor) do
+    # The watcher sends settlement before exiting, so its message precedes
+    # its DOWN signal. An exit without that message must not strand this task.
+    receive do
+      {:websocket_response_cancellation_settled, ^token} -> :ok
+      {:DOWN, ^monitor, :process, ^watcher, _reason} -> exit(:websocket_response_cancellation_watcher_down)
     end
   end
 
@@ -322,39 +344,44 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
          cancel_callback,
          before_cancelled_coordinator_termination
        ) do
-    spawn(fn ->
-      monitor = Process.monitor(coordinator)
+    ownership = :atomics.new(1, signed: false)
 
-      receive do
-        {:websocket_activity_cancel, ^token, :owner_drained, :pre_dispatch} ->
-          settle_cancellation(
-            parent,
-            coordinator,
-            token,
-            registry,
-            cancel_callback,
-            false,
-            before_cancelled_coordinator_termination
-          )
+    {watcher, monitor} =
+      spawn_monitor(fn ->
+        monitor = Process.monitor(coordinator)
 
-        {:websocket_activity_cancel, ^token, :owner_drained} ->
-          settle_cancellation(
-            parent,
-            coordinator,
-            token,
-            registry,
-            cancel_callback,
-            true,
-            before_cancelled_coordinator_termination
-          )
+        receive do
+          {:websocket_activity_cancel, ^token, :owner_drained, :pre_dispatch} ->
+            settle_cancellation(
+              parent,
+              coordinator,
+              token,
+              registry,
+              cancel_callback,
+              false,
+              {before_cancelled_coordinator_termination, ownership}
+            )
 
-        {:websocket_response_cancel_watcher_stop, ^token} ->
-          Process.demonitor(monitor, [:flush])
+          {:websocket_activity_cancel, ^token, :owner_drained} ->
+            settle_cancellation(
+              parent,
+              coordinator,
+              token,
+              registry,
+              cancel_callback,
+              true,
+              {before_cancelled_coordinator_termination, ownership}
+            )
 
-        {:DOWN, ^monitor, :process, ^coordinator, _reason} ->
-          :ok
-      end
-    end)
+          {:websocket_response_cancel_watcher_stop, ^token} ->
+            Process.demonitor(monitor, [:flush])
+
+          {:DOWN, ^monitor, :process, ^coordinator, _reason} ->
+            :ok
+        end
+      end)
+
+    {watcher, monitor, ownership}
   end
 
   defp settle_cancellation(
@@ -364,7 +391,7 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
          registry,
          cancel_callback,
          kill_coordinator?,
-         before_cancelled_coordinator_termination
+         {before_cancelled_coordinator_termination, ownership}
        ) do
     _marked = ExecutionRegistry.mark_interruption(coordinator, "owner_drained")
     _cancel_result = cancel_callback.(coordinator, :owner_drained)
@@ -383,6 +410,10 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTask do
     delivery = await_cancellation_delivery(parent, parent_monitor, token, registry)
 
     Process.demonitor(parent_monitor, [:flush])
+
+    # Publish ownership before complete can remove the activity. A later
+    # handoff reads this synchronously, independent of mailbox signal order.
+    :ok = :atomics.put(ownership, 1, 1)
 
     case delivery do
       :completed ->

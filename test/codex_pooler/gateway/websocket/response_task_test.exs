@@ -162,50 +162,54 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTaskTest do
     refute_received {:codex_response_done, ^pid, {:error, :owner_drained}}
   end
 
-  test "cancellation admitted before watcher handoff settles without dispatch", %{
-    registry: registry
-  } do
-    parent = self()
+  for delivery <- [:aborted, :completed] do
+    @tag delivery: delivery
+    test "cancellation admitted before watcher handoff settles #{delivery} without dispatch", %{
+      registry: registry,
+      delivery: delivery
+    } do
+      parent = self()
 
-    {:ok, pid} =
-      ResponseTask.start(
-        parent,
-        :proxy,
-        fn _task_pid ->
-          send(parent, :forbidden_gap_dispatch)
-          :ok
-        end,
-        fn task_pid, reason -> send(parent, {:gap_cancelled, task_pid, reason}) end,
-        activity_registry: registry,
-        before_cancel_recipient_handoff: fn token ->
-          send(parent, {:before_cancel_recipient_handoff, self(), token})
+      {:ok, pid} =
+        ResponseTask.start(
+          parent,
+          :proxy,
+          fn _task_pid ->
+            send(parent, :forbidden_gap_dispatch)
+            :ok
+          end,
+          fn task_pid, reason -> send(parent, {:gap_cancelled, task_pid, reason}) end,
+          activity_registry: registry,
+          before_cancel_recipient_handoff: fn token ->
+            send(parent, {:before_cancel_recipient_handoff, self(), token})
 
-          receive do
-            :release_cancel_recipient_handoff -> :ok
+            receive do
+              :release_cancel_recipient_handoff -> :ok
+            end
           end
-        end
-      )
+        )
 
-    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :kill) end)
-    monitor = Process.monitor(pid)
-    assert_receive {:before_cancel_recipient_handoff, ^pid, token}
-    assert {_epoch, [%{token: ^token, pid: ^pid}]} = ActivityRegistry.begin_drain(name: registry)
-    assert :ok = ActivityRegistry.cancel(token, :owner_drained, name: registry)
-    assert {:active, :cancelling} = ActivityRegistry.status(token, name: registry)
-    send(pid, :release_cancel_recipient_handoff)
+      on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :kill) end)
+      monitor = Process.monitor(pid)
+      assert_receive {:before_cancel_recipient_handoff, ^pid, token}
+      assert {_epoch, [%{token: ^token, pid: ^pid}]} = ActivityRegistry.begin_drain(name: registry)
+      assert :ok = ActivityRegistry.cancel(token, :owner_drained, name: registry)
+      assert {:active, :cancelling} = ActivityRegistry.status(token, name: registry)
+      send(pid, :release_cancel_recipient_handoff)
 
-    refute_received :forbidden_gap_dispatch
-    assert_receive {:gap_cancelled, ^pid, :owner_drained}
-    assert_receive {:websocket_response_activity, ^pid, ^token}
+      refute_received :forbidden_gap_dispatch
+      assert_receive {:gap_cancelled, ^pid, :owner_drained}
+      assert_receive {:websocket_response_activity, ^pid, ^token}
 
-    assert_receive {:websocket_response_activity_cancelled, ^pid, ^token, ack_pid, :owner_drained}
+      assert_receive {:websocket_response_activity_cancelled, ^pid, ^token, ack_pid, :owner_drained}
 
-    assert :ok = ResponseTask.acknowledge_delivery(ack_pid, token)
-    assert_receive {:codex_response_done, ^pid, {:error, :owner_drained}}
-    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
-    assert {:finished, :aborted} = ActivityRegistry.status(token, name: registry)
-    refute_received :forbidden_gap_dispatch
-    refute_received {:codex_response_done, ^pid, {:error, :owner_drained}}
+      assert :ok = ResponseTask.acknowledge_delivery(ack_pid, token, delivery)
+      if delivery == :aborted, do: assert_receive({:codex_response_done, ^pid, {:error, :owner_drained}})
+      assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+      assert {:finished, ^delivery} = ActivityRegistry.status(token, name: registry)
+      refute_received :forbidden_gap_dispatch
+      refute_received {:codex_response_done, ^pid, {:error, :owner_drained}}
+    end
   end
 
   test "cancellation accepted before completion handoff cannot be lost to the old watcher", %{
@@ -262,6 +266,109 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTaskTest do
     assert {:finished, :aborted} = ActivityRegistry.status(token, name: registry)
     refute_received {:codex_response_done, ^pid, :ok}
     refute_received {:handoff_cancelled, ^pid, :owner_drained}
+    assert ActivityRegistry.activities(name: registry) == []
+  end
+
+  test "cancellation ownership survives activity removal while its original executor is held", %{registry: registry} do
+    %{pid: pid, monitor: monitor, token: token, watcher: watcher, watcher_monitor: watcher_monitor, execution: execution} = held_completion!(registry)
+    cancel_and_hold_watcher!(registry, pid, token, watcher)
+    assert ActivityRegistry.status(token, name: registry) == :unknown
+    send(pid, {:release_held_completion, token})
+    await_cancellation_wait!(pid)
+    assert ExecutionRegistry.status(execution.owner_execution_id, pid) == :alive
+    refute Enum.any?(ExecutionRegistry.pending(10_000), &(&1.owner_execution_id == execution.owner_execution_id))
+    send(watcher, {:release_held_watcher, token})
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}, @shutdown_detection_ms
+    assert_receive {:DOWN, ^watcher_monitor, :process, ^watcher, :normal}, @shutdown_detection_ms
+    assert :dead = ExecutionRegistry.status(execution.owner_execution_id, pid)
+    [proof] = Enum.filter(ExecutionRegistry.pending(10_000), &(&1.owner_execution_id == execution.owner_execution_id))
+    assert %{end_kind: "process_down", interruption_code: "owner_drained"} = proof
+    refute_received {:codex_response_done, ^pid, :ok}
+    refute_received {:codex_response_done, ^pid, {:error, :owner_drained}}
+    assert ActivityRegistry.activities(name: registry) == []
+  end
+
+  test "completed cancellation settlement precedes watcher DOWN after activity removal", %{registry: registry} do
+    %{pid: pid, monitor: monitor, token: token, watcher: watcher, watcher_monitor: watcher_monitor} = held_completion!(registry)
+    assert {_epoch, [_entry]} = ActivityRegistry.begin_drain(name: registry)
+    assert :ok = ActivityRegistry.cancel(token, :owner_drained, name: registry)
+    assert_receive {:held_cancel_callback, ^watcher, ^pid}, @shutdown_detection_ms
+    assert_receive {:websocket_response_activity_cancelled, ^pid, ^token, ^watcher, :owner_drained}, @shutdown_detection_ms
+    ResponseTask.acknowledge_delivery(watcher, token, :completed)
+    assert_receive {:DOWN, ^watcher_monitor, :process, ^watcher, :normal}, @shutdown_detection_ms
+    assert {:finished, :completed} = ActivityRegistry.status(token, name: registry)
+    assert Process.alive?(pid)
+    send(pid, {:release_held_completion, token})
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, @shutdown_detection_ms
+    refute_received {:codex_response_done, ^pid, :ok}
+    refute_received {:codex_response_done, ^pid, {:error, :owner_drained}}
+    assert ActivityRegistry.activities(name: registry) == []
+  end
+
+  @tag capture_log: true
+  test "another watcher's cancellation cannot authorize a missing activity", %{registry: registry} do
+    foreign = held_completion!(registry)
+    own = held_completion!(registry)
+    cancel_and_hold_watcher!(registry, foreign.pid, foreign.token, foreign.watcher)
+    ActivityRegistry.unregister(own.token, :failed, name: registry)
+    send(own.pid, {:release_held_completion, own.token})
+    assert_receive {:DOWN, monitor, :process, pid, {%CaseClauseError{term: {:error, :unknown_activity}}, _stack}}, @shutdown_detection_ms
+    assert monitor == own.monitor and pid == own.pid
+    assert_receive {:DOWN, watcher_monitor, :process, watcher, :normal}, @shutdown_detection_ms
+    assert watcher_monitor == own.watcher_monitor and watcher == own.watcher
+    send(foreign.pid, {:release_held_completion, foreign.token})
+    await_cancellation_wait!(foreign.pid)
+    send(foreign.watcher, {:release_held_watcher, foreign.token})
+    assert_receive {:DOWN, monitor, :process, pid, :killed}, @shutdown_detection_ms
+    assert monitor == foreign.monitor and pid == foreign.pid
+    assert_receive {:DOWN, watcher_monitor, :process, watcher, :normal}, @shutdown_detection_ms
+    assert watcher_monitor == foreign.watcher_monitor and watcher == foreign.watcher
+    refute_received {:codex_response_done, _, :ok}
+    assert ActivityRegistry.activities(name: registry) == []
+  end
+
+  for handoff <- [:before_watcher_death, :after_watcher_death] do
+    @tag capture_log: true, handoff: handoff
+    test "removed activity fails when its watcher dies #{handoff}", %{registry: registry, handoff: handoff} do
+      %{pid: pid, monitor: monitor, token: token, watcher: watcher, watcher_monitor: watcher_monitor} = held_completion!(registry)
+      cancel_and_hold_watcher!(registry, pid, token, watcher)
+
+      if handoff == :before_watcher_death do
+        send(pid, {:release_held_completion, token})
+        await_cancellation_wait!(pid)
+      end
+
+      Process.exit(watcher, :kill)
+      assert_receive {:DOWN, ^watcher_monitor, :process, ^watcher, :killed}, @shutdown_detection_ms
+      if handoff == :after_watcher_death, do: send(pid, {:release_held_completion, token})
+      assert_receive {:DOWN, ^monitor, :process, ^pid, :websocket_response_cancellation_watcher_down}, @shutdown_detection_ms
+      refute_received {:codex_response_done, ^pid, :ok}
+      assert ActivityRegistry.activities(name: registry) == []
+    end
+  end
+
+  @tag capture_log: true
+  test "registry loss during watcher completion cannot strand a recovered missing activity", %{registry: registry} do
+    %{pid: pid, monitor: monitor, token: token, watcher: watcher, watcher_monitor: watcher_monitor} = held_completion!(registry)
+    assert :ok = ActivityRegistry.cancel(token, :owner_drained, name: registry)
+    assert_receive {:held_cancel_callback, ^watcher, ^pid}, @shutdown_detection_ms
+    assert_receive {:websocket_response_activity_cancelled, ^pid, ^token, ^watcher, :owner_drained}, @shutdown_detection_ms
+    registry_pid = Process.whereis(registry)
+    :ok = :sys.suspend(registry_pid)
+
+    on_exit(fn ->
+      if Process.alive?(registry_pid), do: :sys.resume(registry_pid)
+    end)
+
+    ResponseTask.acknowledge_delivery(watcher, token, :aborted)
+    await_registry_completion!(registry_pid, watcher, token, System.monotonic_time(:millisecond) + @shutdown_detection_ms)
+    Process.exit(registry_pid, :kill)
+    assert_receive {:DOWN, ^watcher_monitor, :process, ^watcher, _reason}, @shutdown_detection_ms
+    await_registry_restart!(registry, registry_pid, System.monotonic_time(:millisecond) + @shutdown_detection_ms)
+    assert ActivityRegistry.status(token, name: registry) == :unknown
+    send(pid, {:release_held_completion, token})
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :websocket_response_cancellation_watcher_down}, @shutdown_detection_ms
+    refute_received {:codex_response_done, ^pid, :ok}
     assert ActivityRegistry.activities(name: registry) == []
   end
 
@@ -580,6 +687,94 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTaskTest do
     refute_receive {:websocket_response_activity, ^pid, _token}, 0
     assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
     assert {_epoch, []} = ActivityRegistry.begin_drain(name: registry)
+  end
+
+  defp held_completion!(registry) do
+    parent = self()
+
+    {:ok, pid} =
+      ResponseTask.start(
+        parent,
+        :proxy,
+        fn task ->
+          send(parent, {:held_execution, task, ExecutionIdentity.local()})
+          :ok
+        end,
+        fn task, :owner_drained -> send(parent, {:held_cancel_callback, self(), task}) end,
+        activity_registry: registry,
+        before_completion_handoff: fn token, watcher ->
+          send(parent, {:held_completion, self(), token, watcher})
+
+          receive do
+            {:release_held_completion, ^token} -> :ok
+          after
+            @shutdown_detection_ms -> flunk("held completion was not released")
+          end
+        end,
+        before_cancelled_coordinator_termination: fn token, task ->
+          send(parent, {:held_watcher, self(), token, task})
+
+          receive do
+            {:release_held_watcher, ^token} -> :ok
+          after
+            @shutdown_detection_ms -> flunk("held watcher was not released")
+          end
+        end
+      )
+
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :kill) end)
+    monitor = TestProcess.monitor_flushed(pid)
+    assert_receive {:held_execution, ^pid, execution}, @shutdown_detection_ms
+    assert_receive {:held_completion, ^pid, token, watcher}, @shutdown_detection_ms
+    on_exit(fn -> if Process.alive?(watcher), do: Process.exit(watcher, :kill) end)
+    %{pid: pid, monitor: monitor, token: token, watcher: watcher, watcher_monitor: TestProcess.monitor_flushed(watcher), execution: execution}
+  end
+
+  defp cancel_and_hold_watcher!(registry, pid, token, watcher) do
+    assert :ok = ActivityRegistry.cancel(token, :owner_drained, name: registry)
+    assert_receive {:held_cancel_callback, ^watcher, ^pid}, @shutdown_detection_ms
+    assert_receive {:websocket_response_activity_cancelled, ^pid, ^token, ^watcher, :owner_drained}, @shutdown_detection_ms
+    ResponseTask.acknowledge_delivery(watcher, token, :aborted)
+    assert_receive {:codex_response_done, ^pid, {:error, :owner_drained}}, @shutdown_detection_ms
+    assert_receive {:held_watcher, ^watcher, ^token, ^pid}, @shutdown_detection_ms
+  end
+
+  defp await_cancellation_wait!(pid), do: await_cancellation_wait!(pid, System.monotonic_time(:millisecond) + @shutdown_detection_ms)
+
+  defp await_cancellation_wait!(pid, deadline) do
+    case Process.info(pid, :current_function) do
+      {:current_function, {ResponseTask, :await_cancellation_settled, 3}} ->
+        :ok
+
+      observed ->
+        assert System.monotonic_time(:millisecond) < deadline, "coordinator did not reach cancellation wait: #{inspect(observed)}"
+        Process.sleep(1)
+        await_cancellation_wait!(pid, deadline)
+    end
+  end
+
+  defp await_registry_completion!(registry, watcher, token, deadline) do
+    {:messages, messages} = Process.info(registry, :messages)
+
+    if Enum.any?(messages, &match?({:"$gen_call", {^watcher, _}, {:complete, ^token, :aborted}}, &1)) do
+      :ok
+    else
+      assert System.monotonic_time(:millisecond) < deadline, "watcher did not request activity completion"
+      Process.sleep(1)
+      await_registry_completion!(registry, watcher, token, deadline)
+    end
+  end
+
+  defp await_registry_restart!(registry, previous, deadline) do
+    case Process.whereis(registry) do
+      pid when is_pid(pid) and pid != previous ->
+        :ok
+
+      _ ->
+        assert System.monotonic_time(:millisecond) < deadline, "activity registry did not restart"
+        Process.sleep(1)
+        await_registry_restart!(registry, previous, deadline)
+    end
   end
 
   defp forward_socket_messages(test_pid) do
