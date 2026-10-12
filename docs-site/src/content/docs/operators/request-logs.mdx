@@ -55,7 +55,7 @@ Primary filters are:
     </tr>
     <tr>
       <td>Status</td>
-      <td>Limits rows by the status each row shows: in progress, succeeded, failed, client cancelled, or rejected. <code>Failed</code> leaves out the requests the client cancelled, and the menu says so; choose <code>Client cancelled</code> to list those, or <code>Any status</code> to see both.</td>
+      <td>Limits rows by the status each row shows: accepted, in progress, succeeded, failed, client cancelled, or rejected. <code>Failed</code> leaves out the requests the client cancelled, and the menu says so; choose <code>Client cancelled</code> to list those, or <code>Any status</code> to see both.</td>
     </tr>
     <tr>
       <td>Upstream account</td>
@@ -121,15 +121,30 @@ The table shows the latest matching rows, with a hard page size limit.
 
 The table keeps endpoint details to two lines and uses an ellipsis when text exceeds the available width. On narrow screens, the same record reflows into grouped fields; token values remain visible while the composition bar and legend step aside. The footer shows the operator timezone, result range and paging controls.
 
+## Live updates and the detail drawer
+
+Opening a request holds the table in place while its detail drawer continues to refresh from committed changes. A pinned page also keeps its rows in place and counts newer arrivals. The global pause control stops automatic changes to both the table and the open detail:
+
+| Page | Drawer | Live updates running | Live updates paused |
+| --- | --- | --- | --- |
+| Latest | Closed | Table refreshes. | Table stays unchanged. |
+| Latest | Open | Table stays unchanged; detail refreshes. | Table and detail stay unchanged. |
+| Pinned | Closed | Rows stay unchanged; newer-arrival count refreshes. | Rows and newer-arrival count stay unchanged. |
+| Pinned | Open | Rows stay unchanged; detail and newer-arrival count refresh. | Rows, detail, and newer-arrival count stay unchanged. |
+
+Closing the drawer catches up the latest table when live updates are running; a pinned page stays pinned. Resuming applies pending committed changes while preserving those page and drawer rules. An older background query cannot overwrite a newer selection or apply an automatic update after pause.
+
+Pause applies to automatic refresh. Explicit navigation, filter changes, and opening a detail still work. Permission changes take effect while paused and remove rows or detail the operator can no longer access.
+
 ## Status and errors
 
-Use status and errors together. A completed row with token usage usually means the request reached an upstream and settled successfully. A failed row may still show route, latency, or partial attempt metadata. A rejected row usually means admission or policy failed before upstream work.
+Use status and errors together. `Accepted` has a clock icon and means the request was admitted while its execution reservation is pending; it is distinct from `In progress`. A succeeded row describes delivery, while token and cost fields describe accounting. A failed or client-cancelled row can still carry measured usage. A rejected row usually means admission or policy failed before upstream work.
 
 OpenAI Responses `response.incomplete` can be a successful delivered terminal response. For example, an upstream may stop at `max_output_tokens` or a content filter and still return safe usage metadata. Those rows stay `succeeded` and should not be treated as upstream health failures. Error-coded incomplete terminals, stale continuation anchors, and stream truncation still appear as failures with sanitized error codes.
 
 ### Client cancelled
 
-A request whose client closed the connection before the response finished is recorded as failed with the error code `client_disconnected` and shown as `Client cancelled`. It is a display class, not a recorded status: the request keeps its recorded status `failed`. Clients do this on purpose: Codex interrupts a stream to send the next request when new input is waiting, and agents cancel parallel calls they no longer need. A proxy or network path that closes the connection between the client and Codex Pooler looks the same. None of it says anything about the upstream account, so the class is kept apart everywhere failures are counted:
+A failed request with `client_disconnected` is shown as `Client cancelled`, unless its interruption metadata identifies a server idle timeout. This display class keeps the recorded status `failed`. It can reflect an explicit stop, automatic client interruption, or connection loss through a proxy or network path. The label alone does not identify the cause, prove user intent, establish an upstream fault, or imply zero usage. The class is kept apart wherever failures are counted:
 
 1. the upstream cockpit counts it on its own, outside the failed requests, the failure rate and the degraded state
 2. the Stats page shows it next to the succeeded and failed counts and leaves it out of the success rate
@@ -256,7 +271,16 @@ A turn the idle window closed while it was still running is recorded as `client_
 
 Usage lines summarize request accounting, including request count context, token totals, cached input tokens, and estimated cost when pricing is available. Treat these as operational attribution and capacity evidence. They are not a replacement for provider billing records or the key-local Observatory projection.
 
-If usage is blank, check the request status first. A request can be admitted without final usage if it failed before settlement, if pricing was not matched, or if accounting metadata was not available for that route. A delivered incomplete response with missing upstream usage remains `usage_unknown` and does not get an invented settled cost from the reservation estimate. A request the Pooler refused before anything reached the upstream, such as a `previous_response_id` the current upstream connection cannot resolve, settles with usage `not_applicable`: no tokens, no estimated cost and no provisional token-budget pressure.
+Read usage independently of delivery status. When Codex Pooler has received measured usage for the same request before an interruption, it can retain and settle those counters while the delivery outcome remains failed or client cancelled. A committed accounting correction updates that request; it does not turn the interrupted response into a delivered success or charge the same receipt twice.
+
+| Usage state | What it means |
+| --- | --- |
+| `usage_known` | Measured counters are available, including a measured zero. A missing price can still leave cost unavailable. |
+| `usage_unknown` | Measured usage evidence is unavailable. A dash is not a measured zero, including on failed, cancelled, or delivered incomplete requests. An omitted counter alone does not establish this state. |
+| Provisional estimate | A reservation or pending-accounting estimate, not measured token usage or settled cost. |
+| `not_applicable` | The request was refused before upstream work; there are no tokens, estimated cost, or provisional token-budget pressure. |
+
+Usage that the upstream never delivered to Codex Pooler cannot be recovered from a cancellation label or a reservation estimate. Retaining a receipt already received does not guarantee recovery after a hard process or node loss before persistence.
 
 ### Service tiers
 

@@ -68,9 +68,11 @@ The table shows requests admitted in the last 60 minutes, newest first, independ
 
 Consecutive requests with the same endpoint class, status and client that name no model and carry no tokens, such as clients listing models, fold into one `— no model · N requests` row that shows the newest time of the group. Refreshing starts a new hour snapshot and replaces any older pages already loaded.
 
-A request whose client closed the connection before the response finished, for example a client that interrupts a stream to send its next request, is shown as `Client cancelled` instead of a failure. The success rate leaves these requests out of both its counts, and its detail line says how many there were.
+A failed request classified as `Client cancelled` can reflect an explicit stop, automatic client interruption, or connection loss. The label alone does not identify the cause or prove user intent; a recorded server idle timeout stays a failure. The success rate excludes client cancellations from its succeeded and failed counts, and its detail line says how many there were.
 
-Rejected requests appear as `Rejected` with a sanitized failure reason and count as failures. Requests awaiting execution appear as `Accepted`; requests already executing appear as `In progress`.
+Delivery outcome and accounting are separate. Measured usage retained for a failed or client-cancelled request still contributes to token and cost totals when settled; an accounting correction does not make that response a success. Known zero usage is a measured value. Without measured usage evidence, usage remains unknown; an omitted counter alone does not establish that state. A provisional estimate is not measured usage. Usage never received by Codex Pooler cannot be inferred from a cancellation. The [request-log usage states](/operators/request-logs/#usage-metadata) explain these distinctions.
+
+Rejected requests appear as `Rejected` with a sanitized failure reason and count as failures. Requests admitted while their execution reservation is pending appear as `Accepted`; requests already executing appear as `In progress`.
 
 The page refreshes while visible. You can pause and resume refresh, and a hidden or disconnected browser stops periodic refreshes until it becomes visible or connected again. The dashboard displays explicit loading, empty, partial-accounting, stale, disconnected, and temporary-error states instead of filling gaps with invented values.
 
