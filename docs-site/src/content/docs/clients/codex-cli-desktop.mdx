@@ -270,6 +270,8 @@ If Codex repeatedly enters a broken login/account state with a Pooler provider, 
 
 This setup connects Codex's model requests to Pooler. It does not proxy your ChatGPT account or every OpenAI feature. Leave `chatgpt_base_url` unchanged; see [Runtime routes](/reference/runtime-routes/) for the supported requests.
 
+For Codex Mobile Remote behavior and the desktop-first workaround, see [Codex Mobile on Codex Pooler](/clients/codex-mobile/).
+
 Codex can interrupt a response to handle new input while the model is still generating. Pooler supports this, and the tokens generated before the interruption still count toward usage.
 
 When Codex works with other agents, it can pause a reply to read their updates and then continue. This can explain some cancelled entries in the request log while the conversation keeps going.

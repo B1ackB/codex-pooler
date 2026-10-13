@@ -1,0 +1,58 @@
+---
+title: Codex Mobile on Codex Pooler
+sidebar:
+  label: Codex Mobile
+description: Continue Codex Pooler chats from your phone with Remote. Set up Codex Desktop, create a chat there, then open it on mobile.
+---
+
+Codex Mobile's Remote in the ChatGPT app lets you continue your Codex Desktop work from your phone. Send instructions, review changes and approve commands while your computer runs the task.
+
+:::caution[Create the chat on desktop first]
+New chats started from your phone can use your ChatGPT account instead of Codex Pooler, even when your computer is configured for Pooler.
+
+**Workaround:** create the chat in Codex Desktop with Codex Pooler configured, then open that same chat in Remote on your phone and continue there. Follow [Verify the connection](#verify-the-connection) to check that your mobile messages reach Pooler.
+:::
+
+## Before you start
+
+- Install [Codex Desktop](https://developers.openai.com/codex/app/) and the ChatGPT mobile app. Follow OpenAI's [Remote guide](https://developers.openai.com/blog/mastering-codex-remote-for-engineering) to connect your phone to your computer.
+- Have a Codex Pooler URL reachable from your computer and a [Pool API key](/getting-started/quick-start/).
+- Sign in to the account used for Remote and select the computer and project you want to work on.
+
+## Configure the connection
+
+Set up Pooler on your computer using the [Codex CLI / Desktop guide](/clients/codex-cli-desktop/). If Desktop already works through Pooler, keep that setup. Your Pool API key stays on your computer; you do not enter it on your phone.
+
+Stay signed in to ChatGPT for Remote to work. In the mobile app, connect to the computer where you configured Pooler and select your project.
+
+## Choose a model
+
+1. In Codex Desktop, choose a model from your Pool's model list.
+2. Create a new chat on your computer and send the first message there.
+3. On your phone, open Remote, select the same computer and open that existing chat.
+4. Continue the conversation from your phone using the model you selected on desktop.
+
+Use this desktop-first workflow for each new chat. Choosing a Pool model on your phone does not by itself avoid the new-chat problem.
+
+## Verify the connection
+
+Send a short message from your phone in the chat you created on desktop. If you have access to Pooler's admin, open [Request logs](/operators/request-logs/) and look for the message's time and model. Otherwise, ask your Pool operator to check it for you.
+
+A reply alone does not confirm that Pooler handled the message. Check once after setup and again after changing your model or account. If the request is missing, use the troubleshooting steps below.
+
+## Troubleshooting
+
+| Problem | What to do |
+| --- | --- |
+| A new chat from mobile rejects the model or uses your ChatGPT account | Create a new chat in Codex Desktop with Pooler configured, send its first message there, then open that same chat from Remote. |
+| A mobile reply has no matching Pooler request | Check that you opened the desktop-created chat on the intended computer. Test a message on desktop first, then another from mobile; ask your Pool operator to check both if needed. |
+| Desktop cannot connect to Pooler | Recheck the URL and API key using the [Desktop setup guide](/clients/codex-cli-desktop/#troubleshooting), then restart Desktop. |
+| The chat is missing from Remote | Check the selected computer, account and project, then look for the chat on desktop. A missing history entry does not necessarily mean the chat was deleted. |
+| Remote is unavailable after changing the Desktop setup | Check that Desktop is still signed in to ChatGPT, then reconnect Remote. See the [Desktop troubleshooting guide](/clients/codex-cli-desktop/#troubleshooting) if sign-in is unavailable. |
+| Approvals or sandbox settings differ on mobile | Check the chat's permission settings separately; changing the model connection does not set tool permissions. |
+
+## Compatibility notes
+
+Remote uses your computer's Codex setup. Pooler handles the model requests; OpenAI still handles Remote pairing and account features. Keep the rest of your OpenAI connection settings unchanged. See [Runtime routes](/reference/runtime-routes/) for the supported endpoints.
+
+This new-chat limitation affects [Android Remote](https://github.com/openai/codex/issues/23659) and [iOS Remote](https://github.com/openai/codex/issues/33054). See [Codex Mobile support tracking](https://github.com/icoretech/codex-pooler/issues/149) for further details. Use the desktop-first workaround above when you want the chat to use Pooler.
