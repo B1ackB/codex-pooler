@@ -14,7 +14,7 @@ defmodule CodexPoolerWeb.V1.InputImageDetailTest do
 
   import CodexPoolerWeb.Runtime.BackendCodexWebsocketSupport, only: [model_serving_scope: 0, set_model_serving_mode!: 3]
 
-  alias CodexPooler.Accounting.Request
+  alias CodexPooler.Accounting.{LedgerEntry, Request}
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Repo
 
@@ -29,6 +29,28 @@ defmodule CodexPoolerWeb.V1.InputImageDetailTest do
   }
 
   for mode <- ["full", "lite"] do
+    test "/v1/responses keeps equal-pixel reservations equal on #{mode}" do
+      upstream = start_upstream(FakeUpstream.json_response(@completed))
+      setup = gateway_setup(upstream, model_metadata: @vision_metadata)
+      _revision = set_model_serving_mode!(model_serving_scope(), setup, unquote(mode))
+      locators = Enum.map([0, 9], &png_locator/1)
+      assert byte_size(hd(locators)) > byte_size(List.last(locators))
+
+      for locator <- locators do
+        payload = %{"model" => setup.model.exposed_model_id, "input" => [%{"role" => "user", "content" => [%{"type" => "input_image", "image_url" => locator}]}]}
+        response = build_conn() |> auth(setup) |> post("/v1/responses", payload)
+        assert response.status == 200
+      end
+
+      reservations = Repo.all(from(e in LedgerEntry, where: e.pool_id == ^setup.pool.id and e.entry_kind == "reservation"))
+      assert length(reservations) == 2
+      assert [input] = reservations |> Enum.map(& &1.input_tokens) |> Enum.uniq()
+      assert input > 1_600
+      assert Enum.all?(reservations, &(&1.details["image_estimate"]["image_count"] == 1))
+      captured_sizes = for request <- FakeUpstream.requests(upstream), item <- request.json["input"], part <- List.wrap(item["content"]), is_map(part) and part["type"] == "input_image", do: byte_size(part["image_url"])
+      assert Enum.sort(captured_sizes) == Enum.sort(Enum.map(locators, &byte_size/1))
+    end
+
     @tag serving_mode: mode
     test "/v1/responses drops a null message input_image detail and keeps a string one on a #{mode} model", %{conn: conn, serving_mode: mode} do
       upstream = start_upstream(FakeUpstream.json_response(@completed))
@@ -58,6 +80,7 @@ defmodule CodexPoolerWeb.V1.InputImageDetailTest do
 
       refute Map.has_key?(null_image, "detail")
       assert high_image["detail"] == if(mode == "lite", do: nil, else: "high")
+      assert_image_reservation(setup, 2)
     end
 
     @tag serving_mode: mode
@@ -85,6 +108,7 @@ defmodule CodexPoolerWeb.V1.InputImageDetailTest do
 
       assert %{"object" => "chat.completion"} = json_response(conn, 200)
       assert [original_image, null_image] = captured_images(upstream)
+      assert_image_reservation(setup, 2)
 
       # Lite removes the hint, as the released client does for a Responses Lite
       # model; Full forwards it as the Responses adapter does.
@@ -270,6 +294,36 @@ defmodule CodexPoolerWeb.V1.InputImageDetailTest do
     assert [captured] = FakeUpstream.requests(upstream)
     assert [%{"output" => output}] = for(%{"type" => "function_call_output", "call_id" => ^call_id} = item <- captured.json["input"], do: item)
     output
+  end
+
+  defp assert_image_reservation(setup, count) do
+    request = Repo.one!(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    reservation = Repo.one!(from(e in LedgerEntry, where: e.request_id == ^request.id and e.entry_kind == "reservation"))
+    expected = %{"version" => 1, "basis" => "fixed_per_image_allowance", "image_count" => count, "image_tokens" => count * 1_600, "tokens_per_image" => 1_600}
+    assert reservation.details["image_estimate"] == expected
+    assert request.request_metadata["reservation"]["image_estimate"] == expected
+    assert reservation.input_tokens > count * 1_600
+    settlement = Repo.one!(from(e in LedgerEntry, where: e.request_id == ^request.id and e.entry_kind == "settlement"))
+    assert settlement.input_tokens == 4
+    assert request.usage_status == "usage_known"
+  end
+
+  defp png_locator(level) do
+    compressor = :zlib.open()
+
+    compressed =
+      try do
+        :ok = :zlib.deflateInit(compressor, level)
+        bytes = :zlib.deflate(compressor, :binary.copy(<<0>> <> :binary.copy(<<0, 0, 0>>, 256), 256), :finish)
+        :ok = :zlib.deflateEnd(compressor)
+        IO.iodata_to_binary(bytes)
+      after
+        :zlib.close(compressor)
+      end
+
+    chunk = fn type, bytes -> <<byte_size(bytes)::32, type::binary, bytes::binary, :erlang.crc32(type <> bytes)::32>> end
+    bytes = <<137, 80, 78, 71, 13, 10, 26, 10>> <> chunk.("IHDR", <<256::32, 256::32, 8, 2, 0, 0, 0>>) <> chunk.("IDAT", compressed) <> chunk.("IEND", "")
+    "data:image/png;base64," <> Base.encode64(bytes)
   end
 
   defp captured_images(upstream) do

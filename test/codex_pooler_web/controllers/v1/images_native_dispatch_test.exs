@@ -230,6 +230,13 @@ defmodule CodexPoolerWeb.V1.ImagesNativeDispatchTest do
       if @operation == "edits" do
         assert [%{"image_url" => "data:image/png;base64," <> encoded}] = captured.json["images"]
         assert Base.decode64!(encoded) == png()
+        expected = %{"version" => 1, "basis" => "fixed_per_image_allowance", "image_count" => 1, "image_tokens" => 1_600, "tokens_per_image" => 1_600}
+        assert request.request_metadata["reservation"]["image_estimate"] == expected
+        reservation = Repo.one!(from(e in LedgerEntry, where: e.request_id == ^request.id and e.entry_kind == "reservation"))
+        assert reservation.details["image_estimate"] == expected
+        assert reservation.input_tokens > 1_600
+      else
+        refute Map.has_key?(request.request_metadata["reservation"], "image_estimate")
       end
 
       assert [attempt] = Repo.all(Attempt)

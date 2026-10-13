@@ -8,6 +8,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
 
   alias CodexPooler.Access
   alias CodexPooler.Accounting.NativeContentFilterRetry
+  alias CodexPooler.Accounting.PricingResolution.InputEstimate
 
   alias CodexPooler.Accounting.{
     Attempt,
@@ -899,7 +900,8 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
                 payload,
                 pricing.snapshot,
                 policy,
-                attr(opts, :reservation_estimate)
+                attr(opts, :reservation_estimate),
+                %{source_endpoint: input.endpoint}
               )
 
             case ReservationPolicy.enforce_reservation_limits(api_key, policy, estimate) do
@@ -1035,7 +1037,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
           Repo.get!(CodexPooler.Catalog.PricingSnapshot, reservation.pricing_snapshot_id),
       pricing_status: reservation.details["pricing_status"],
       pricing_service_tier: reservation.details["service_tier"],
-      estimate: estimate,
+      estimate: restore_image_estimate(estimate, estimate_metadata),
       link: link,
       correlation_id: request.correlation_id,
       dispatch_authority: ClientRetry.dispatch_authority(predecessor.request, request, link)
@@ -1225,7 +1227,8 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
             payload,
             pricing.snapshot,
             policy,
-            attr(opts, :reservation_estimate)
+            attr(opts, :reservation_estimate),
+            %{source_endpoint: endpoint}
           )
 
         case ReservationPolicy.enforce_reservation_limits(api_key, policy, estimate) do
@@ -1551,19 +1554,29 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
 
     opts_metadata
     |> Metadata.sanitize_metadata()
+    |> Map.drop([:image_estimate, "image_estimate"])
     |> Map.merge(%{
       "pricing" => PricingResolution.metadata(pricing),
-      "reservation" => %{
-        "input_tokens" => estimate.input_tokens,
-        "cached_input_tokens" => estimate.cached_input_tokens,
-        "output_tokens" => estimate.output_tokens,
-        "reasoning_tokens" => estimate.reasoning_tokens,
-        "total_tokens" => estimate.total_tokens,
-        "estimated_cost_micros" => decimal_string_or_nil(estimate.estimated_cost_micros),
-        "strategy" => estimate.strategy
-      },
+      "reservation" =>
+        %{
+          "input_tokens" => estimate.input_tokens,
+          "cached_input_tokens" => estimate.cached_input_tokens,
+          "output_tokens" => estimate.output_tokens,
+          "reasoning_tokens" => estimate.reasoning_tokens,
+          "total_tokens" => estimate.total_tokens,
+          "estimated_cost_micros" => decimal_string_or_nil(estimate.estimated_cost_micros),
+          "strategy" => estimate.strategy
+        }
+        |> InputEstimate.put_metadata(Map.get(estimate, :image_estimate)),
       "api_key" => %{"id" => auth.api_key.id, "prefix" => auth.api_key.key_prefix}
     })
+  end
+
+  defp restore_image_estimate(estimate, metadata) do
+    case InputEstimate.provenance(metadata["image_estimate"]) do
+      nil -> estimate
+      provenance -> Map.put(estimate, :image_estimate, provenance)
+    end
   end
 
   defp denied_request_metadata(auth, opts) do

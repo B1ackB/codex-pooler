@@ -5,6 +5,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.Accounting.PreAttemptRelease
   alias CodexPooler.Accounting.PricingResolution
+  alias CodexPooler.Accounting.PricingResolution.InputEstimate
   alias CodexPooler.Accounting.RequestLifecycle.ReferenceLocks
   alias CodexPooler.Accounting.RequestLifecycle.WindowUsage
   alias CodexPooler.Repo
@@ -33,7 +34,8 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
           required(:reasoning_tokens) => non_neg_integer() | nil,
           required(:total_tokens) => non_neg_integer() | nil,
           required(:estimated_cost_micros) => cost(),
-          required(:strategy) => String.t() | atom() | nil
+          required(:strategy) => String.t() | atom() | nil,
+          optional(:image_estimate) => InputEstimate.provenance()
         }
   @type ledger_attrs :: %{
           required(:request_id) => Ecto.UUID.t(),
@@ -185,6 +187,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
           "key_prefix" => Map.get(auth, :key_prefix) || api_key.key_prefix
         }
         |> Map.merge(PricingResolution.details(pricing))
+        |> InputEstimate.put_metadata(Map.get(estimate, :image_estimate))
     }
   end
 

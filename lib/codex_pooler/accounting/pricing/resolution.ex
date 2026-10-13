@@ -28,7 +28,7 @@ defmodule CodexPooler.Accounting.PricingResolution do
           input_tokens
 
         _estimate ->
-          Costing.estimate_input_tokens(payload)
+          Costing.estimate_input_tokens(payload, %{source_endpoint: attr(opts, :endpoint) || "/backend-api/codex/responses"})
       end
 
     lookup_for_tier(
@@ -95,8 +95,8 @@ defmodule CodexPooler.Accounting.PricingResolution do
 
   def latest_snapshot_for_request(%Request{}, nil), do: nil
 
-  @spec reservation_estimate(map(), struct() | nil, term(), map() | nil) :: {:ok, map()}
-  defdelegate reservation_estimate(payload, snapshot, policy, precomputed \\ nil), to: Costing
+  @spec reservation_estimate(map(), struct() | nil, term(), map() | nil, CodexPooler.Accounting.PricingResolution.InputEstimate.context()) :: {:ok, map()}
+  defdelegate reservation_estimate(payload, snapshot, policy, precomputed \\ nil, context \\ %{}), to: Costing
 
   @spec cost_micros(struct() | nil, map()) :: Decimal.t() | nil
   defdelegate cost_micros(snapshot, usage), to: Costing

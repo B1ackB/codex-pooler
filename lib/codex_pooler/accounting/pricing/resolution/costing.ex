@@ -3,15 +3,21 @@ defmodule CodexPooler.Accounting.PricingResolution.Costing do
   Pricing reservation estimates, token estimates, and cost calculations.
   """
 
+  alias CodexPooler.Accounting.PricingResolution.InputEstimate
   alias CodexPooler.Catalog.PricingSnapshot
 
-  @reservation_strategy "json_bytes_div_4_ceil"
   @default_output_reservation_tokens 512
   @opaque_context_output_reservation_tokens 2_048
 
-  @spec reservation_estimate(map(), struct() | nil, term(), map() | nil) :: {:ok, map()}
-  def reservation_estimate(payload, snapshot, policy, precomputed \\ nil) do
-    input_tokens = precomputed_input_tokens(precomputed) || estimate_input_tokens(payload)
+  @spec reservation_estimate(map(), struct() | nil, term(), map() | nil, InputEstimate.context()) :: {:ok, map()}
+  def reservation_estimate(payload, snapshot, policy, precomputed \\ nil, context \\ %{}) do
+    input =
+      case precomputed do
+        %{input_tokens: tokens} when is_integer(tokens) -> InputEstimate.precomputed(precomputed)
+        _ -> input_estimate(payload, context)
+      end
+
+    input_tokens = input.input_tokens
 
     output_tokens =
       precomputed_output_tokens(precomputed) || output_reservation_tokens(payload, snapshot, nil)
@@ -33,8 +39,9 @@ defmodule CodexPooler.Accounting.PricingResolution.Costing do
            output_tokens: output_tokens,
            reasoning_tokens: 0
          }),
-       strategy: @reservation_strategy
-     }}
+       strategy: input.strategy
+     }
+     |> Map.merge(Map.take(input, [:image_estimate]))}
   end
 
   @spec cost_micros(struct() | nil, map()) :: Decimal.t() | nil
@@ -84,12 +91,11 @@ defmodule CodexPooler.Accounting.PricingResolution.Costing do
     |> Decimal.add(snapshot.request_base_micros || Decimal.new(0))
   end
 
-  @spec estimate_input_tokens(map()) :: non_neg_integer()
-  def estimate_input_tokens(payload) do
-    payload
-    |> prompt_payload()
-    |> estimate_tokens()
-  end
+  @spec input_estimate(map(), InputEstimate.context()) :: InputEstimate.t()
+  def input_estimate(payload, context \\ %{}), do: InputEstimate.estimate(payload, context)
+
+  @spec estimate_input_tokens(map(), InputEstimate.context()) :: non_neg_integer()
+  def estimate_input_tokens(payload, context \\ %{}), do: input_estimate(payload, context).input_tokens
 
   defp output_reservation_tokens(payload, _snapshot, policy) do
     payload_cap =
@@ -101,11 +107,6 @@ defmodule CodexPooler.Accounting.PricingResolution.Costing do
     |> Enum.reject(&is_nil/1)
     |> Enum.max()
   end
-
-  defp precomputed_input_tokens(%{input_tokens: input_tokens}) when is_integer(input_tokens),
-    do: input_tokens
-
-  defp precomputed_input_tokens(_precomputed), do: nil
 
   defp precomputed_output_tokens(%{output_tokens: output_tokens}) when is_integer(output_tokens),
     do: output_tokens
@@ -181,30 +182,6 @@ defmodule CodexPooler.Accounting.PricingResolution.Costing do
       end
     end)
   end
-
-  defp prompt_payload(payload) do
-    Map.drop(payload, [
-      "model",
-      :model,
-      "stream",
-      :stream,
-      "max_tokens",
-      :max_tokens,
-      "max_output_tokens",
-      :max_output_tokens
-    ])
-  end
-
-  defp estimate_tokens(payload) when map_size(payload) == 0, do: 0
-
-  defp estimate_tokens(payload) do
-    payload
-    |> CodexPooler.JSON.encode!()
-    |> byte_size()
-    |> then(&ceil_div(&1, 4))
-  end
-
-  defp ceil_div(value, divisor), do: div(value + divisor - 1, divisor)
 
   defp get_int(map, keys),
     do: keys |> Enum.find_value(fn key -> Map.get(map, key) end) |> int_value()

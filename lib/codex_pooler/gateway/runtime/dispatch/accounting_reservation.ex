@@ -287,7 +287,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
       PricingResolution.reservation_estimate(
         payload,
         nil,
-        nil
+        nil,
+        nil,
+        %{source_endpoint: endpoint}
       )
 
     %{}

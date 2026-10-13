@@ -209,6 +209,24 @@ defmodule CodexPooler.Accounting.PricingContextBoundariesTest do
     assert estimated.price_bucket == "default"
   end
 
+  test "image allowance selects context price bands consistently in direct and precomputed lookup" do
+    import_catalog!("2026-10-12T00:00:00Z", %{"sample-image-estimate" => model_prices(1_600, 1_600)})
+    model = %Model{pricing_ref: "sample-image-estimate"}
+
+    for {payload, context, opts} <- [
+          {%{"input" => [%{"role" => "user", "content" => [%{"type" => "input_image", "image_url" => "https://example.com/image.png"}]}]}, %{}, %{}},
+          {%{"images" => [%{"image_url" => "https://example.com/image.png"}]}, %{source_endpoint: "/backend-api/codex/images/edits"}, %{endpoint: "/backend-api/codex/images/edits"}}
+        ] do
+      {:ok, estimate} = PricingResolution.reservation_estimate(payload, nil, nil, nil, context)
+      assert estimate.input_tokens > 1_600
+      direct = PricingResolution.lookup(model, model.pricing_ref, payload, opts, @as_of)
+      precomputed = PricingResolution.lookup(model, model.pricing_ref, payload, Map.put(opts, :reservation_estimate, estimate), @as_of)
+      assert direct == precomputed
+      assert direct.price_bucket == "long_context"
+      assert direct.context_pricing["band"] == "long"
+    end
+  end
+
   test "malformed persisted rule fields fail closed with a bounded reason" do
     for {label, corrupt_rule} <- [
           {"boolean", stored_rule(true)},

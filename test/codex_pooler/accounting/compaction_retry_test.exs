@@ -712,6 +712,23 @@ defmodule CodexPooler.Accounting.CompactionRetryTest do
     assert Repo.get!(Request, first.request.id).status == "failed"
   end
 
+  test "image allowance survives successor creation and reclaim without accepting a new estimate" do
+    {setup, _predecessor, opts} = predecessor!("client_disconnected", 0)
+    opts = live_owner!(setup, opts)
+    payload = %{"input" => [%{"role" => "user", "content" => [%{"type" => "input_image", "image_url" => "https://example.com/image.png"}]}]}
+    assert {:ok, first} = Accounting.claim_compaction_retry_successor(setup.auth, setup.model, payload, forwarding_opts(opts, 1))
+    assert first.estimate.image_estimate.image_count == 1
+    assert first.estimate.image_estimate.image_tokens == 1_600
+    assert first.request.request_metadata["reservation"]["image_estimate"] == first.reservation.details["image_estimate"]
+    counts = row_counts()
+    incoming = opts |> forwarding_opts(2) |> Map.put(:reservation_estimate, %{input_tokens: 99, output_tokens: 99})
+    assert {:ok, reclaimed} = Accounting.claim_compaction_retry_successor(setup.auth, setup.model, %{}, incoming)
+    assert reclaimed.estimate == first.estimate
+    assert reclaimed.reservation == first.reservation
+    assert reclaimed.request.request_metadata["reservation"] == first.request.request_metadata["reservation"]
+    assert row_counts() == counts
+  end
+
   test "reclaimed authority fences an old worker before its first attempt" do
     {setup, _predecessor, opts} = predecessor!("client_disconnected", 0)
     opts = live_owner!(setup, opts)

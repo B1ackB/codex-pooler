@@ -10,6 +10,30 @@ defmodule CodexPooler.Accounting.MetadataTest do
   import CodexPooler.AccountingTestSupport
 
   describe "sanitize_metadata/1" do
+    test "image allowance provenance preserves only the complete typed receipt" do
+      receipt = %{"version" => 1, "basis" => "fixed_per_image_allowance", "image_count" => 2, "image_tokens" => 3_200, "tokens_per_image" => 1_600}
+      assert Accounting.sanitize_metadata(%{"image_estimate" => Map.put(receipt, "image_url", "synthetic locator")}) == %{"image_estimate" => receipt}
+
+      for invalid <- [nil, "synthetic", Map.put(receipt, "version", 2), Map.put(receipt, "version", 1.0), Map.put(receipt, "basis", "caller"), Map.put(receipt, "image_count", "2"), Map.put(receipt, "image_tokens", 1), Map.put(receipt, "image_tokens", 3_200.0), Map.put(receipt, "tokens_per_image", 1), Map.put(receipt, "tokens_per_image", 1_600.0), Map.delete(receipt, "image_count")] do
+        assert Accounting.sanitize_metadata(%{"image_estimate" => invalid}) == %{"image_estimate" => nil}
+      end
+
+      assert Accounting.sanitize_metadata(%{"other_image_data" => receipt}) == %{"other_image_data" => "[REDACTED]"}
+    end
+
+    test "caller metadata cannot add image provenance to a text or legacy reservation" do
+      setup = accounting_setup()
+      receipt = %{"version" => 1, "basis" => "fixed_per_image_allowance", "image_count" => 1, "image_tokens" => 1_600, "tokens_per_image" => 1_600}
+      payload = %{"model" => setup.model.exposed_model_id, "input" => "synthetic text"}
+
+      for estimate <- [nil, %{input_tokens: 10, output_tokens: 20}] do
+        assert {:ok, reserved} = Accounting.reserve(setup.auth, setup.model, payload, %{reservation_estimate: estimate, request_metadata: %{"reservation" => %{"image_estimate" => receipt}, "image_estimate" => receipt}})
+        refute Map.has_key?(reserved.request.request_metadata, "image_estimate")
+        refute Map.has_key?(reserved.request.request_metadata["reservation"], "image_estimate")
+        refute Map.has_key?(reserved.reservation.details, "image_estimate")
+      end
+    end
+
     # findings#238: this is the sanitizer attempt settlement applies to
     # response metadata. An allowlisted frame header name keeps its bounded
     # value even when it carries a redaction fragment; a name outside the
