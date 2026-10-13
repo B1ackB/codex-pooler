@@ -5,7 +5,7 @@ defmodule CodexPooler.Alerts.WebhookDeliveryDeadlineTest do
   import CodexPooler.PoolerFixtures
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Alerts
-  alias CodexPooler.Alerts.Delivery.{Execution, WebhookDelivery}
+  alias CodexPooler.Alerts.Delivery.{Execution, WebhookDelivery, WebhookDestination}
   alias CodexPooler.Alerts.Schemas.AlertDeliveryAttempt
   alias CodexPooler.Jobs.AlertDeliveryWorker
   alias CodexPooler.Platform.OutboundHTTP
@@ -166,6 +166,87 @@ defmodule CodexPooler.Alerts.WebhookDeliveryDeadlineTest do
     CodexPooler.TestDiagnostics.puts("alert-drip established_before_budget=true deadline_ms=300 executor_down=true peer_released=true")
   end
 
+  @tag slow: "holds the caller while the real HTTPS transport exhausts its absolute budget"
+  test "an exhausted HTTPS receive budget keeps the delivery timeout receipt when the caller resumes after the transport", context do
+    TestAppEnv.restore_on_exit(WebhookDestination)
+    parent = self()
+
+    Application.put_env(:codex_pooler, WebhookDestination,
+      resolver: fn
+        _, :inet ->
+          send(parent, {:delivery_executor, self()})
+          {:ok, [context.ip]}
+
+        _, :inet6 ->
+          {:error, :nxdomain}
+      end
+    )
+
+    fixture = fixture!(%{context | host: "webhook.example.test"}, :drip)
+    execution = %{Execution.new(fixture.job) | deadline: System.monotonic_time(:millisecond) + 2_000}
+    tasks = start_supervised!(Task.Supervisor)
+
+    caller =
+      Task.Supervisor.async_nolink(tasks, fn ->
+        WebhookDelivery.deliver_incident_to_channel(fixture.incident.id, fixture.channel.id, 1, delivery_execution: execution)
+      end)
+
+    assert_receive {:delivery_executor, executor}, 5_000
+    monitor = Process.monitor(executor)
+    assert_receive {:https_request, _receiver}, 5_000
+
+    try do
+      assert :erlang.suspend_process(caller.pid)
+      assert_receive {:DOWN, ^monitor, :process, ^executor, :normal}, 5_000
+      assert Execution.remaining(execution) == 0
+    after
+      :erlang.resume_process(caller.pid)
+    end
+
+    assert {:error, %{code: "alert_webhook_delivery_timeout", retryable: true}} = Task.await(caller, 5_000)
+    assert_receive :https_connection_released, 5_000
+    [attempt] = Repo.all(from a in AlertDeliveryAttempt, where: a.incident_id == ^fixture.incident.id)
+    assert attempt.status == "retryable"
+    assert attempt.response_metadata["delivery_outcome"] == "unknown"
+    assert attempt.response_metadata["delivery_execution"]["job_id"] == fixture.job.id
+    assert DateTime.compare(attempt.next_retry_at, attempt.completed_at) == :gt
+  end
+
+  @tag slow: "exercises the real five-second TLS connection timeout before the delivery deadline"
+  test "an earlier TLS connection timeout remains a transport timeout while the delivery budget is available", context do
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, ip: context.ip])
+    on_exit(fn -> :gen_tcp.close(listener) end)
+    {:ok, port} = :inet.port(listener)
+    tasks = start_supervised!(Task.Supervisor)
+    parent = self()
+
+    peer =
+      Task.Supervisor.async_nolink(tasks, fn ->
+        {:ok, socket} = :gen_tcp.accept(listener, 10_000)
+
+        try do
+          {:ok, _hello} = :gen_tcp.recv(socket, 0, 5_000)
+          send(parent, :early_tls_started)
+          await_tls_close(socket, 10_000)
+        after
+          :gen_tcp.close(socket)
+        end
+      end)
+
+    pool = pool_fixture()
+    {:ok, channel} = Alerts.create_channel(context.scope, %{channel_type: "webhook", display_name: "connect deadline", endpoint_url: "https://#{context.host}:#{port}/hooks", webhook_signing_secret: "synthetic-connect-secret"})
+    incident = alert_incident_fixture(pool: pool)
+    execution = Execution.new()
+    assert {:error, %{code: "alert_webhook_transport_timeout", retryable: true}} = WebhookDelivery.deliver_incident_to_channel(incident.id, channel.id, 1, delivery_execution: execution)
+    assert Execution.remaining(execution) > 0
+    assert_receive :early_tls_started
+    assert Task.await(peer, 5_000) == {:error, :closed}
+    [attempt] = Repo.all(from a in AlertDeliveryAttempt, where: a.incident_id == ^incident.id)
+    assert attempt.status == "retryable"
+    assert attempt.response_metadata["transport_reason"] == "timeout"
+    refute Map.has_key?(attempt.response_metadata, "delivery_outcome")
+  end
+
   test "TLS negotiation that never answers is cancelled by the same absolute deadline" do
     {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
     on_exit(fn -> :gen_tcp.close(listener) end)
@@ -320,9 +401,9 @@ defmodule CodexPooler.Alerts.WebhookDeliveryDeadlineTest do
     end
   end
 
-  defp await_tls_close(socket) do
-    case :gen_tcp.recv(socket, 0, 5_000) do
-      {:ok, _tls_alert} -> await_tls_close(socket)
+  defp await_tls_close(socket, timeout \\ 5_000) do
+    case :gen_tcp.recv(socket, 0, timeout) do
+      {:ok, _tls_alert} -> await_tls_close(socket, timeout)
       {:error, reason} -> {:error, reason}
     end
   end

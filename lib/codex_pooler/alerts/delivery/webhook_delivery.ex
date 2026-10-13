@@ -168,12 +168,26 @@ defmodule CodexPooler.Alerts.Delivery.WebhookDelivery do
       {"x-codex-pooler-signature", signature}
     ]
 
-    result = Execution.run(execution, fn -> post_webhook(endpoint_url, body, headers, execution) end)
+    result =
+      Execution.run(execution, fn ->
+        endpoint_url
+        |> post_webhook(body, headers, execution)
+        |> classify_delivery_timeout(execution)
+      end)
 
     Execution.storage(execution, fn ->
       record_delivery_result(result, attempt, incident, channel, event_id, byte_size(body), {DateTime.utc_now(), retry_attempt})
     end)
   end
+
+  # Classify in the outbound task: a completed early transport error may wait
+  # in its caller's mailbox until after the absolute delivery deadline.
+  defp classify_delivery_timeout({:error, %{__struct__: module, reason: :timeout}} = result, execution)
+       when module in [Req.TransportError, Finch.TransportError, Mint.TransportError] do
+    if Execution.remaining(execution) == 0, do: {:error, :delivery_timeout}, else: result
+  end
+
+  defp classify_delivery_timeout(result, _execution), do: result
 
   # Only status is consumed. Drain through Req's streaming parser without
   # retaining body chunks; framing errors and the absolute deadline still apply.
