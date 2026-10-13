@@ -19,6 +19,7 @@ defmodule CodexPoolerWeb.Admin.SavedResetRedemptionWorkflowIntegrationTest do
   alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
   alias CodexPooler.Upstreams.SavedResets.Convergence
   alias Ecto.Adapters.SQL.Sandbox
+  alias Phoenix.LiveViewTest.ClientProxy
 
   @consume "/api/codex/rate-limit-reset-credits/consume"
   @usage "/api/codex/usage"
@@ -38,6 +39,75 @@ defmodule CodexPoolerWeb.Admin.SavedResetRedemptionWorkflowIntegrationTest do
     Process.unlink(task_supervisor)
     Agent.update(resources, &[{:task_supervisor, task_supervisor} | &1])
     %{resources: resources, task_supervisor: task_supervisor}
+  end
+
+  test "view teardown waits for its deferred cockpit audit query", context do
+    %{identity: identity} = upstream_assignment_fixture(pool_fixture())
+    {list, cockpit} = open_views(context, identity)
+    render_async(list, @detection_timeout)
+    render_async(cockpit, @detection_timeout)
+    tag = {__MODULE__, make_ref()}
+    on_exit(fn -> :telemetry.detach(tag) end)
+    :ok = :telemetry.attach(tag, [:codex_pooler, :repo, :query], &__MODULE__.hold_cockpit_audit/4, %{context: context, parent: self(), view: cockpit.pid, tag: tag})
+    render_click(cockpit, "refresh_data", %{})
+    assert_receive {^tag, :audit_held, actor}, @detection_timeout
+    monitor = Process.monitor(actor)
+    stopper = Task.async(fn -> stop_view(cockpit) end)
+
+    try do
+      assert await_async_shutdown(cockpit.pid, System.monotonic_time(:millisecond) + @detection_timeout) == :waiting
+      assert Task.yield(stopper, 0) == nil
+    after
+      :telemetry.detach(tag)
+      send(actor, {:release_cockpit_audit, tag})
+      Task.await(stopper, @detection_timeout)
+    end
+
+    assert_receive {:DOWN, ^monitor, :process, ^actor, :normal}, @detection_timeout
+    refute Process.alive?(cockpit.pid)
+    finish(context, [list, cockpit], [], "async_view_teardown")
+  end
+
+  @doc false
+  @spec hold_cockpit_audit([atom()], map(), map(), map()) :: :ok
+  def hold_cockpit_audit(_event, _measurements, metadata, %{context: context, parent: parent, view: view, tag: tag}) do
+    query = to_string(metadata[:query])
+
+    if view in Process.get(:"$callers", []) and String.contains?(query, "audit_events") and String.contains?(query, "count(") do
+      remember(context, {:gate, self(), :release_cockpit_audit, tag})
+      send(parent, {tag, :audit_held, self()})
+
+      receive do
+        {:release_cockpit_audit, ^tag} -> :ok
+      after
+        @detection_timeout -> raise "cockpit audit barrier was not released"
+      end
+    end
+
+    :ok
+  end
+
+  defp await_async_shutdown(view, deadline) do
+    case Process.info(view, :current_stacktrace) do
+      nil ->
+        :stopped
+
+      {:current_stacktrace, stack} ->
+        poll_async_shutdown(view, stack, deadline)
+    end
+  end
+
+  defp poll_async_shutdown(view, stack, deadline) do
+    if Enum.any?(stack, fn {module, function, _, _} -> module == Phoenix.LiveView.Channel and String.contains?(Atom.to_string(function), "await_asyncs") end) do
+      :waiting
+    else
+      assert System.monotonic_time(:millisecond) < deadline, "view did not enter async shutdown"
+
+      receive do
+      after
+        1 -> await_async_shutdown(view, deadline)
+      end
+    end
   end
 
   test "one_manual_consume_open_views_confirm", context do
@@ -180,7 +250,7 @@ defmodule CodexPoolerWeb.Admin.SavedResetRedemptionWorkflowIntegrationTest do
     # rendered acceptance nor its browser state is used by the replacement.
     stop_view(list)
     {:ok, replacement, _} = live(context.conn, ~p"/admin/upstreams")
-    remember(context, {:view, replacement.pid})
+    remember(context, {:view, replacement})
     render_click(replacement, "open_saved_reset_policy", %{"id" => fixture.identity.id})
     assert has_element?(replacement, heading(:bank, fixture.identity), "Request accepted")
     render_click(replacement, "redeem_saved_reset", target(fixture))
@@ -450,9 +520,9 @@ defmodule CodexPoolerWeb.Admin.SavedResetRedemptionWorkflowIntegrationTest do
 
   defp open_views(context, identity) do
     {:ok, list, _} = live(context.conn, ~p"/admin/upstreams")
-    remember(context, {:view, list.pid})
+    remember(context, {:view, list})
     {:ok, cockpit, _} = live(context.conn, ~p"/admin/upstreams/#{identity.id}")
-    remember(context, {:view, cockpit.pid})
+    remember(context, {:view, cockpit})
     {list, cockpit}
   end
 
@@ -531,7 +601,18 @@ defmodule CodexPoolerWeb.Admin.SavedResetRedemptionWorkflowIntegrationTest do
     assert counts.websocket_generation == 0
   end
 
-  defp stop_view(view), do: stop_pid(view.pid)
+  defp stop_view(view) do
+    monitor = CodexPooler.TestProcess.monitor_flushed(view.pid)
+    {_ref, _topic, proxy} = view.proxy
+
+    try do
+      ClientProxy.stop(proxy, {:shutdown, :cleanup})
+    catch
+      :exit, _ -> :ok
+    end
+
+    assert_receive {:DOWN, ^monitor, :process, _, _}, @detection_timeout
+  end
 
   defp stop_pid(pid) do
     Process.unlink(pid)
@@ -562,7 +643,7 @@ defmodule CodexPoolerWeb.Admin.SavedResetRedemptionWorkflowIntegrationTest do
       Agent.get(
         context.resources,
         &Enum.count(&1, fn
-          {:view, pid} -> Process.alive?(pid)
+          {:view, view} -> Process.alive?(view.pid)
           {:task, pid} -> Process.alive?(pid)
           {:fake, fake} -> Process.alive?(fake.supervisor)
           {:fake_name, name} -> not is_nil(Process.whereis(name))
@@ -597,7 +678,7 @@ defmodule CodexPoolerWeb.Admin.SavedResetRedemptionWorkflowIntegrationTest do
       tracker ->
         resources = Agent.get(tracker, & &1)
         for {:gate, pid, kind, ref} <- resources, do: send(pid, {kind, ref})
-        for {:view, pid} <- resources, do: stop_pid(pid)
+        for {:view, view} <- resources, do: stop_view(view)
         # Closing owned HTTP connections also releases a handler whose gate
         # notice never reached the test. Let writers finish before owner teardown.
         for {:fake, fake} <- resources, do: FakeUpstream.stop(fake)
