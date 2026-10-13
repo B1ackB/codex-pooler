@@ -266,7 +266,7 @@ Most OpenAI-compatible clients are unaware of Lite and need no configuration for
 
 - `parallel_tool_calls` is overridden to `false`, so parallel tool calling is off regardless of what was requested.
 - `reasoning.context` is forced to `all_turns`.
-- `detail` pins on input images are not forwarded. A `detail` of `high` or `low` has no effect in Lite.
+- `detail` pins on input images are not forwarded. A `detail` of `high` or `low` has no effect in Lite. The local [image allowance](/operators/api-keys/#token-estimates-and-budget-pressure) is 1,600 estimated input tokens per occurrence in both modes, independent of detail; ordinary JSON overhead can still differ. This accounting estimate does not change the separate native Images contract below.
 - The response, including the event stream, is unchanged.
 
 On native, non-compact Codex backend Responses routes, a present `input` or `tools` value must be an array. A non-list value is rejected before dispatch with `400 invalid_request` in both Lite and Full, so it is never silently dropped or forwarded with changed meaning. The narrow `/v1` surface continues to normalize a string `input` into an item array before serving-mode handling, so existing `/v1` string-input behavior is unaffected.

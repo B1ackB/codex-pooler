@@ -282,6 +282,8 @@ Read usage independently of delivery status. When Codex Pooler has received meas
 
 Usage that the upstream never delivered to Codex Pooler cannot be recovered from a cancellation label or a reservation estimate. Retaining a receipt already received does not guarantee recovery after a hard process or node loss before persistence.
 
+Image-bearing reservations use a versioned local allowance of 1,600 input tokens per image occurrence, added to the ordinary text and JSON-structure estimate. Reservation metadata records the version, `fixed_per_image_allowance` basis, image count, aggregate image tokens and per-image allowance, without retaining image content or source references. This approximation can under- or over-estimate usage; it is not measured usage or calibrated Codex billing. Measured usage replaces the reservation estimate when available, `usage_unknown` retains provisional pressure, and `not_applicable` adds none. Historical estimates without image provenance are not relabelled. See [token estimates and budget pressure](/operators/api-keys/#token-estimates-and-budget-pressure).
+
 ### API pricing rules and recorded costs
 
 Cost is a USD reporting estimate from published API prices, not a subscription charge, provider invoice, or measurement of subscription quota debit. A subscription announcement about long-context fees does not set an API pricing cutoff or make imported API rates zero.
