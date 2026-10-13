@@ -733,7 +733,18 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteering do
   end
 
   defp identity(context), do: %{request_id: context.reserved.request.id, attempt_id: context.attempt.id, replay_generation: context.attempt.replay_generation || 0}
-  defp trim_context(context), do: %{context | payload: Map.take(context.payload, ["model", "reasoning", "max_output_tokens", "service_tier"]), request_options: RequestOptions.put_runtime_context(context.request_options, gateway_debug_payload: nil)}
+
+  defp trim_context(context) do
+    route_state = %{context.route_state | visible_model_context: %{}, visible_models: []}
+
+    %{
+      context
+      | payload: Map.take(context.payload, ["model", "reasoning", "max_output_tokens", "service_tier"]),
+        request_options: RequestOptions.put_runtime_context(context.request_options, gateway_debug_payload: nil),
+        route_state: route_state
+    }
+  end
+
   defp native_relay?(options), do: options.transport.transport == "websocket" and options.transport.websocket_delivery_mode == :relay and is_nil(options.openai_compatibility.source_endpoint) and not options.openai_compatibility.public_openai_responses_stream
   # The socket captures this response-task context. An owner's downstream
   # identifies transport delivery, not authority to handle socket callbacks.

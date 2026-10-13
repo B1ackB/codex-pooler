@@ -28,6 +28,54 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteeringTest do
   @successor_usage %{"input_tokens" => 110, "output_tokens" => 7, "total_tokens" => 117}
   @independent_usage %{"input_tokens" => 19, "output_tokens" => 3, "total_tokens" => 22}
 
+  for mode <- ["full", "lite"], forwarding <- [:off, :on] do
+    test "ordinary turns retain bounded steering state with mode=#{mode} forwarding=#{forwarding}" do
+      assert_bounded_ordinary_context!(unquote(mode), unquote(forwarding))
+    end
+  end
+
+  defp assert_bounded_ordinary_context!(mode, forwarding) do
+    fixture = start_fixture!(forwarding, :coalesced, mode: mode, catalog_size: 20, independent?: true)
+    assert_bounded_lane!(fixture.lane)
+    assert :ok = FakeUpstream.release_steerable(fixture.upstream, fixture.hold)
+    {client, frames} = receive_texts!(fixture.client, 1)
+    assert event_types(frames) == ["response.completed"]
+    [original] = await_rows!(fixture.setup, 1, &Enum.all?(&1, fn row -> row.status == "succeeded" end))
+    settled = await_lane!(fixture.lane, &(map_size(&1.prepared) == 0 and not is_nil(&1.original_result)))
+    assert settled.context.reserved.request.id == original.id
+    assert is_nil(settled.active)
+    assert_bounded_lane!(fixture.lane)
+    assert_usage!(original, @original_usage)
+    assert_complete_ledger!(original)
+
+    client = send_text!(client, create(fixture.setup, fixture.thread, Ecto.UUID.generate(), "synthetic independent input"))
+    {client, frames} = receive_texts!(client, 2)
+    assert event_types(frames) == ["response.created", "response.completed"]
+    settled_rows = await_rows!(fixture.setup, 2, &Enum.all?(&1, fn row -> row.status == "succeeded" end))
+    independent = Enum.find(settled_rows, &(&1.id != original.id))
+    assert await_lane!(fixture.lane, &(map_size(&1.prepared) == 0 and &1.context.reserved.request.id == independent.id))
+    assert_bounded_lane!(fixture.lane)
+    assert_usage!(independent, @independent_usage)
+    Enum.each(settled_rows, &assert_complete_ledger!/1)
+    assert :ok = FakeUpstream.verify!(fixture.upstream)
+    close_client!(client)
+  end
+
+  defp assert_bounded_lane!(lane) do
+    state = :sys.get_state(lane)
+    # flat_size counts the copied terms, independent of GC and heap slack.
+    assert :erts_debug.flat_size(state) * :erlang.system_info(:wordsize) < 1_048_576
+    assert map_size(state.context.route_state.visible_model_context) == 0
+    assert state.context.route_state.visible_models == []
+    assert is_map(state.context.route_state.reservation_snapshot_inputs)
+    assert state.context.route_state.candidates != []
+
+    Enum.each(state.prepared, fn {_key, entry} ->
+      assert map_size(entry.context.route_state.visible_model_context) == 0
+      assert entry.context.route_state.visible_models == []
+    end)
+  end
+
   for row_locked? <- [false, true] do
     @tag slow: "the real downstream read timeout closes an untracked direct steering successor"
     test "the server idle timeout attributes only the active direct steering successor with row_locked=#{row_locked?}" do
@@ -433,7 +481,8 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteeringTest do
     expectations = if Keyword.get(opts, :independent?, false), do: expectations ++ [expected_request(FakeUpstream.websocket_text_frames([created(independent_id), completed(independent_id, @independent_usage)]))], else: expectations
     upstream = start_upstream(FakeUpstream.strict_sequence(expectations))
     setup = gateway_setup(upstream)
-    set_model_serving_mode!(model_serving_scope(), setup, "full")
+    set_model_serving_mode!(model_serving_scope(), setup, Keyword.get(opts, :mode, "full"))
+    seed_unselected_catalog!(setup, Keyword.get(opts, :catalog_size, 0))
     {_server, port} = start_public_endpoint_with_server!()
     # The listener's preinstalled fence owns teardown, including partial
     # connection setup. Keep release ahead of listener shutdown and never
@@ -478,6 +527,16 @@ defmodule CodexPooler.Gateway.Runtime.NativeResponseSteeringTest do
       end
 
     %{setup: setup, upstream: upstream, hold: hold, handler: handler, client: client, thread: thread, lane: state.native_response_steering, upstream_session: upstream_session, before_create: before_create, original_id: original_id, successor_id: successor_id, independent_id: independent_id, successor_frames: successor_frames, steering_frames: steering_frames}
+  end
+
+  defp seed_unselected_catalog!(_setup, 0), do: :ok
+
+  defp seed_unselected_catalog!(setup, size) do
+    metadata = Map.put(setup.model.metadata, "synthetic_catalog_details", Enum.map(1..512, &%{"index" => &1, "label" => "synthetic model metadata"}))
+
+    Enum.each(1..size, fn index ->
+      model_fixture(setup.pool, %{exposed_model_id: "synthetic-unselected-#{index}", metadata: metadata})
+    end)
   end
 
   defp install_next_request_probe!(client) do
