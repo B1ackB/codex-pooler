@@ -2,6 +2,8 @@ defmodule CodexPooler.UpstreamWebsocketRetirementPeer do
   @moduledoc false
   import ExUnit.Assertions
   import ExUnit.Callbacks
+  require Record
+  Record.defrecordp(:ssl_socket, :sslsocket, Record.extract(:sslsocket, from_lib: "ssl/src/ssl_api.hrl"))
   @budget 15_000
   @guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -41,10 +43,14 @@ defmodule CodexPooler.UpstreamWebsocketRetirementPeer do
 
     on_exit(fn ->
       resources = Agent.get(tracker, & &1)
-      assert Enum.all?(resources.tasks, &(not Process.alive?(&1)))
-      assert Enum.all?(resources.sockets, fn {transport, socket} -> socket_closed?(transport, socket) end)
-      Agent.stop(tracker)
-      assert :ets.info(resources.progress) == :undefined
+
+      try do
+        await_resources_closed!(resources)
+      after
+        Agent.stop(tracker)
+        assert :ets.info(resources.progress) == :undefined
+      end
+
       CodexPooler.TestDiagnostics.puts(fn -> CodexPooler.JSON.encode!(%{scenario: "retirement_peer_cleanup", tasks_stopped: true, sockets_closed: true}) end)
     end)
 
@@ -54,6 +60,49 @@ defmodule CodexPooler.UpstreamWebsocketRetirementPeer do
     scheme = if context.transport == :wss, do: "https", else: "http"
     %{url: "#{scheme}://127.0.0.1:#{port}/backend-api/codex/responses", ref: ref, progress: progress}
   end
+
+  @doc false
+  @spec await_resources_closed!(%{tasks: [pid()], sockets: [{:ws | :wss, term()}]}, non_neg_integer()) :: :ok
+  def await_resources_closed!(resources, timeout \\ @budget) do
+    owned = Enum.uniq(resources.tasks ++ Enum.flat_map(resources.sockets, fn {_transport, socket} -> socket_resources(socket) end))
+
+    monitors =
+      Enum.map(owned, fn resource ->
+        type = if is_port(resource), do: :port, else: :process
+        {:erlang.monitor(type, resource), type, resource}
+      end)
+
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    try do
+      for {monitor, type, resource} <- monitors do
+        receive do
+          {:DOWN, ^monitor, ^type, ^resource, _reason} -> :ok
+        after
+          max(deadline - System.monotonic_time(:millisecond), 0) ->
+            pending_ports = Enum.count(owned, &(is_port(&1) and Port.info(&1) != nil))
+            pending_processes = Enum.count(owned, &(is_pid(&1) and Process.alive?(&1)))
+            flunk("peer resources still live: pending_ports=#{pending_ports} pending_processes=#{pending_processes}")
+        end
+      end
+
+      assert Enum.all?(resources.tasks, &(not Process.alive?(&1)))
+      assert Enum.all?(resources.sockets, fn {transport, socket} -> socket_closed?(transport, socket) end)
+      :ok
+    after
+      for {monitor, _type, _resource} <- monitors, do: Process.demonitor(monitor, [:flush])
+    end
+  end
+
+  # OTP's server handle also contains shared session-ticket trackers. Only
+  # the transport and these two processes belong to this connection.
+  defp socket_resources(ssl_socket(socket_handle: socket, connection_handler: receiver, payload_sender: sender)),
+    do: Enum.flat_map([socket, receiver, sender], &socket_resources/1)
+
+  defp socket_resources(value) when is_pid(value) or is_port(value), do: [value]
+  defp socket_resources(value) when is_tuple(value), do: value |> Tuple.to_list() |> Enum.flat_map(&socket_resources/1)
+  defp socket_resources(value) when is_list(value), do: Enum.flat_map(value, &socket_resources/1)
+  defp socket_resources(_value), do: []
 
   defp peer(parent, ref, context, scripts, tracker, progress) do
     peer_pid = self()
@@ -255,8 +304,5 @@ defmodule CodexPooler.UpstreamWebsocketRetirementPeer do
     :ok
   end
 
-  defp socket_processes(value) when is_pid(value), do: [value]
-  defp socket_processes(value) when is_tuple(value), do: value |> Tuple.to_list() |> Enum.flat_map(&socket_processes/1) |> Enum.uniq()
-  defp socket_processes(value) when is_list(value), do: Enum.flat_map(value, &socket_processes/1) |> Enum.uniq()
-  defp socket_processes(_value), do: []
+  defp socket_processes(value), do: value |> socket_resources() |> Enum.filter(&is_pid/1) |> Enum.uniq()
 end

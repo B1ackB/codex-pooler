@@ -181,6 +181,57 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionRetir
     result
   end
 
+  test "peer cleanup waits for exact live socket ownership without closing it" do
+    parent = self()
+    tasks = start_supervised!(Task.Supervisor)
+
+    owner =
+      Task.Supervisor.async_nolink(tasks, fn ->
+        {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+        send(parent, {:owned_listener, listener})
+
+        receive do
+          :release_listener -> :gen_tcp.close(listener)
+        end
+      end)
+
+    assert_receive {:owned_listener, listener}, @budget
+    waiter = Task.Supervisor.async_nolink(tasks, fn -> Peer.await_resources_closed!(%{tasks: [owner.pid], sockets: [ws: listener]}) end)
+    await_port_monitor!(waiter.pid, listener, System.monotonic_time(:millisecond) + @budget)
+    assert Port.info(listener) != nil
+    assert Task.yield(waiter, 0) == nil
+    send(owner.pid, :release_listener)
+    assert Task.await(owner, @budget) == :ok
+    assert Task.await(waiter, @budget) == :ok
+    assert Port.info(listener) == nil
+  end
+
+  test "peer cleanup refuses a live port rather than closing it to satisfy the assertion" do
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+    on_exit(fn -> :gen_tcp.close(listener) end)
+    assert_raise ExUnit.AssertionError, ~r/pending_ports=1/, fn -> Peer.await_resources_closed!(%{tasks: [], sockets: [ws: listener]}, 0) end
+    assert Port.info(listener) != nil
+  end
+
+  defp await_port_monitor!(pid, port, deadline) do
+    case Process.info(pid, :monitors) do
+      {:monitors, monitors} ->
+        if {:port, port} in monitors do
+          :ok
+        else
+          assert System.monotonic_time(:millisecond) < deadline
+
+          receive do
+          after
+            1 -> await_port_monitor!(pid, port, deadline)
+          end
+        end
+
+      nil ->
+        flunk("cleanup waiter exited before monitoring its owned port")
+    end
+  end
+
   defp start_session! do
     session = start_supervised!(%{id: make_ref(), start: {UpstreamWebsocketSession, :start_link, [[]]}, restart: :temporary})
 
