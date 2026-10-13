@@ -16,10 +16,12 @@ defmodule CodexPooler.Gateway.Runtime.LateCircuitRetryAfterTest do
 
   alias CodexPooler.Access
   alias CodexPooler.Accounting
+  alias CodexPooler.AccountingBoundaryTrace
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.RoutingCircuitState
+  alias CodexPooler.Gateway.Routing.CircuitRetryAfter
   alias CodexPooler.Gateway.Runtime.Dispatch
   alias CodexPooler.Gateway.Runtime.Dispatch.Context
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
@@ -30,20 +32,42 @@ defmodule CodexPooler.Gateway.Runtime.LateCircuitRetryAfterTest do
 
   test "an open circuit met at dispatch on the last candidate advises the seconds to its probe" do
     {context, setup, upstream} = dispatch_context!()
-    open_circuit!(setup, 40)
+    circuits = open_circuit!(setup, 40)
 
-    assert {:error, %{status: 503, code: "no_eligible_backend", circuit_retry_after_seconds: seconds}} = Dispatch.dispatch(context, &transport_never_called/1)
-    assert seconds in 35..40
-    assert FakeUpstream.count(upstream) == 0
+    assert_retry_deadline!(context, circuits, hd(circuits).next_probe_at, upstream)
   end
 
   test "a saturated half-open circuit met at dispatch advises when its probe goes stale" do
-    {context, setup, _upstream} = dispatch_context!()
+    {context, setup, upstream} = dispatch_context!()
     stale_in = OperationalSettings.current().circuit_open_seconds
-    half_open_circuit!(setup, 20 - stale_in)
+    circuits = half_open_circuit!(setup, 20 - stale_in)
+    unblock_at = DateTime.add(hd(circuits).updated_at, stale_in, :second)
 
-    assert {:error, %{status: 503, code: "no_eligible_backend", circuit_retry_after_seconds: seconds}} = Dispatch.dispatch(context, &transport_never_called/1)
-    assert seconds in 15..20
+    assert_retry_deadline!(context, circuits, unblock_at, upstream)
+  end
+
+  defp assert_retry_deadline!(context, circuits, unblock_at, upstream) do
+    # Inserts, dispatch and refusal settlement consume the circuit's lifetime.
+    # Observe the real advice clock rather than assuming those DB calls take
+    # less than five seconds. Tracing is scoped to this process and call.
+    Code.ensure_loaded!(CircuitRetryAfter)
+
+    {result, [_refusal, _candidates, route_state, evaluated_at]} =
+      AccountingBoundaryTrace.capture_call({CircuitRetryAfter, :put, 4}, fn ->
+        Dispatch.dispatch(context, &transport_never_called/1)
+      end)
+
+    assert {:error, %{status: 503, code: "no_eligible_backend", circuit_retry_after_seconds: seconds}} = result
+    {assignment, _identity} = hd(context.route_plan.candidates)
+    assert %{eligible?: false, state: state} = RouteState.circuit_snapshot(route_state, assignment.id)
+    assert state == Enum.find(circuits, &(&1.id == state.id))
+
+    assert is_integer(seconds)
+    remaining_ms = DateTime.diff(unblock_at, evaluated_at, :millisecond)
+    assert remaining_ms > 0
+    assert (seconds - 1) * 1_000 < remaining_ms
+    assert remaining_ms <= seconds * 1_000
+    assert FakeUpstream.count(upstream) == 0
   end
 
   defp transport_never_called(_context), do: flunk("the refused candidate reached the transport")
