@@ -1858,30 +1858,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.ReplayTest
   # A second instance of the Repo, outside the sandbox, with one connection that
   # a test task holds and a queue that drops a waiter after a few milliseconds.
   defp hold_unavailable_repo! do
-    repo =
-      start_supervised!(
-        {Repo, name: nil, pool: DBConnection.ConnectionPool, pool_size: 1, queue_target: 1, queue_interval: 10},
-        id: :unavailable_replay_arm_repo
-      )
-
-    test_pid = self()
-    release_ref = make_ref()
-
-    holder =
-      Task.async(fn ->
-        _previous = Repo.put_dynamic_repo(repo)
-
-        Repo.checkout(fn ->
-          send(test_pid, {:unavailable_repo_held, release_ref})
-
-          receive do
-            {:release_unavailable_repo, ^release_ref} -> :released
-          end
-        end)
-      end)
-
-    assert_receive {:unavailable_repo_held, ^release_ref}, @handoff_detection_timeout_ms
-    %{repo: repo, holder: holder, release_ref: release_ref}
+    CodexPooler.UnavailableRepo.hold!(:unavailable_replay_arm_repo)
   end
 
   defp release_unavailable_repo!(%{holder: holder, release_ref: release_ref}) do
