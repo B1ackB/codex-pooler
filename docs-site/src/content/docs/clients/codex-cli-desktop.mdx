@@ -251,6 +251,22 @@ Get-ChildItem -Path $CodexHome -Filter "state_*.sqlite" |
   }
 ```
 
+<details>
+<summary>Optional: when to read agent updates</summary>
+
+When Codex works with other agents, it can pause a reply to read their updates and then continue. This can explain some cancelled entries in the request log while the conversation keeps going.
+
+The default is fine for normal use. If you prefer Codex to finish its reply before reading agent updates, you can try this experimental option. Add the setting to your existing `[features]` section, or use this block if you don't have one:
+
+```toml title="CODEX_HOME/config.toml" frame="code"
+[features]
+defer_mailbox_preemption = true
+```
+
+Start a new conversation to apply it. You can still stop a reply yourself. Remove the setting to return to the default.
+
+</details>
+
 <a id="optional-operator-mcp-endpoint"></a>
 
 ## Operator MCP (optional)
