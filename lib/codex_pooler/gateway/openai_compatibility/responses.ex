@@ -21,7 +21,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   # The type-only built-ins an `allowed_tools` choice may name (Full only). `programmatic_tool_calling` and
   # `web_search_preview` left on 2026-10-06: the Codex backend refuses both tool types on a Full request (findings#333).
   @allowed_tools_builtin_types ~w(web_search image_generation)
-  @locally_unsupported_fields ~w(background context_management conversation max_tool_calls prompt top_logprobs user)
+  @locally_unsupported_fields ~w(background context_management conversation max_tool_calls prompt top_logprobs)
 
   # The hosted `web_search` tool keys the provider accepts, in Full and in the Lite manifest alike (direct probe,
   # 2026-10-06: every other key, `zz_probe_unknown_key` and the pre-0.144.0 Codex spelling `index_gated_web_access`
@@ -52,6 +52,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
          :ok <- Validation.reject_high_impact_fields(payload),
          :ok <- Validation.reject_unsupported_fields(payload, :responses),
          :ok <- Validation.require_model(payload),
+         {:ok, payload} <- discard_user_identifier(payload),
          :ok <- reject_locally_unsupported_fields(payload),
          :ok <- validate_instructions(payload),
          :ok <- validate_metadata(payload),
@@ -122,6 +123,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
 
   defp expands_input_positions?(%{"role" => "assistant", "tool_calls" => calls}) when is_list(calls), do: length(calls) != 1
   defp expands_input_positions?(_item), do: false
+
+  defp discard_user_identifier(%{"user" => user} = payload) when is_binary(user) or is_nil(user),
+    do: {:ok, Map.delete(payload, "user")}
+
+  defp discard_user_identifier(%{"user" => _user}),
+    do: {:error, Error.invalid_request("user must be a string or null", "user")}
+
+  defp discard_user_identifier(payload), do: {:ok, payload}
 
   defp validate_instructions(%{"instructions" => instructions}) when is_binary(instructions) or is_nil(instructions), do: :ok
 

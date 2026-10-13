@@ -39,6 +39,7 @@ const expectedInventory = {
 		"/clients/pi/",
 		"/clients/trae/",
 		"/clients/hermes/",
+		"/clients/home-assistant/",
 		"/clients/windmill/",
 		"/reference/runtime-routes/",
 		"/reference/routing-strategies/",

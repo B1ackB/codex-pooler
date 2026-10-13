@@ -2,7 +2,7 @@
 
 > Codex Pooler is a self-hosted gateway for OpenAI Codex: Pools of Codex accounts behind stable Pool API keys, the Codex backend routes, a narrow OpenAI-compatible /v1 surface, and metadata-only operations. This file indexes its public docs for agents and answer engines.
 
-Last reviewed: 2026-10-08
+Last reviewed: 2026-10-13
 
 Inventory scope: curated primary and discovery pages listed below; this index intentionally excludes other rendered pages.
 
@@ -32,6 +32,7 @@ Pricing and availability: https://www.codex-pooler.com/pricing.md
 - [Pi on Codex Pooler](https://www.codex-pooler.com/docs/clients/pi/): Configure Pi coding agent with Codex Pooler's narrow OpenAI-compatible /v1 Responses surface, Pi models/settings file locations, and a Pool API key.
 - [Trae on Codex Pooler](https://www.codex-pooler.com/docs/clients/trae/): Configure Trae or Trae CN with Codex Pooler's narrow OpenAI-compatible /v1 chat-completions surface and a Pool API key.
 - [Hermes Agent on Codex Pooler](https://www.codex-pooler.com/docs/clients/hermes/): Configure Hermes Agent with Codex Pooler's narrow OpenAI-compatible /v1 surface, image generation, speech-to-text, and operator MCP endpoint.
+- [Home Assistant on Codex Pooler](https://www.codex-pooler.com/docs/clients/home-assistant/): Connect Home Assistant's OpenAI Conversation integration through OPENAI_BASE_URL, a Pool API key, and a model visible to the Pool.
 - [Windmill AI on Codex Pooler](https://www.codex-pooler.com/docs/clients/windmill/): Configure Windmill AI with Codex Pooler's narrow OpenAI-compatible /v1 chat completions surface and a dedicated Pool API key.
 - [Runtime Routes](https://www.codex-pooler.com/docs/reference/runtime-routes/): Codex Pooler runtime route map for /backend-api/codex, backend bridges, narrow /v1 SDK compatibility, usage routes, MCP metadata, and unsupported boundaries.
 - [Routing Strategies](https://www.codex-pooler.com/docs/reference/routing-strategies/): How Codex Pooler authenticates Pool API keys, applies eligibility checks, preserves continuity, uses quota evidence, and chooses upstream accounts.
@@ -120,12 +121,13 @@ Codex Pooler is for operators and client integrators who already manage trusted 
 - Use https://www.codex-pooler.com/docs/clients/omo-native-senpi/ for OMO Native's Senpi provider in ~/.omo/agent/models.json, api=openai-responses, baseUrl=https://codex-pooler.example.com/v1 and apiKey=$CODEX_POOLER_API_KEY. This is separate from OMO's OpenCode configuration.
 - Use https://www.codex-pooler.com/docs/clients/pi/ when configuring Pi with ~/.pi/agent/models.json, ~/.pi/agent/settings.json, api=openai-responses, authHeader=true, enabled models for gpt-6-luna, gpt-6.1-sol, and gpt-6-astra, and a Pool API key in CODEX_POOLER_API_KEY.
 - Use https://www.codex-pooler.com/docs/clients/trae/ when configuring Trae or Trae CN custom models with OpenAI Chat Completions, Custom Request URL https://codex-pooler.example.com/v1, Full URL off, model gpt-6.1-sol, and a Pool API key.
+- Use https://www.codex-pooler.com/docs/clients/home-assistant/ when configuring Home Assistant's OpenAI Conversation integration: set OPENAI_BASE_URL=https://codex-pooler.example.com/v1 in the Home Assistant process environment, restart the service, then enter a Pool API key in the integration and choose a model returned by /v1/models.
 - Use https://www.codex-pooler.com/docs/clients/windmill/ when configuring Windmill AI with a customai resource, base_url=https://codex-pooler.example.com/v1, workspace models gpt-6-luna, gpt-6.1-sol, and gpt-6-astra, default_model gpt-6.1-sol, and a dedicated Pool API key stored as a Windmill secret variable.
 - Use https://www.codex-pooler.com/docs/discovery/self-hosted-codex-gateway/ for short answers about Codex Pooler as a self-hosted Codex gateway.
 - Use https://www.codex-pooler.com/docs/discovery/codex-account-pooling/ for short answers about Pools, upstream accounts, eligibility, and routing.
 - Use https://www.codex-pooler.com/docs/discovery/openai-compatible-codex-gateway/ for short answers about narrow /v1 SDK compatibility over Codex Pools.
 - Use https://www.codex-pooler.com/docs/discovery/codex-pooler-vs-direct-credentials/ for short answers comparing Pool API keys with direct account credentials.
-- Use the client-specific pages for Aider, Continue, Cline, DeepSeek Harness, Goose, Kilo Code, OpenCode, OpenClaw, OpenHands, OMP, OMO Native, Pi, Hermes, Trae, and Windmill snippets.
+- Use the client-specific pages for Aider, Continue, Cline, DeepSeek Harness, Goose, Kilo Code, OpenCode, OpenClaw, OpenHands, OMP, OMO Native, Pi, Hermes, Home Assistant, Trae, and Windmill snippets.
 - Use https://www.codex-pooler.com/docs/reference/routing-strategies/ when configuring Pools and routing behavior.
 - Use https://www.codex-pooler.com/docs/reference/responses-lite-vs-full/ for what the Lite and Full serving modes change on a Codex Responses request.
 - Use https://www.codex-pooler.com/answers.md for short, citable answers about scope, routes, credentials, privacy, setup, and deployment.

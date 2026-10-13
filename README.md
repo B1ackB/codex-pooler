@@ -19,6 +19,7 @@
   <a href="#goose-setup" title="Goose"><img src=".github/assets/goose-favicon.png" alt="Goose" width="24" height="24"></a>
   <a href="#deepseek-harness-setup" title="DeepSeek Harness"><img src=".github/assets/deepseek-harness-favicon.png" alt="DeepSeek Harness" width="24" height="24"></a>
   <a href="#windmill-setup" title="Windmill AI"><img src=".github/assets/windmill-favicon.png" alt="Windmill AI" width="24" height="24"></a>
+  <a href="#home-assistant-setup" title="Home Assistant"><img src=".github/assets/home-assistant-favicon.png" alt="Home Assistant" width="24" height="24"></a>
   <a href="#openhands-setup" title="OpenHands"><img src=".github/assets/openhands-favicon.png" alt="OpenHands" width="24" height="24"></a>
   <a href="#openai-python-sdk-setup" title="OpenAI-compatible SDKs"><img src=".github/assets/python-favicon.png" alt="OpenAI-compatible SDKs" width="24" height="24"></a>
   <a href="#openai-node-sdk-setup" title="OpenAI-compatible SDKs"><img src=".github/assets/nodejs-favicon.png" alt="OpenAI-compatible SDKs" width="24" height="24"></a>
@@ -1146,6 +1147,33 @@ Use a URL reachable from the Windmill server; private addresses require
 `ALLOW_PRIVATE_AI_BASE_URLS=true` on that server.
 
 **[Full setup & extras](https://www.codex-pooler.com/docs/clients/windmill/)** — resource creation, workspace configuration and supported features.
+
+</details>
+
+<a id="home-assistant-setup"></a>
+
+<details>
+<summary><img src=".github/assets/home-assistant-favicon.png" alt="Home Assistant logo" width="16" height="16"> Home Assistant Container <code>OPENAI_BASE_URL</code></summary>
+
+Home Assistant's OpenAI Conversation integration can use Codex Pooler's narrow
+OpenAI-compatible `/v1` surface from a Home Assistant Container process. Set the
+endpoint in the container environment, then add the integration in Home
+Assistant and enter a Pool API key:
+
+```yaml
+services:
+  homeassistant:
+    environment:
+      OPENAI_BASE_URL: https://codex-pooler.example.com/v1
+```
+
+Restart Home Assistant before adding the integration. Choose a model returned by
+`GET /v1/models`; use Full serving mode when Assist needs tools. The integration
+form has no custom endpoint field, and Home Assistant's official docs do not
+endorse third-party endpoints. This is the tested Container setup for Codex
+Pooler.
+
+**[Full setup & extras](https://www.codex-pooler.com/docs/clients/home-assistant/)** — container environment, model selection, request verification and compatibility limits.
 
 </details>
 

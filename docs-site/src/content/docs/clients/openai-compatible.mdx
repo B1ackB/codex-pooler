@@ -108,6 +108,7 @@ Use the dedicated setup pages when configuring an agent or editor that has its o
 - [Pi](/clients/pi/)
 - [Trae](/clients/trae/)
 - [Windmill AI](/clients/windmill/)
+- [Home Assistant](/clients/home-assistant/)
 
 ## Python SDK
 
@@ -489,6 +490,14 @@ dispatch on `metadata`, with the OpenAI API's error code: `invalid_type`,
 `string_above_max_length`. An accepted value is not forwarded, because the
 upstream rejects the parameter, and it is neither stored nor echoed in the
 response.
+
+### Responses request compatibility
+
+The optional top-level `user` field on `POST /v1/responses` accepts a string or
+`null` and is discarded before dispatch. It does not establish ownership,
+permissions or routing identity. Other `user` shapes are rejected before
+upstream dispatch. The field is discarded before dispatch; it does not replace
+or populate `safety_identifier` or `prompt_cache_key`.
 
 ### Chat Completions request compatibility
 

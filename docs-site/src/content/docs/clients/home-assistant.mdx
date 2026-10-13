@@ -1,0 +1,75 @@
+---
+title: Home Assistant on Codex Pooler
+sidebar:
+  label: Home Assistant
+description: Connect Home Assistant's OpenAI Conversation integration to Codex Pooler's narrow OpenAI-compatible /v1 surface through OPENAI_BASE_URL.
+---
+
+Home Assistant's OpenAI Conversation integration adds an OpenAI-backed conversation agent to Assist. Point a Home Assistant Container process at Codex Pooler's narrow OpenAI-compatible `/v1` surface with `OPENAI_BASE_URL`, then enter a Pool API key and choose a model visible to that Pool.
+
+The integration's setup form asks for an API key but does not provide a custom endpoint field. The environment variable is the connection setting for a Pooler deployment. Home Assistant's official documentation does not endorse third-party endpoints; this page documents the tested Container environment configuration for Codex Pooler.
+
+## Before you start
+
+- Install [Home Assistant Container](https://www.home-assistant.io/installation/linux#install-home-assistant-container) and add the [OpenAI Conversation integration](https://www.home-assistant.io/integrations/openai_conversation/) using the official instructions.
+- Have a Codex Pooler URL reachable from the Home Assistant runtime.
+- Create a [Pool API key](/getting-started/quick-start/) and choose a model that the same Pool exposes.
+- Use a Full serving mode when the conversation agent needs Home Assistant Assist tools. Lite mode removes tools from the request.
+
+## Configure the connection
+
+Set the endpoint in the environment of the Home Assistant process. For a container deployment, add it to the Home Assistant service and restart it:
+
+```yaml title="compose.yaml" frame="code"
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    environment:
+      OPENAI_BASE_URL: https://codex-pooler.example.com/v1
+```
+
+For local setup, use `http://localhost:4000/v1`. `localhost` is resolved by the Home Assistant process, so use the Pooler address reachable from that process rather than the browser that opens the Home Assistant dashboard.
+
+After the restart, open **Settings → Devices & services → Add integration**, search for **OpenAI Conversation**, and enter the Pool API key when Home Assistant asks for it. Keep the endpoint environment variable in place; the integration form does not replace it. Home Assistant OS does not expose the same arbitrary core process environment setting, so use the Container setup above for this integration path.
+
+## Choose a model
+
+Home Assistant's default model may not be present in your Pool. List the Pool's visible models before choosing one in the integration options:
+
+```bash
+curl --fail --silent \
+  -H "Authorization: Bearer <pool-api-key>" \
+  https://codex-pooler.example.com/v1/models
+```
+
+Select one of the returned model ids in the OpenAI Conversation integration. If you use the integration's Assist tools, keep the selected model and Pool on Full mode and make sure the model assignment accepts tool requests.
+
+## Verify the connection
+
+Open an Assist conversation that uses the OpenAI Conversation agent and send a short text request. A successful reply confirms that Home Assistant completed a conversation, but it does not prove which endpoint handled it. In Codex Pooler's request logs, match the request time, Pool API key, model and final status; stock Home Assistant requests identify themselves through the OpenAI Python SDK, so the request log does not contain a Home Assistant-specific user agent.
+
+If Assist tools are enabled, run a harmless request that needs one tool and then ask a follow-up question. The tool turn and the follow-up must use the same Pool and model. Do not use a real device action as the first connectivity check.
+
+## Troubleshooting
+
+### Home Assistant still calls the default OpenAI endpoint
+
+`OPENAI_BASE_URL` must be visible to the running Home Assistant process, not only to the shell where the container was created. Inspect the service environment, restart the container, and add the integration again if its initial model check used the wrong endpoint.
+
+### Setup fails while Home Assistant checks the model list
+
+The integration checks `GET /v1/models` during setup. Confirm that the Pool API key is valid, the `/v1` suffix is present in `OPENAI_BASE_URL`, and the Home Assistant runtime can resolve and reach the Pooler URL.
+
+### The selected model is unavailable
+
+Use a model id returned by the Pool's `/v1/models` response. A model name supported by the upstream OpenAI service is not automatically available in a Codex Pooler Pool.
+
+### Home Assistant cannot call an Assist tool
+
+Assist tool calls require a Full serving mode. Lite mode removes tools before the request reaches the provider; assign the key to a Pool that serves Full mode and retry with a model that accepts the tool shape.
+
+## Compatibility notes
+
+Home Assistant uses the OpenAI Python SDK to call `POST /v1/responses` as an HTTP streaming request. It does not use the narrow Responses websocket route, Chat Completions, or `previous_response_id` continuity. Tool calls are replayed in the next request as Responses function-call items and function-call outputs.
+
+Codex Pooler's `/v1` surface is narrow compatibility for selected SDK request shapes, not full OpenAI API parity. `/v1/realtime`, OpenAI Realtime SDK routes, remote MCP tool declarations and the beta Agents API remain unsupported. See [OpenAI-Compatible SDKs](/clients/openai-compatible/) for the shared route contract and [Responses Lite and Full](/reference/responses-lite-vs-full/) for serving-mode differences.

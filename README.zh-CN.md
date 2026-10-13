@@ -19,6 +19,7 @@
   <a href="#goose-setup" title="Goose"><img src=".github/assets/goose-favicon.png" alt="Goose" width="24" height="24"></a>
   <a href="#deepseek-harness-setup" title="DeepSeek Harness"><img src=".github/assets/deepseek-harness-favicon.png" alt="DeepSeek Harness" width="24" height="24"></a>
   <a href="#windmill-setup" title="Windmill AI"><img src=".github/assets/windmill-favicon.png" alt="Windmill AI" width="24" height="24"></a>
+  <a href="#home-assistant-setup" title="Home Assistant"><img src=".github/assets/home-assistant-favicon.png" alt="Home Assistant" width="24" height="24"></a>
   <a href="#openhands-setup" title="OpenHands"><img src=".github/assets/openhands-favicon.png" alt="OpenHands" width="24" height="24"></a>
   <a href="#openai-python-sdk-setup" title="OpenAI-compatible SDKs"><img src=".github/assets/python-favicon.png" alt="OpenAI-compatible SDKs" width="24" height="24"></a>
   <a href="#openai-node-sdk-setup" title="OpenAI-compatible SDKs"><img src=".github/assets/nodejs-favicon.png" alt="OpenAI-compatible SDKs" width="24" height="24"></a>
@@ -1129,6 +1130,30 @@ metadata_model:
 `ALLOW_PRIVATE_AI_BASE_URLS=true`。
 
 **[完整配置与扩展选项](https://www.codex-pooler.com/docs/clients/windmill/)** — 资源创建、工作区配置和支持的功能。
+
+</details>
+
+<a id="home-assistant-setup"></a>
+
+<details>
+<summary><img src=".github/assets/home-assistant-favicon.png" alt="Home Assistant logo" width="16" height="16"> Home Assistant Container <code>OPENAI_BASE_URL</code></summary>
+
+Home Assistant 的 OpenAI Conversation 集成可以在 Home Assistant Container
+进程中使用 Codex Pooler 的窄 OpenAI 兼容 `/v1` 接口。在容器环境中设置端点，
+然后在 Home Assistant 中添加集成并输入 Pool API 密钥：
+
+```yaml
+services:
+  homeassistant:
+    environment:
+      OPENAI_BASE_URL: https://codex-pooler.example.com/v1
+```
+
+添加集成前重启 Home Assistant。选择 `GET /v1/models` 返回的模型；Assist 需要
+工具时使用 Full 模式。集成表单没有自定义端点字段，Home Assistant 官方文档也
+不认可第三方端点。这是 Codex Pooler 已验证的 Container 配置。
+
+**[完整配置与扩展选项](https://www.codex-pooler.com/docs/clients/home-assistant/)** — 容器环境、模型选择、验证方式和兼容性限制。
 
 </details>
 

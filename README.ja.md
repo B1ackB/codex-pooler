@@ -19,6 +19,7 @@
   <a href="#goose-setup" title="Goose"><img src=".github/assets/goose-favicon.png" alt="Goose" width="24" height="24"></a>
   <a href="#deepseek-harness-setup" title="DeepSeek Harness"><img src=".github/assets/deepseek-harness-favicon.png" alt="DeepSeek Harness" width="24" height="24"></a>
   <a href="#windmill-setup" title="Windmill AI"><img src=".github/assets/windmill-favicon.png" alt="Windmill AI" width="24" height="24"></a>
+  <a href="#home-assistant-setup" title="Home Assistant"><img src=".github/assets/home-assistant-favicon.png" alt="Home Assistant" width="24" height="24"></a>
   <a href="#openhands-setup" title="OpenHands"><img src=".github/assets/openhands-favicon.png" alt="OpenHands" width="24" height="24"></a>
   <a href="#openai-python-sdk-setup" title="OpenAI-compatible SDKs"><img src=".github/assets/python-favicon.png" alt="OpenAI 互換 SDK" width="24" height="24"></a>
   <a href="#openai-node-sdk-setup" title="OpenAI-compatible SDKs"><img src=".github/assets/nodejs-favicon.png" alt="OpenAI 互換 SDK" width="24" height="24"></a>
@@ -1075,6 +1076,33 @@ metadata_model:
 Windmill サーバーから到達できる URL を使用してください。プライベートアドレスを使う場合は、そのサーバーで `ALLOW_PRIVATE_AI_BASE_URLS=true` を設定する必要があります。
 
 **[詳しい設定と追加機能](https://www.codex-pooler.com/docs/clients/windmill/)** — リソースの作成、ワークスペース設定、対応機能。
+
+</details>
+
+<a id="home-assistant-setup"></a>
+
+<details>
+<summary><img src=".github/assets/home-assistant-favicon.png" alt="Home Assistant ロゴ" width="16" height="16"> Home Assistant Container <code>OPENAI_BASE_URL</code></summary>
+
+Home Assistant の OpenAI Conversation インテグレーションは、Home Assistant
+Container プロセスから Codex Pooler の狭い OpenAI 互換 `/v1` サーフェスを利用
+できます。コンテナの環境にエンドポイントを設定し、Home Assistant でインテ
+グレーションを追加して Pool API キーを入力します。
+
+```yaml
+services:
+  homeassistant:
+    environment:
+      OPENAI_BASE_URL: https://codex-pooler.example.com/v1
+```
+
+インテグレーションを追加する前に Home Assistant を再起動してください。
+`GET /v1/models` が返すモデルを選び、Assist がツールを使う場合は Full モード
+を使用します。インテグレーション画面にはカスタムエンドポイント欄がなく、
+Home Assistant の公式ドキュメントもサードパーティーのエンドポイントを推奨
+していません。これは Codex Pooler で検証した Container 設定です。
+
+**[詳しい設定と追加機能](https://www.codex-pooler.com/docs/clients/home-assistant/)** — コンテナ環境、モデル選択、確認方法、互換性の制限。
 
 </details>
 

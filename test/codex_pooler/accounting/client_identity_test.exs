@@ -23,4 +23,11 @@ defmodule CodexPooler.Accounting.ClientIdentityTest do
 
     assert ClientIdentity.classify("custom-client/1.2.3 private-marker") == unknown
   end
+
+  test "the stock Home Assistant SDK user agent keeps SDK attribution" do
+    identity = ClientIdentity.classify("AsyncOpenAI/Python 3.10.0")
+
+    assert %{kind: "openai_python", label: "OpenAI Python SDK", logo: %{asset: "openai.svg"}} = identity
+    assert ClientIdentity.from_kind(identity.kind) == identity
+  end
 end

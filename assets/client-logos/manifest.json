@@ -261,6 +261,17 @@
 			"sizes": [16, 24, 32, 48, 64, 128]
 		},
 		{
+			"name": "home-assistant",
+			"source": "home-assistant.svg",
+			"source_url": "https://github.com/simple-icons/simple-icons/blob/4d29a35c954699b389a834aacc97dd6e7e74143c/icons/homeassistant.svg",
+			"revision": "4d29a35c954699b389a834aacc97dd6e7e74143c",
+			"attribution": "Simple Icons, CC0; underlying product marks belong to their respective owners.",
+			"source_sha256": "fed294bba289ad605cd4cab2df98dd239f52d40e5cb8e03c9487c649a6a62957",
+			"format": "svg",
+			"painted_bounds_xywh_at_1024": [0, 13, 1024, 998],
+			"sizes": [16, 24, 32, 48, 64, 128, 256]
+		},
+		{
 			"name": "codex-pooler",
 			"source": "codex-pooler.svg",
 			"source_url": "https://github.com/icoretech/codex-pooler/blob/main/docs-site/public/favicon.svg",

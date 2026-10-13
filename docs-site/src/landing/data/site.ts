@@ -66,4 +66,9 @@ export const TOOLS: Tool[] = [
 		name: "Vercel AI SDK",
 		guide: docs("/clients/openai-compatible/"),
 	},
+	{
+		logo: "home-assistant",
+		name: "Home Assistant",
+		guide: docs("/clients/home-assistant/"),
+	},
 ];
