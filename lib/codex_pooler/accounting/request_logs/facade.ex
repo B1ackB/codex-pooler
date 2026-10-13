@@ -469,6 +469,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
 
   defp enrich_detail_settlement(%{settlement_entry_id: nil} = item) do
     item
+    |> Map.put(:context_pricing, nil)
     |> Map.update!(:token_counts, &SettlementPresentation.with_component_cost(&1, nil))
     |> Map.delete(:settlement_entry_id)
   end
@@ -481,6 +482,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
       |> Repo.one()
 
     item
+    |> Map.put(:context_pricing, SettlementPresentation.context_pricing(details))
     |> Map.update!(:token_counts, &SettlementPresentation.with_component_cost(&1, details))
     |> Map.delete(:settlement_entry_id)
   end

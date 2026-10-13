@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-09T19:50:14.261670Z",
+  "generated_at": "2026-10-12T21:13:32.893677Z",
   "models": {
     "babbage-002": {
       "categories": [
@@ -7,6 +7,25 @@
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "c3d4d2d25c64da4d1e918d90a346d212975fdcc4ebddd6afcaa2738591a51016",
+              "locator": "babbage-002/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "c3d4d2d25c64da4d1e918d90a346d212975fdcc4ebddd6afcaa2738591a51016",
+              "locator": "babbage-002/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "babbage-002",
       "prices": {
         "batch": {
@@ -35,14 +54,25 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "chat-latest": {
       "categories": [
         "chatgpt"
       ],
       "category": "chatgpt",
+      "context_pricing": {
+        "tiers": {
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "b7bfe16c647bfa6cb7eb5f814d1fdb78028133f32b1f59c89aef542a233892d6",
+              "locator": "chat-latest/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "chat-latest",
       "prices": {
         "standard": {
@@ -56,8 +86,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "chatgpt-image-latest": {
       "categories": [
@@ -94,8 +123,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "davinci-002": {
       "categories": [
@@ -103,6 +131,25 @@
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "c3d4d2d25c64da4d1e918d90a346d212975fdcc4ebddd6afcaa2738591a51016",
+              "locator": "davinci-002/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "c3d4d2d25c64da4d1e918d90a346d212975fdcc4ebddd6afcaa2738591a51016",
+              "locator": "davinci-002/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "davinci-002",
       "prices": {
         "batch": {
@@ -131,8 +178,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-3.5-turbo": {
       "categories": [
@@ -140,6 +186,18 @@
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "c3d4d2d25c64da4d1e918d90a346d212975fdcc4ebddd6afcaa2738591a51016",
+              "locator": "gpt-3.5-turbo/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-3.5-turbo",
       "prices": {
         "batch": {
@@ -164,14 +222,32 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-3.5-turbo-0125": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-3.5-turbo-0125/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-3.5-turbo-0125/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-3.5-turbo-0125",
       "prices": {
         "batch": {
@@ -190,14 +266,32 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-3.5-turbo-1106": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-3.5-turbo-1106/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-3.5-turbo-1106/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-3.5-turbo-1106",
       "prices": {
         "batch": {
@@ -216,14 +310,25 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-3.5-turbo-instruct": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-3.5-turbo-instruct/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-3.5-turbo-instruct",
       "prices": {
         "standard": {
@@ -236,14 +341,32 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4-0613": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4-0613/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4-0613/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-4-0613",
       "prices": {
         "batch": {
@@ -262,14 +385,32 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4-turbo-2024-04-09": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4-turbo-2024-04-09/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4-turbo-2024-04-09/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-4-turbo-2024-04-09",
       "prices": {
         "batch": {
@@ -288,14 +429,39 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4.1": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4.1/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4.1/fast/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4.1/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-4.1",
       "prices": {
         "batch": {
@@ -322,8 +488,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4.1-2025-04-14": {
       "categories": [
@@ -352,14 +517,39 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4.1-mini": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4.1-mini/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4.1-mini/fast/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4.1-mini/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-4.1-mini",
       "prices": {
         "batch": {
@@ -386,8 +576,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4.1-mini-2025-04-14": {
       "categories": [
@@ -416,14 +605,39 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4.1-nano": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4.1-nano/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4.1-nano/fast/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4.1-nano/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-4.1-nano",
       "prices": {
         "batch": {
@@ -450,8 +664,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4.1-nano-2025-04-14": {
       "categories": [
@@ -480,14 +693,39 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4o": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4o/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4o/fast/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4o/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-4o",
       "prices": {
         "batch": {
@@ -514,14 +752,39 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4o-2024-05-13": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4o-2024-05-13/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4o-2024-05-13/fast/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4o-2024-05-13/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-4o-2024-05-13",
       "prices": {
         "batch": {
@@ -546,8 +809,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4o-2024-08-06": {
       "categories": [
@@ -576,14 +838,39 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4o-mini": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4o-mini/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4o-mini/fast/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-4o-mini/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-4o-mini",
       "prices": {
         "batch": {
@@ -610,8 +897,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4o-mini-2024-07-18": {
       "categories": [
@@ -640,8 +926,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4o-mini-transcribe": {
       "categories": [
@@ -661,8 +946,7 @@
       "pricing_type": "per_minute",
       "pricing_types": [
         "per_minute"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4o-mini-tts": {
       "categories": [
@@ -683,8 +967,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4o-transcribe": {
       "categories": [
@@ -704,8 +987,7 @@
       "pricing_type": "per_minute",
       "pricing_types": [
         "per_minute"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-4o-transcribe-diarize": {
       "categories": [
@@ -725,14 +1007,46 @@
       "pricing_type": "per_minute",
       "pricing_types": [
         "per_minute"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5/fast/context"
+            },
+            "status": "uniform"
+          },
+          "flex": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5/flex/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5",
       "prices": {
         "batch": {
@@ -767,14 +1081,46 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5-mini": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5-mini/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5-mini/fast/context"
+            },
+            "status": "uniform"
+          },
+          "flex": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5-mini/flex/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5-mini/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5-mini",
       "prices": {
         "batch": {
@@ -809,14 +1155,39 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5-nano": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5-nano/batch/context"
+            },
+            "status": "uniform"
+          },
+          "flex": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5-nano/flex/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5-nano/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5-nano",
       "prices": {
         "batch": {
@@ -844,14 +1215,32 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5-pro": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5-pro/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5-pro/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5-pro",
       "prices": {
         "batch": {
@@ -870,14 +1259,25 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5-search-api": {
       "categories": [
         "search"
       ],
       "category": "search",
+      "context_pricing": {
+        "tiers": {
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "b7bfe16c647bfa6cb7eb5f814d1fdb78028133f32b1f59c89aef542a233892d6",
+              "locator": "gpt-5-search-api/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5-search-api",
       "prices": {
         "standard": {
@@ -891,14 +1291,46 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.1": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.1/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.1/fast/context"
+            },
+            "status": "uniform"
+          },
+          "flex": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.1/flex/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.1/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.1",
       "prices": {
         "batch": {
@@ -933,14 +1365,46 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.2": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.2/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.2/fast/context"
+            },
+            "status": "uniform"
+          },
+          "flex": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.2/flex/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.2/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.2",
       "prices": {
         "batch": {
@@ -975,14 +1439,32 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.2-pro": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.2-pro/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.2-pro/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.2-pro",
       "prices": {
         "batch": {
@@ -1001,14 +1483,32 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.3-codex": {
       "categories": [
         "codex"
       ],
       "category": "codex",
+      "context_pricing": {
+        "tiers": {
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "b7bfe16c647bfa6cb7eb5f814d1fdb78028133f32b1f59c89aef542a233892d6",
+              "locator": "gpt-5.3-codex/fast/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "b7bfe16c647bfa6cb7eb5f814d1fdb78028133f32b1f59c89aef542a233892d6",
+              "locator": "gpt-5.3-codex/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.3-codex",
       "prices": {
         "fast": {
@@ -1029,14 +1529,50 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.4": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "5e51c04384e7a952f5c4526c3018a3ce4bcb119bb76feb5cf2fe9274759e8eaa",
+              "locator": "gpt-5.4/batch/context"
+            },
+            "status": "known"
+          },
+          "fast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "5e51c04384e7a952f5c4526c3018a3ce4bcb119bb76feb5cf2fe9274759e8eaa",
+              "locator": "gpt-5.4/fast/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "5e51c04384e7a952f5c4526c3018a3ce4bcb119bb76feb5cf2fe9274759e8eaa",
+              "locator": "gpt-5.4/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "5e51c04384e7a952f5c4526c3018a3ce4bcb119bb76feb5cf2fe9274759e8eaa",
+              "locator": "gpt-5.4/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.4",
       "prices": {
         "batch": {
@@ -1109,14 +1645,46 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.4-mini": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.4-mini/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.4-mini/fast/context"
+            },
+            "status": "uniform"
+          },
+          "flex": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.4-mini/flex/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.4-mini/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.4-mini",
       "prices": {
         "batch": {
@@ -1151,14 +1719,39 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.4-nano": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.4-nano/batch/context"
+            },
+            "status": "uniform"
+          },
+          "flex": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.4-nano/flex/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "gpt-5.4-nano/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.4-nano",
       "prices": {
         "batch": {
@@ -1186,14 +1779,42 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.4-pro": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "e12075a124a63eddce5cc05396301910629e556868adbd3a100df9ac9fbc27e4",
+              "locator": "gpt-5.4-pro/batch/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "e12075a124a63eddce5cc05396301910629e556868adbd3a100df9ac9fbc27e4",
+              "locator": "gpt-5.4-pro/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "e12075a124a63eddce5cc05396301910629e556868adbd3a100df9ac9fbc27e4",
+              "locator": "gpt-5.4-pro/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.4-pro",
       "prices": {
         "batch": {
@@ -1242,14 +1863,50 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.5": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "aa183ea4c92f78670a5219422455209d50a9a077d95308b47d95e91d65cf8df5",
+              "locator": "gpt-5.5/batch/context"
+            },
+            "status": "known"
+          },
+          "fast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "aa183ea4c92f78670a5219422455209d50a9a077d95308b47d95e91d65cf8df5",
+              "locator": "gpt-5.5/fast/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "aa183ea4c92f78670a5219422455209d50a9a077d95308b47d95e91d65cf8df5",
+              "locator": "gpt-5.5/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "aa183ea4c92f78670a5219422455209d50a9a077d95308b47d95e91d65cf8df5",
+              "locator": "gpt-5.5/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.5",
       "prices": {
         "batch": {
@@ -1322,14 +1979,26 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.5-cyber": {
       "categories": [
         "cyber"
       ],
       "category": "cyber",
+      "context_pricing": {
+        "tiers": {
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "4075e15eb162052e61fdd29ea82e7a94285c09139288ec4d94c6798c4e8124fa",
+              "locator": "gpt-5.5-cyber/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.5-cyber",
       "prices": {
         "standard": {
@@ -1351,14 +2020,42 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.5-pro": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "f43e85b3af462e462feb4c2ec811a43f504fe20b078b88488575461f94994699",
+              "locator": "gpt-5.5-pro/batch/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "f43e85b3af462e462feb4c2ec811a43f504fe20b078b88488575461f94994699",
+              "locator": "gpt-5.5-pro/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "f43e85b3af462e462feb4c2ec811a43f504fe20b078b88488575461f94994699",
+              "locator": "gpt-5.5-pro/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.5-pro",
       "prices": {
         "batch": {
@@ -1405,14 +2102,26 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.6-cyber": {
       "categories": [
         "cyber"
       ],
       "category": "cyber",
+      "context_pricing": {
+        "tiers": {
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "4075e15eb162052e61fdd29ea82e7a94285c09139288ec4d94c6798c4e8124fa",
+              "locator": "gpt-5.6-cyber/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.6-cyber",
       "prices": {
         "standard": {
@@ -1436,14 +2145,50 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.6-luna": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-luna/batch/context"
+            },
+            "status": "known"
+          },
+          "fast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-luna/fast/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-luna/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-luna/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.6-luna",
       "prices": {
         "batch": {
@@ -1530,8 +2275,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.6-sol": {
       "categories": [
@@ -1539,6 +2283,43 @@
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-sol/batch/context"
+            },
+            "status": "known"
+          },
+          "fast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-sol/fast/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-sol/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "d18fd23a06662fe3ac0a326733dfde5b0c5e96cf152d7e850251d0078e76108b",
+              "locator": "gpt-5.6-sol/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.6-sol",
       "prices": {
         "batch": {
@@ -1625,14 +2406,50 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-5.6-terra": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-terra/batch/context"
+            },
+            "status": "known"
+          },
+          "fast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-terra/fast/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-terra/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-5.6-terra/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-5.6-terra",
       "prices": {
         "batch": {
@@ -1719,14 +2536,58 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-6-astra": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-astra/batch/context"
+            },
+            "status": "known"
+          },
+          "fast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-astra/fast/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-astra/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-astra/standard/context"
+            },
+            "status": "known"
+          },
+          "ultrafast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-astra/ultrafast/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-6-astra",
       "prices": {
         "batch": {
@@ -1833,14 +2694,50 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-6-luna": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-luna/batch/context"
+            },
+            "status": "known"
+          },
+          "fast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-luna/fast/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-luna/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-luna/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-6-luna",
       "prices": {
         "batch": {
@@ -1927,14 +2824,50 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-6-sol": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-sol/batch/context"
+            },
+            "status": "known"
+          },
+          "fast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-sol/fast/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-sol/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6-sol/standard/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-6-sol",
       "prices": {
         "batch": {
@@ -2021,14 +2954,58 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-6.1-sol": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6.1-sol/batch/context"
+            },
+            "status": "known"
+          },
+          "fast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6.1-sol/fast/context"
+            },
+            "status": "known"
+          },
+          "flex": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6.1-sol/flex/context"
+            },
+            "status": "known"
+          },
+          "standard": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6.1-sol/standard/context"
+            },
+            "status": "known"
+          },
+          "ultrafast": {
+            "long_context_input_tokens_gt": 272000,
+            "provenance": {
+              "evidence_sha256": "971ad28a44010e94cb66e1eca48705a06d29058b3568fa5d1b35331391bc8c36",
+              "locator": "gpt-6.1-sol/ultrafast/context"
+            },
+            "status": "known"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-6.1-sol",
       "prices": {
         "batch": {
@@ -2135,8 +3112,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-audio": {
       "categories": [
@@ -2159,8 +3135,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-audio-1.5": {
       "categories": [
@@ -2183,8 +3158,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-audio-mini": {
       "categories": [
@@ -2207,8 +3181,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-image-1": {
       "categories": [
@@ -2243,8 +3216,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-image-1-mini": {
       "categories": [
@@ -2279,8 +3251,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-image-1.5": {
       "categories": [
@@ -2317,8 +3288,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-image-2": {
       "categories": [
@@ -2353,8 +3323,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-image-2.5-flare": {
       "categories": [
@@ -2389,8 +3358,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-image-2.5-sunburst": {
       "categories": [
@@ -2425,8 +3393,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-live-1": {
       "categories": [
@@ -2444,8 +3411,7 @@
       "pricing_type": "per_minute",
       "pricing_types": [
         "per_minute"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-live-transcribe": {
       "categories": [
@@ -2463,8 +3429,7 @@
       "pricing_type": "per_minute",
       "pricing_types": [
         "per_minute"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-realtime": {
       "categories": [
@@ -2493,8 +3458,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-realtime-1.5": {
       "categories": [
@@ -2523,8 +3487,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-realtime-2": {
       "categories": [
@@ -2553,8 +3516,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-realtime-2.1": {
       "categories": [
@@ -2583,8 +3545,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-realtime-2.1-mini": {
       "categories": [
@@ -2613,8 +3574,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-realtime-mini": {
       "categories": [
@@ -2643,8 +3603,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-realtime-translate": {
       "categories": [
@@ -2662,8 +3621,7 @@
       "pricing_type": "per_minute",
       "pricing_types": [
         "per_minute"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-realtime-whisper": {
       "categories": [
@@ -2681,14 +3639,25 @@
       "pricing_type": "per_minute",
       "pricing_types": [
         "per_minute"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-rosalind-discovery": {
       "categories": [
         "life_sciences"
       ],
       "category": "life_sciences",
+      "context_pricing": {
+        "tiers": {
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "a142abd6fac3f9dbe20dfd89626425d536516086b7e3df79c6974079f6996277",
+              "locator": "gpt-rosalind-discovery/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-rosalind-discovery",
       "prices": {
         "standard": {
@@ -2702,14 +3671,25 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-rosalind-research": {
       "categories": [
         "life_sciences"
       ],
       "category": "life_sciences",
+      "context_pricing": {
+        "tiers": {
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "a142abd6fac3f9dbe20dfd89626425d536516086b7e3df79c6974079f6996277",
+              "locator": "gpt-rosalind-research/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "gpt-rosalind-research",
       "prices": {
         "standard": {
@@ -2723,8 +3703,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "gpt-transcribe": {
       "categories": [
@@ -2742,14 +3721,32 @@
       "pricing_type": "per_minute",
       "pricing_types": [
         "per_minute"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "o1": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o1/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o1/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "o1",
       "prices": {
         "batch": {
@@ -2769,14 +3766,32 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "o1-pro": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o1-pro/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o1-pro/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "o1-pro",
       "prices": {
         "batch": {
@@ -2795,14 +3810,46 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "o3": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o3/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o3/fast/context"
+            },
+            "status": "uniform"
+          },
+          "flex": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o3/flex/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o3/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "o3",
       "prices": {
         "batch": {
@@ -2836,14 +3883,32 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "o3-mini": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o3-mini/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o3-mini/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "o3-mini",
       "prices": {
         "batch": {
@@ -2863,14 +3928,32 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "o3-pro": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o3-pro/batch/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o3-pro/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "o3-pro",
       "prices": {
         "batch": {
@@ -2889,14 +3972,46 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "o4-mini": {
       "categories": [
         "language_model"
       ],
       "category": "language_model",
+      "context_pricing": {
+        "tiers": {
+          "batch": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o4-mini/batch/context"
+            },
+            "status": "uniform"
+          },
+          "fast": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o4-mini/fast/context"
+            },
+            "status": "uniform"
+          },
+          "flex": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o4-mini/flex/context"
+            },
+            "status": "uniform"
+          },
+          "standard": {
+            "provenance": {
+              "evidence_sha256": "f059512c72c79495d52875538af1ce9dfba8e920f08a0316c788588fb98c34d8",
+              "locator": "o4-mini/standard/context"
+            },
+            "status": "uniform"
+          }
+        },
+        "version": 1
+      },
       "model": "o4-mini",
       "prices": {
         "batch": {
@@ -2930,8 +4045,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "o4-mini-2025-04-16": {
       "categories": [
@@ -2976,8 +4090,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "omni-moderation-latest": {
       "categories": [
@@ -2995,8 +4108,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "text-embedding-3-large": {
       "categories": [
@@ -3014,8 +4126,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "text-embedding-3-small": {
       "categories": [
@@ -3033,8 +4144,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "text-embedding-ada-002": {
       "categories": [
@@ -3052,8 +4162,7 @@
       "pricing_type": "per_1m_tokens",
       "pricing_types": [
         "per_1m_tokens"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "tts-1": {
       "categories": [
@@ -3071,8 +4180,7 @@
       "pricing_type": "per_1m_characters",
       "pricing_types": [
         "per_1m_characters"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "tts-1-hd": {
       "categories": [
@@ -3090,8 +4198,7 @@
       "pricing_type": "per_1m_characters",
       "pricing_types": [
         "per_1m_characters"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     },
     "whisper": {
       "categories": [
@@ -3109,11 +4216,11 @@
       "pricing_type": "per_minute",
       "pricing_types": [
         "per_minute"
-      ],
-      "timestamp": "2026-10-09T19:50:14.261670Z"
+      ]
     }
   },
   "models_count": 85,
+  "schema_version": 2,
   "source": "openai_official_pricing_page",
   "source_url": "https://developers.openai.com/api/docs/pricing",
   "tools": {

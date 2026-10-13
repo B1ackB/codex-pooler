@@ -23,6 +23,136 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
     end
   end
 
+  test "revision 3 records immutable v2 rules and ignores timestamp layout and rule provenance" do
+    payload = v2_payload("gpt-example-a")
+    assert {:ok, %{inserted: 1, price_version: version}} = OpenAIPricingImporter.import_file(write_json!(payload))
+    assert version == payload["generated_at"] <> ":importer-format-3"
+    original = Repo.one!(from row in PricingSnapshot, where: row.model_identifier == "gpt-example-a")
+    assert original.config["catalog_schema_version"] == 2
+    assert original.config["context_pricing"]["long_context_input_tokens_gt"] == 500_000
+    assert original.config["context_pricing"]["version"] == 1
+    assert original.config["context_pricing"]["provenance"]["source_url"] == payload["source_url"]
+
+    changed =
+      payload
+      |> update_in(["models", "gpt-example-a"], &Map.delete(&1, "timestamp"))
+      |> put_in(["models", "gpt-example-a", "context_pricing", "tiers", "standard", "provenance", "locator"], "changed/source")
+
+    assert {:ok, %{inserted: 0}} = OpenAIPricingImporter.import_file(write_json!(changed))
+    assert persisted_snapshot_fields(Repo.get!(PricingSnapshot, original.id)) == persisted_snapshot_fields(original)
+    changed = put_in(changed, ["models", "gpt-example-a", "context_pricing", "tiers", "standard", "long_context_input_tokens_gt"], 272_000)
+    assert {:error, %{code: :concurrent_pricing_conflict}} = OpenAIPricingImporter.import_file(write_json!(changed))
+    assert persisted_snapshot_fields(Repo.get!(PricingSnapshot, original.id)) == persisted_snapshot_fields(original)
+  end
+
+  test "v2 model-only catalogs import with an empty tool collection but malformed tools fail" do
+    payload = v2_payload("gpt-example-no-tools") |> Map.put("tools", %{}) |> Map.put("tools_count", 0)
+    assert {:ok, %{inserted: 1}} = OpenAIPricingImporter.import_file(write_json!(payload))
+    assert {:ok, %{inserted: 0}} = OpenAIPricingImporter.import_file(write_json!(payload))
+    count = Repo.aggregate(PricingSnapshot, :count)
+
+    invalid_candidates =
+      Enum.map([nil, [], 0], &Map.put(payload, "tools", &1)) ++
+        Enum.map([nil, true, 0.0, "0", 1, -1], &Map.put(payload, "tools_count", &1)) ++
+        [
+          Map.delete(payload, "tools"),
+          Map.delete(payload, "tools_count"),
+          Map.put(payload, "unknown", true),
+          payload |> Map.put("models", %{}) |> Map.put("models_count", 0),
+          payload |> Map.put("tools", %{"example" => %{"unknown" => true}}) |> Map.put("tools_count", 1)
+        ]
+
+    for candidate <- invalid_candidates do
+      assert {:error, %{code: :incompatible_pricing_catalog}} = OpenAIPricingImporter.import_file(write_json!(candidate))
+      assert Repo.aggregate(PricingSnapshot, :count) == count
+    end
+
+    legacy = valid_payload("gpt-example-no-tools-legacy") |> Map.put("tools", %{}) |> Map.put("tools_count", 0)
+    assert {:error, %{code: :incompatible_pricing_catalog}} = OpenAIPricingImporter.import_file(write_json!(legacy))
+    assert Repo.aggregate(PricingSnapshot, :count) == count
+  end
+
+  test "legacy and v2 timestamp layouts import idempotently in both orders with mixed records" do
+    for schema <- [1, 2], first_clean? <- [false, true] do
+      identifier = "gpt-example-layout-#{schema}-#{first_clean?}"
+      payload = if schema == 1, do: valid_payload(identifier), else: v2_payload(identifier)
+      clean = update_in(payload, ["models", identifier], &Map.delete(&1, "timestamp"))
+      {first, second} = if first_clean?, do: {clean, payload}, else: {payload, clean}
+      assert {:ok, %{inserted: 1}} = OpenAIPricingImporter.import_file(write_json!(first))
+      assert {:ok, %{inserted: 0}} = OpenAIPricingImporter.import_file(write_json!(second))
+      snapshot = Repo.one!(from row in PricingSnapshot, where: row.model_identifier == ^identifier)
+      assert snapshot.config["catalog_schema_version"] == schema
+    end
+
+    mixed =
+      v2_payload("gpt-example-mixed-a")
+      |> put_in(["models", "gpt-example-mixed-b"], v2_payload("gpt-example-mixed-b")["models"]["gpt-example-mixed-b"] |> Map.delete("timestamp"))
+      |> Map.put("models_count", 2)
+
+    assert {:ok, %{inserted: 2}} = OpenAIPricingImporter.import_file(write_json!(mixed))
+  end
+
+  test "all v2 priced and unavailable buckets retain their tier descriptor and immutable generations" do
+    payload = v2_payload("gpt-example-generation")
+    model_path = ["models", "gpt-example-generation"]
+
+    payload =
+      put_in(payload, model_path ++ ["prices", "standard"], %{
+        "default" => %{"input" => 1, "output" => 2},
+        "short_context" => %{"input" => 1.0, "output" => 2.0},
+        "long_context" => %{"available" => false}
+      })
+
+    assert {:ok, %{inserted: 3}} = OpenAIPricingImporter.import_file(write_json!(payload))
+    original = Repo.all(from row in PricingSnapshot, where: row.model_identifier == "gpt-example-generation", order_by: row.id)
+    assert Enum.uniq(Enum.map(original, & &1.config["context_pricing"])) |> length() == 1
+    assert Enum.map(original, & &1.config["price_bucket"]) |> Enum.sort() == ~w(default long_context short_context)
+    next = payload |> Map.put("generated_at", "2026-07-29T00:00:00+00:00") |> update_in(model_path, &Map.delete(&1, "timestamp"))
+    assert {:ok, %{inserted: 3, price_version: "2026-07-29T00:00:00+00:00:importer-format-3"}} = OpenAIPricingImporter.import_file(write_json!(next))
+    assert Enum.map(original, &persisted_snapshot_fields(Repo.get!(PricingSnapshot, &1.id))) == Enum.map(original, &persisted_snapshot_fields/1)
+  end
+
+  test "invalid v2 catalogs cannot partially write and schema transitions with one identity conflict" do
+    identifier = "gpt-example-rejected"
+    payload = v2_payload(identifier)
+    count = Repo.aggregate(PricingSnapshot, :count)
+    rule_path = ["models", identifier, "context_pricing", "tiers", "standard"]
+
+    for invalid <- [nil, true, 0, -1, "500000", 500_000.0, 9_007_199_254_740_992] do
+      candidate = put_in(payload, rule_path ++ ["long_context_input_tokens_gt"], invalid)
+      assert {:error, %{code: :incompatible_pricing_catalog}} = OpenAIPricingImporter.import_file(write_json!(candidate))
+      assert Repo.aggregate(PricingSnapshot, :count) == count
+    end
+
+    for candidate <- [put_in(payload, ["models", identifier, "context_pricing"], nil), put_in(payload, ["models", identifier, "timestamp"], nil), Map.put(payload, "schema_version", nil)] do
+      assert {:error, %{code: :incompatible_pricing_catalog}} = OpenAIPricingImporter.import_file(write_json!(candidate))
+      assert Repo.aggregate(PricingSnapshot, :count) == count
+    end
+
+    assert {:ok, %{inserted: 1}} = OpenAIPricingImporter.import_file(write_json!(valid_payload(identifier)))
+    assert {:error, %{code: :concurrent_pricing_conflict}} = OpenAIPricingImporter.import_file(write_json!(payload))
+    assert Repo.aggregate(PricingSnapshot, :count) == count + 1
+  end
+
+  test "unknown observations and statuses are immutable semantics while provenance alone is ignored" do
+    payload = v2_payload("gpt-example-unknown")
+    rule_path = ["models", "gpt-example-unknown", "context_pricing", "tiers", "standard"]
+    provenance = get_in(payload, rule_path ++ ["provenance"])
+    rule = %{"status" => "unknown", "reason" => "unsupported_source", "observed_rules" => [%{"bucket" => "long_context", "operator" => "gte", "input_tokens" => 500_000}], "provenance" => provenance}
+    payload = put_in(payload, rule_path, rule)
+    assert {:ok, %{inserted: 1}} = OpenAIPricingImporter.import_file(write_json!(payload))
+
+    for change <- [Map.put(rule, "reason", "conflicting_source"), put_in(rule, ["observed_rules"], [%{"bucket" => "long_context", "operator" => "gt", "input_tokens" => 500_000}]), %{"status" => "uniform", "provenance" => provenance}] do
+      assert {:error, %{code: :concurrent_pricing_conflict}} = OpenAIPricingImporter.import_file(write_json!(put_in(payload, rule_path, change)))
+    end
+
+    changed = payload |> Map.put("source_url", "https://example.com/changed") |> put_in(rule_path ++ ["provenance", "evidence_sha256"], String.duplicate("b", 64))
+    assert {:ok, %{inserted: 0}} = OpenAIPricingImporter.import_file(write_json!(changed))
+    stored = Repo.one!(from row in PricingSnapshot, where: row.model_identifier == "gpt-example-unknown")
+    assert stored.config["context_pricing"]["provenance"]["source_url"] == payload["source_url"]
+    assert stored.config["context_pricing"]["provenance"]["evidence_sha256"] == provenance["evidence_sha256"]
+  end
+
   test "bounds generic Req adapter exceptions as transport failures" do
     original_options = Req.default_options()
     Req.default_options(adapter: GenericExceptionAdapter)
@@ -235,9 +365,9 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
     assert Repo.aggregate(PricingSnapshot, :count) == before_count
   end
 
-  test "imports revision 2 rows from the immutable fixture idempotently" do
+  test "imports revision 3 rows from the immutable fixture idempotently" do
     assert {:ok, first} = OpenAIPricingImporter.import_file(@fixture)
-    assert first.price_version == "2026-07-28T17:25:03.915713Z:importer-format-2"
+    assert first.price_version == "2026-07-28T17:25:03.915713Z:importer-format-3"
     assert first.inserted == 208
     assert first.skipped == 90
 
@@ -249,7 +379,8 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
       Repo.all(from snapshot in PricingSnapshot, where: snapshot.price_version == ^first.price_version)
 
     assert length(rows) == 208
-    assert Enum.all?(rows, &(&1.config["importer_format_revision"] == "2"))
+    assert Enum.all?(rows, &(&1.config["importer_format_revision"] == "3"))
+    assert Enum.all?(rows, &(&1.config["catalog_schema_version"] == 1 and &1.config["context_pricing"] == %{"version" => 1, "status" => "legacy", "long_context_input_tokens_gt" => 272_000}))
     refute Enum.any?(rows, &(&1.config["service_tier"] == "fast"))
   end
 
@@ -569,7 +700,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
     refute Repo.exists?(from row in PricingSnapshot, where: row.model_identifier == "sample-model")
   end
 
-  test "revision 2 canonical import preserves revision 1 fast rows and attempt references" do
+  test "revision 3 canonical import preserves revision 1 fast rows and attempt references" do
     generated_at = "2026-07-30T10:00:00Z"
     legacy = seed_snapshot!("revision-model", generated_at, "fast", "1", 2)
 
@@ -593,7 +724,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
     assert {:ok, %{inserted: 1, price_version: version}} =
              OpenAIPricingImporter.import_file(write_json!(payload))
 
-    assert version == "#{generated_at}:importer-format-2"
+    assert version == "#{generated_at}:importer-format-3"
     assert Repo.get!(PricingSnapshot, legacy.id).config["service_tier"] == "fast"
     assert Repo.get!(CodexPooler.Accounting.Attempt, attempt.id).pricing_snapshot_id == legacy.id
 
@@ -837,6 +968,35 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
     assert unboxed_snapshot_count([identifier]) == 1
   end
 
+  test "simultaneous v2 equivalent rule imports retain winner provenance through the unique index" do
+    identifier = "gpt-example-race-equivalent-#{System.unique_integer([:positive])}"
+    on_exit(fn -> cleanup_unboxed_snapshots([identifier]) end)
+    winner = v2_payload(identifier)
+    candidate = put_in(winner, ["models", identifier, "context_pricing", "tiers", "standard", "provenance", "locator"], "changed/source")
+    assert %{first: {:ok, %{inserted: 1}}, second: {:ok, %{inserted: 0}}} = run_concurrent_imports(write_json!(winner), write_json!(candidate))
+    assert unboxed_snapshot_count([identifier]) == 1
+    assert unboxed_snapshot!(identifier).config["context_pricing"]["provenance"]["locator"] == "example/standard"
+  end
+
+  test "simultaneous v2 cutoff conflict rolls back a preceding row despite equal rates" do
+    unique = System.unique_integer([:positive])
+    first_identifier = "a-example-race-#{unique}"
+    conflict_identifier = "z-example-race-#{unique}"
+    on_exit(fn -> cleanup_unboxed_snapshots([first_identifier, conflict_identifier]) end)
+    winner = v2_payload(conflict_identifier)
+
+    candidate =
+      winner
+      |> put_in(["models", conflict_identifier, "context_pricing", "tiers", "standard", "long_context_input_tokens_gt"], 272_000)
+      |> put_in(["models", first_identifier], v2_payload(first_identifier)["models"][first_identifier])
+      |> Map.put("models_count", 2)
+
+    assert %{first: {:ok, %{inserted: 1}}, second: {:error, %{code: :concurrent_pricing_conflict}}} = run_concurrent_imports(write_json!(winner), write_json!(candidate))
+    refute unboxed_snapshot_exists?(first_identifier)
+    assert unboxed_snapshot_count([conflict_identifier]) == 1
+    assert unboxed_snapshot!(conflict_identifier).config["context_pricing"]["long_context_input_tokens_gt"] == 500_000
+  end
+
   test "later divergent unique conflict rolls back an earlier candidate insert" do
     unique = System.unique_integer([:positive])
     first_identifier = "a-race-first-#{unique}"
@@ -950,6 +1110,12 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
       assert result.settlement.details["pricing_status"] == "priced"
       assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(expected_cost))
     end
+  end
+
+  defp v2_payload(identifier) do
+    valid_payload(identifier)
+    |> Map.put("schema_version", 2)
+    |> put_in(["models", identifier, "context_pricing"], %{"version" => 1, "tiers" => %{"standard" => %{"status" => "known", "long_context_input_tokens_gt" => 500_000, "provenance" => %{"locator" => "example/standard", "evidence_sha256" => String.duplicate("a", 64)}}}})
   end
 
   defp valid_payload(

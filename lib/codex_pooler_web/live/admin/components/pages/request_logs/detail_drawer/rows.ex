@@ -226,6 +226,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
     [
       detail("request-log-detail-token-counts", "Tokens", format_token_counts(log.token_counts)),
       detail("request-log-detail-cost", "Cost", format_usage_cost(log.cost)),
+      context_pricing_rows(Map.get(log, :context_pricing)),
       detail(
         "request-log-detail-usage-status",
         "Measured usage",
@@ -275,7 +276,42 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
         token_field(log.token_counts, :reasoning_tokens)
       )
     ]
+    |> List.flatten()
     |> present_rows()
+  end
+
+  defp context_pricing_rows(nil), do: []
+
+  defp context_pricing_rows(facts) do
+    [
+      detail("request-log-detail-billing-cutoff", "API pricing cutoff", context_cutoff(facts)),
+      detail("request-log-detail-pricing-rule", "Pricing rule", context_rule(facts)),
+      detail("request-log-detail-pricing-version", "Pricing version", context_version(facts.generation), mono: true),
+      detail("request-log-detail-pricing-explanation", "Reporting basis", "Reporting estimate from published API prices; not a subscription charge.")
+    ]
+  end
+
+  defp context_cutoff(%{status: status, long_context_input_tokens_gt: cutoff}) when status in ~w(known legacy) and is_integer(cutoff),
+    do: "#{cutoff} input tokens; long context above cutoff"
+
+  defp context_cutoff(%{status: "uniform"}), do: "No cutoff (uniform pricing)"
+  defp context_cutoff(_facts), do: "Unavailable"
+
+  defp context_rule(facts) do
+    basis =
+      case facts.basis do
+        "catalog" -> "Catalog"
+        "legacy_assumption" -> "Legacy assumption"
+        _other -> "Unavailable"
+      end
+
+    [basis, facts.status, facts.reason] |> Enum.reject(&is_nil/1) |> Enum.join(" · ")
+  end
+
+  defp context_version(generation) do
+    [generation.price_version || "Not recorded", generation.model_identifier, generation.service_tier, generation.importer_format_revision && "importer #{generation.importer_format_revision}"]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" · ")
   end
 
   defp measured_usage("usage_known"), do: "Available"

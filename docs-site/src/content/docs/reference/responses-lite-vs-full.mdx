@@ -227,7 +227,7 @@ This section exists because the mode is easy to over-attribute. Lite and Full pr
   <tbody>
     <tr>
       <td>Context window</td>
-      <td>None. A model advertises the same context window in Lite and in Full. On native Codex routes, Codex Pooler derives the raw advertised window from the operator context-window override and the model's pricing bucket, while preserving the effective context-window percentage for Codex to apply once. On <code>/v1/models</code>, Pooler flattens that percentage into <code>context_length</code>. Serving mode is not an input, and the Lite boolean is applied after context policy has already run</td>
+      <td>None. A model advertises the same context window in Lite and in Full. On native Codex routes, the selected upstream's advertised metadata and any operator context-window override govern the raw window, while Codex Pooler preserves the effective context-window percentage for Codex to apply once. On <code>/v1/models</code>, Pooler flattens that percentage into <code>context_length</code>. Pricing cutoffs and rates are independent: importing prices does not change advertised context, compaction, or catalog ETags. Serving mode is not an input, and the Lite boolean is applied after context policy has already run</td>
     </tr>
     <tr>
       <td>Token budgets and auto-compaction limits</td>

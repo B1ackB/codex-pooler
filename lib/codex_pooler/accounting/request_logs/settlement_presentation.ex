@@ -1,6 +1,8 @@
 defmodule CodexPooler.Accounting.RequestLogs.SettlementPresentation do
   @moduledoc false
 
+  alias CodexPooler.Accounting.Metadata
+
   @type settlement_projection :: %{
           optional(:request_id) => Ecto.UUID.t(),
           optional(:usage_status) => String.t() | nil,
@@ -34,6 +36,71 @@ defmodule CodexPooler.Accounting.RequestLogs.SettlementPresentation do
         }
 
   @usage_known "usage_known"
+
+  @type context_pricing :: %{
+          status: String.t(),
+          basis: String.t() | nil,
+          long_context_input_tokens_gt: pos_integer() | nil,
+          reason: String.t() | nil,
+          generation: map(),
+          price_bucket: String.t() | nil,
+          band: String.t() | nil,
+          snapshot_id: Ecto.UUID.t() | nil
+        }
+
+  # Only the stored phase facts belong in this projection. In particular,
+  # absence on an old settlement is not permission to consult today's catalog.
+  @spec context_pricing(term()) :: context_pricing() | nil
+  def context_pricing(%{"context_pricing" => %{"status" => status} = facts})
+      when status in ~w(known uniform legacy unknown invalid) do
+    %{
+      status: status,
+      basis: member(facts["basis"], ~w(catalog legacy_assumption unavailable)),
+      long_context_input_tokens_gt: cutoff(facts["long_context_input_tokens_gt"]),
+      reason: member(facts["reason"], ~w(missing_source unsupported_source conflicting_source invalid_rule)),
+      generation: generation(facts["generation"]),
+      price_bucket: member(facts["price_bucket"], ~w(default short_context long_context)),
+      band: member(facts["band"], ~w(lower long uniform)),
+      snapshot_id: uuid(facts["snapshot_id"])
+    }
+  end
+
+  def context_pricing(_details), do: nil
+
+  defp generation(value) when is_map(value) do
+    %{
+      model_identifier: Metadata.bounded_model_identifier(value["model_identifier"]),
+      price_version: bounded_identifier(value["price_version"]),
+      importer_format_revision: revision(value["importer_format_revision"]),
+      service_tier: member(value["service_tier"], ~w(standard priority ultrafast flex batch))
+    }
+  end
+
+  defp generation(_value), do: generation(%{})
+
+  defp bounded_identifier(value) when is_binary(value) and byte_size(value) <= 256 do
+    if Regex.match?(~r/\A[A-Za-z0-9][A-Za-z0-9_.:+\/-]*\z/, value), do: value
+  end
+
+  defp bounded_identifier(_value), do: nil
+
+  defp revision(value) when is_integer(value) and value > 0 and value <= 9_007_199_254_740_991, do: Integer.to_string(value)
+
+  defp revision(value) when is_binary(value) and byte_size(value) <= 16 do
+    if Regex.match?(~r/\A[1-9][0-9]*\z/, value), do: value
+  end
+
+  defp revision(_value), do: nil
+  defp cutoff(value) when is_integer(value) and value > 0 and value <= 9_007_199_254_740_991, do: value
+  defp cutoff(_value), do: nil
+  defp member(value, allowed), do: if(value in allowed, do: value)
+
+  defp uuid(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, id} -> id
+      :error -> nil
+    end
+  end
 
   @spec token_counts(nil | settlement_projection()) :: nil | token_counts()
   def token_counts(nil), do: nil

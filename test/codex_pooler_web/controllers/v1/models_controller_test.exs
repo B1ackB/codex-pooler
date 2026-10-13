@@ -17,6 +17,7 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
 
   alias CodexPooler.Accounting.Request
   alias CodexPooler.AccountingBoundaryTrace
+  alias CodexPooler.Catalog.{OpenAIPricingImporter, PricingSnapshot}
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Pools.ModelServingOverride
   alias CodexPooler.Repo
@@ -406,6 +407,73 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
     assert FakeUpstream.count(upstream) == 0
   end
 
+  test "imported billing cutoffs and account context cohorts change independently in Full and Lite", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        exposed_model_id: "gpt-example-context",
+        pricing_ref: "openai/gpt-example-context",
+        model_metadata: %{
+          "upstream_model" => %{
+            "context_window" => 200_000,
+            "max_context_window" => 300_000,
+            "auto_compact_token_limit" => 150_000,
+            "effective_context_window_percent" => 90
+          }
+        }
+      )
+
+    siblings =
+      for label <- ["Sample cohort A", "Sample cohort B"] do
+        sibling = active_upstream_assignment_fixture(setup.pool, %{account_label: label})
+        prime_routing_quota!(sibling.identity)
+        sibling.assignment
+      end
+
+    singleton = setup.model.metadata["source_assignment_models"][setup.assignment.id]
+
+    majority =
+      Map.merge(singleton, %{
+        "context_window" => 300_000,
+        "max_context_window" => 900_000,
+        "auto_compact_token_limit" => 180_000
+      })
+
+    updated_majority =
+      Map.merge(majority, %{
+        "context_window" => 450_000,
+        "max_context_window" => 1_000_000,
+        "auto_compact_token_limit" => 420_000
+      })
+
+    for {mode, day} <- [{"full", 1}, {"lite", 3}] do
+      put_models_model_serving_mode!(setup, mode)
+      put_context_cohorts!(setup, siblings, singleton, majority)
+      import_context_prices!(setup.model, day, 272_000, 2)
+      before_prices = context_catalogs(conn, setup)
+      assert_context_catalogs(before_prices, mode, 300_000, 900_000, 180_000)
+
+      import_context_prices!(setup.model, day + 1, 500_000, 7)
+      after_prices = context_catalogs(conn, setup)
+      assert after_prices.etag == before_prices.etag
+      assert after_prices == before_prices
+
+      snapshots = context_price_snapshots(setup.model)
+      newest = Enum.filter(snapshots, &(&1.config["context_pricing"]["long_context_input_tokens_gt"] == 500_000))
+      assert Enum.any?(newest, &Decimal.equal?(&1.input_token_micros, Decimal.new(7)))
+      assert Enum.any?(snapshots, &(&1.config["context_pricing"]["long_context_input_tokens_gt"] == 272_000))
+
+      put_context_cohorts!(setup, siblings, singleton, updated_majority)
+      after_context = context_catalogs(conn, setup)
+      assert_context_catalogs(after_context, mode, 450_000, 1_000_000, 420_000)
+      refute after_context.etag == after_prices.etag
+      assert context_price_snapshots(setup.model) == snapshots
+    end
+
+    assert FakeUpstream.count(upstream) == 0
+  end
+
   test "GET /v1/models uses the same canonical context source as native Codex", %{conn: conn} do
     upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
 
@@ -508,6 +576,112 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
              )
 
     assert FakeUpstream.count(upstream) == 0
+  end
+
+  defp put_context_cohorts!(setup, siblings, singleton, majority) do
+    sources = Map.new(siblings, &{&1.id, majority}) |> Map.put(setup.assignment.id, singleton)
+
+    setup.model
+    |> Ecto.Changeset.change(
+      source_assignment_count: map_size(sources),
+      metadata:
+        setup.model.metadata
+        |> Map.put("source_assignment_ids", Map.keys(sources))
+        |> Map.put("source_assignment_models", sources)
+    )
+    |> Repo.update!()
+  end
+
+  defp import_context_prices!(model, day, cutoff, input_rate) do
+    payload = %{
+      "schema_version" => 2,
+      "generated_at" => "2026-10-#{day |> Integer.to_string() |> String.pad_leading(2, "0")}T00:00:00Z",
+      "source" => "synthetic",
+      "source_url" => "https://example.com/pricing",
+      "models_count" => 1,
+      "tools_count" => 1,
+      "tools" => %{
+        "sample-tool" => %{"details" => "Synthetic tool", "price" => 0, "pricing" => "$0", "tool" => "Sample Tool"}
+      },
+      "models" => %{
+        model.exposed_model_id => %{
+          "model" => model.exposed_model_id,
+          "category" => "language_model",
+          "categories" => ["language_model"],
+          "pricing_type" => "per_1m_tokens",
+          "pricing_types" => ["per_1m_tokens"],
+          "prices" => %{
+            "standard" => %{
+              "default" => %{"input" => input_rate, "output" => 10},
+              "long_context" => %{"input" => input_rate * 2, "output" => 20}
+            }
+          },
+          "context_pricing" => %{
+            "version" => 1,
+            "tiers" => %{
+              "standard" => %{
+                "status" => "known",
+                "long_context_input_tokens_gt" => cutoff,
+                "provenance" => %{"locator" => "example/standard", "evidence_sha256" => String.duplicate("a", 64)}
+              }
+            }
+          }
+        }
+      }
+    }
+
+    path = Path.join(System.tmp_dir!(), "context-pricing-#{System.unique_integer([:positive])}.json")
+    on_exit(fn -> File.rm(path) end)
+    File.write!(path, CodexPooler.JSON.encode!(payload))
+    assert {:ok, %{inserted: 2}} = OpenAIPricingImporter.import_file(path)
+    File.rm!(path)
+    refute File.exists?(path)
+  end
+
+  defp context_price_snapshots(model) do
+    Repo.all(from snapshot in PricingSnapshot, where: snapshot.model_identifier == ^model.exposed_model_id, order_by: snapshot.id)
+  end
+
+  defp context_catalogs(conn, setup) do
+    handler_id = {__MODULE__, System.unique_integer([:positive])}
+    parent = self()
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if self() == parent and metadata[:repo] == Repo do
+            send(parent, {handler_id, String.contains?(metadata.query, "pricing_snapshots")})
+          end
+        end,
+        nil
+      )
+
+    try do
+      native = conn |> recycle() |> auth(setup) |> get("/backend-api/codex/models")
+      public = conn |> recycle() |> auth(setup) |> get("/v1/models")
+      assert_received {^handler_id, false}
+      refute_received {^handler_id, true}
+      assert [_] = get_resp_header(native, "etag")
+      %{native: json_response(native, 200), public: json_response(public, 200), etag: get_resp_header(native, "etag")}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp assert_context_catalogs(catalogs, mode, context, maximum, compaction) do
+    assert %{"models" => [native]} = catalogs.native
+    assert native["context_window"] == context
+    assert native["max_context_window"] == maximum
+    assert native["auto_compact_token_limit"] == compaction
+    assert native["effective_context_window_percent"] == 90
+    assert native["use_responses_lite"] == (mode == "lite")
+    assert %{"data" => [public]} = catalogs.public
+    assert public["context_length"] == div(context * 90, 100)
+    refute Map.has_key?(public, "auto_compact_token_limit")
+    refute Map.has_key?(public, "use_responses_lite")
   end
 
   defp put_models_model_serving_mode!(setup, mode) do

@@ -1,6 +1,7 @@
 defmodule CodexPooler.Catalog.OpenAIPricingFormat do
   @moduledoc false
 
+  alias CodexPooler.Catalog.ContextPricing
   alias CodexPooler.ServiceTier
 
   @root_fields ~w(generated_at models models_count source source_url tools tools_count)
@@ -28,7 +29,9 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
             output: Decimal.t() | nil,
             reasoning: Decimal.t() | nil,
             request_base: Decimal.t() | nil,
-            reasoning_price_source: String.t() | nil
+            reasoning_price_source: String.t() | nil,
+            catalog_schema_version: pos_integer(),
+            context_pricing: map()
           }
     defstruct [
       :model_identifier,
@@ -44,6 +47,8 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
       :reasoning,
       :request_base,
       :reasoning_price_source,
+      :catalog_schema_version,
+      :context_pricing,
       categories: []
     ]
   end
@@ -87,17 +92,26 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
   def classify(payload) do
     state = empty_state()
 
-    with {:ok, root} <- exact_object(payload, @root_fields, "$", state),
+    with {:ok, root} <- exact_object(payload, root_fields(payload), "$", state),
          {:ok, generated_at, state} <- validate_root(root, state),
          {:ok, state} <- validate_tools(root["tools"], state),
          {:ok, state} <- validate_models(root["models"], generated_at, state) do
-      finalize(state, generated_at)
+      %{finalize(state, generated_at) | generated_at_raw: root["generated_at"]}
     else
       {:error, state} -> finalize(state, nil)
     end
   end
 
+  defp root_fields(payload) when is_map(payload) do
+    if Map.has_key?(payload, "schema_version"), do: ["schema_version" | @root_fields], else: @root_fields
+  end
+
+  defp root_fields(_payload), do: @root_fields
+
   defp validate_root(root, state) do
+    state = if Map.has_key?(root, "schema_version") and root["schema_version"] !== 2, do: add_error(state, :invalid_schema_version, "schema_version must be integer 2", "schema_version"), else: state
+    state = Map.merge(state, %{catalog_schema_version: Map.get(root, "schema_version", 1), source_url: root["source_url"]})
+
     state =
       state
       |> validate_nonblank(root["source"], "source")
@@ -105,7 +119,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
       |> validate_count(root["models_count"], root["models"], "models_count")
       |> validate_count(root["tools_count"], root["tools"], "tools_count")
       |> validate_nonempty_map(root["models"], "models")
-      |> validate_nonempty_map(root["tools"], "tools")
+      |> validate_tool_collection(root["tools"])
 
     case parse_timestamp(root["generated_at"]) do
       {:ok, generated_at} when state.errors == [] ->
@@ -125,7 +139,10 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
     end
   end
 
-  defp validate_tools(tools, state) when is_map(tools) and map_size(tools) > 0 do
+  defp validate_tool_collection(%{catalog_schema_version: 2} = state, tools) when is_map(tools), do: state
+  defp validate_tool_collection(state, tools), do: validate_nonempty_map(state, tools, "tools")
+
+  defp validate_tools(tools, state) when is_map(tools) do
     state =
       tools
       |> Enum.sort_by(&elem(&1, 0))
@@ -208,7 +225,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
     path = "models.#{key}"
 
     with true <- is_binary(key),
-         {:ok, model} <- exact_object(model, @model_fields, path, state) do
+         {:ok, model} <- exact_object(model, model_fields(model, state.catalog_schema_version), path, state) do
       normalized_key = normalize_identity(key)
       normalized_model = normalize_identity(model["model"])
 
@@ -219,7 +236,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
         |> validate_string_list(model["pricing_types"], path <> ".pricing_types")
         |> validate_nonempty_map(model["prices"], path <> ".prices")
         |> validate_model_identity(normalized_key, normalized_model, path)
-        |> validate_model_timestamp(model["timestamp"], generated_at, path)
+        |> validate_optional_model_timestamp(model, generated_at, path)
         |> validate_pricing_types(model["pricing_type"], model["pricing_types"], path)
 
       cond do
@@ -239,6 +256,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
 
         true ->
           state = classify_model(state, normalized_model, model, path)
+          state = attach_context_pricing(state, normalized_model, model, path)
           {state, MapSet.put(identities, normalized_model)}
       end
     else
@@ -250,8 +268,69 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
     end
   end
 
+  defp model_fields(model, schema) when is_map(model) do
+    fields = if Map.has_key?(model, "timestamp"), do: @model_fields, else: @model_fields -- ["timestamp"]
+    if schema == 2 and Map.has_key?(model, "context_pricing"), do: ["context_pricing" | fields], else: fields
+  end
+
+  defp model_fields(_model, _schema), do: @model_fields
+
+  defp validate_optional_model_timestamp(state, model, generated_at, path) do
+    if Map.has_key?(model, "timestamp"), do: validate_model_timestamp(state, model["timestamp"], generated_at, path), else: state
+  end
+
+  defp attach_context_pricing(state, identifier, model, path) do
+    rows = Enum.filter(state.rows, &(&1.model_identifier == identifier))
+    tiers = rows |> Enum.map(& &1.raw_service_tier) |> Enum.uniq() |> Enum.sort()
+
+    rules = context_rules(state, model, tiers)
+
+    case rules do
+      {:ok, rules} ->
+        state = %{
+          state
+          | rows:
+              Enum.map(state.rows, fn row ->
+                if row.model_identifier == identifier, do: %{row | catalog_schema_version: state.catalog_schema_version, context_pricing: rules[row.raw_service_tier]}, else: row
+              end)
+        }
+
+        if state.catalog_schema_version == 2, do: validate_default_short_alias(state, rows, model["prices"], path), else: state
+
+      :error ->
+        add_error(state, :invalid_context_pricing, "context pricing must completely describe importable tiers", path <> ".context_pricing")
+    end
+  end
+
+  defp context_rules(%{catalog_schema_version: 1}, _model, tiers), do: {:ok, Map.new(tiers, &{&1, ContextPricing.legacy()})}
+
+  defp context_rules(_state, model, []), do: if(Map.has_key?(model, "context_pricing"), do: :error, else: {:ok, %{}})
+
+  defp context_rules(state, model, tiers), do: ContextPricing.normalize(model["context_pricing"], tiers, model["prices"], state.source_url)
+
+  defp validate_default_short_alias(state, rows, prices, path) do
+    Enum.reduce(Enum.group_by(rows, & &1.raw_service_tier), state, fn {tier, tier_rows}, acc ->
+      by_bucket = Map.new(tier_rows, &{&1.price_bucket, &1})
+
+      if Map.has_key?(prices[tier], "default") and Map.has_key?(prices[tier], "short_context") do
+        compare_default_short(acc, by_bucket["default"], by_bucket["short_context"], path)
+      else
+        acc
+      end
+    end)
+  end
+
+  defp compare_default_short(state, %Row{} = default, %Row{} = short, path) do
+    fields = ~w(availability input cached_input cache_write output reasoning request_base)a
+    if Map.take(semantic_row(default), fields) == Map.take(semantic_row(short), fields), do: state, else: default_short_error(state, path)
+  end
+
+  defp compare_default_short(state, _default, _short, path), do: default_short_error(state, path)
+
+  defp default_short_error(state, path), do: add_error(state, :conflicting_default_short_alias, "default and short_context prices conflict", path <> ".prices")
+
   defp validate_model_scalars(state, model, path) do
-    Enum.reduce(~w(model category pricing_type timestamp), state, fn field, acc ->
+    Enum.reduce(~w(model category pricing_type), state, fn field, acc ->
       validate_trimmed_nonblank(acc, model[field], path <> ".#{field}")
     end)
   end
@@ -656,7 +735,9 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
       :output,
       :reasoning,
       :request_base,
-      :reasoning_price_source
+      :reasoning_price_source,
+      :catalog_schema_version,
+      :context_pricing
     ])
     |> Map.update!(:input, &normalize_decimal/1)
     |> Map.update!(:cached_input, &normalize_decimal/1)
@@ -664,6 +745,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
     |> Map.update!(:output, &normalize_decimal/1)
     |> Map.update!(:reasoning, &normalize_decimal/1)
     |> Map.update!(:request_base, &normalize_decimal/1)
+    |> Map.update!(:context_pricing, &ContextPricing.semantics/1)
   end
 
   defp row_identity(row), do: {row.model_identifier, row.service_tier, row.price_bucket}

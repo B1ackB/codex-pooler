@@ -282,6 +282,27 @@ Read usage independently of delivery status. When Codex Pooler has received meas
 
 Usage that the upstream never delivered to Codex Pooler cannot be recovered from a cancellation label or a reservation estimate. Retaining a receipt already received does not guarantee recovery after a hard process or node loss before persistence.
 
+### API pricing rules and recorded costs
+
+Cost is a USD reporting estimate from published API prices, not a subscription charge, provider invoice, or measurement of subscription quota debit. A subscription announcement about long-context fees does not set an API pricing cutoff or make imported API rates zero.
+
+For records with stored pricing facts, the drawer shows:
+
+| Row | Meaning |
+| --- | --- |
+| API pricing cutoff | The selected model and tier's recorded input-token cutoff. Input at or below it uses the lower band; input strictly above it uses long-context pricing. Uniform pricing shows no cutoff. |
+| Pricing rule | `Catalog` with `known` or `uniform`, `Legacy assumption` with `legacy`, or `Unavailable` with an unknown/invalid rule and its recorded reason. |
+| Pricing version | The recorded generation's price version, model identifier, service tier, and importer revision, where available. |
+| Reporting basis | “Reporting estimate from published API prices; not a subscription charge.” |
+
+The cutoff compares total input, including cached reads and cache writes exactly once, before decomposing input for each component's rate. Output tokens are excluded. Cached-token counters must not be added again to an input total that already includes them. This rule applies to both Full and Lite requests and is independent of the model's advertised context window or compaction limit.
+
+The [pricing catalog](https://github.com/icoretech/openai-json-pricing) uses schema 2 with version-1 rules per model and tier. Importer revision 3 selects a coherent generation of rules and rates. The reservation uses estimated input and the generation applicable then; completion uses normalized actual input and the generation applicable at completion. An intervening catalog import can therefore change both the cutoff and rates used for the final estimate without changing the original reservation.
+
+`unknown` rules retain a reason such as `missing_source`, `unsupported_source`, or `conflicting_source`; invalid stored rules are also unavailable. Neither is a zero-dollar price or a reason to borrow an older generation's rule. Pricing availability does not control runtime admission or subscription quota. Legacy pricing retains a labelled 272000-token assumption only for the old contract.
+
+The drawer reads persisted completion facts. Later imports do not reprice recorded costs, and historical records without those facts omit these rows or show `Not recorded`; their rule is not reconstructed from today's catalog. See [API key accounting](/operators/api-keys/) for the token-budget and reporting-cost distinction.
+
 ### Service tiers
 
 The request drawer keeps three tier facts apart:

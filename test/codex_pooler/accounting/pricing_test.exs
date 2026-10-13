@@ -2308,7 +2308,7 @@ defmodule CodexPooler.Accounting.PricingTest do
       assert result.settlement.details["price_bucket"] == "default"
 
       assert result.settlement.details["price_version"] ==
-               "#{DateTime.to_iso8601(generated_at)}:importer-format-2"
+               "#{DateTime.to_iso8601(generated_at)}:importer-format-3"
 
       assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(99))
       assert result.settlement.details["cache_write_rate_status"] == "available"
@@ -2323,7 +2323,7 @@ defmodule CodexPooler.Accounting.PricingTest do
                Decimal.new(21)
              )
 
-      assert result.settlement.details["pricing_importer_revision"] in [2, "2"]
+      assert result.settlement.details["pricing_importer_revision"] in [3, "3"]
     end
 
     test "explicit zero cache writes remain priced without a cache-write rate" do

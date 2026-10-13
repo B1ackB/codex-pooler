@@ -6,9 +6,6 @@ defmodule CodexPooler.Accounting.PricingResolution.Costing do
   alias CodexPooler.Catalog.PricingSnapshot
 
   @reservation_strategy "json_bytes_div_4_ceil"
-  @default_price_bucket "default"
-  @long_context_price_bucket "long_context"
-  @long_context_input_token_threshold 272_000
   @default_output_reservation_tokens 512
   @opaque_context_output_reservation_tokens 2_048
 
@@ -87,21 +84,8 @@ defmodule CodexPooler.Accounting.PricingResolution.Costing do
     |> Decimal.add(snapshot.request_base_micros || Decimal.new(0))
   end
 
-  @spec price_bucket(map()) :: String.t()
-  def price_bucket(payload) when is_map(payload) do
-    payload
-    |> estimate_input_tokens()
-    |> price_bucket_for_input_tokens()
-  end
-
-  @spec price_bucket_for_input_tokens(term()) :: String.t()
-  def price_bucket_for_input_tokens(input_tokens)
-      when input_tokens > @long_context_input_token_threshold,
-      do: @long_context_price_bucket
-
-  def price_bucket_for_input_tokens(_input_tokens), do: @default_price_bucket
-
-  defp estimate_input_tokens(payload) do
+  @spec estimate_input_tokens(map()) :: non_neg_integer()
+  def estimate_input_tokens(payload) do
     payload
     |> prompt_payload()
     |> estimate_tokens()

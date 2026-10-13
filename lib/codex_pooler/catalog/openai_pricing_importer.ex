@@ -3,12 +3,12 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporter do
 
   import Ecto.Query
 
-  alias CodexPooler.Catalog.{OpenAIPricingFormat, PricingSnapshot}
+  alias CodexPooler.Catalog.{ContextPricing, OpenAIPricingFormat, PricingSnapshot}
   alias CodexPooler.Platform.OutboundHTTP
   alias CodexPooler.Repo
 
   @source "openai-json-pricing"
-  @revision "2"
+  @revision "3"
   @currency_code "USD"
   @billing_unit "token"
 
@@ -103,7 +103,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporter do
   end
 
   defp persist(classified, source_url) do
-    price_version = "#{classified.generated_at_raw}:importer-format-2"
+    price_version = "#{classified.generated_at_raw}:importer-format-#{@revision}"
     captured_at = now()
 
     rows =
@@ -245,6 +245,8 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporter do
       config: %{
         "source" => @source,
         "importer_format_revision" => @revision,
+        "catalog_schema_version" => row.catalog_schema_version,
+        "context_pricing" => row.context_pricing,
         "source_generated_at" => generated_at_raw,
         "source_path" => source_url,
         "service_tier" => row.service_tier,
@@ -263,6 +265,8 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporter do
       model_identifier: String.downcase(snapshot.model_identifier),
       price_version: snapshot.price_version,
       revision: snapshot.config["importer_format_revision"],
+      catalog_schema_version: snapshot.config["catalog_schema_version"],
+      context_pricing: ContextPricing.semantics(snapshot.config["context_pricing"]),
       service_tier: snapshot.config["service_tier"],
       price_bucket: snapshot.config["price_bucket"],
       currency_code: snapshot.currency_code,
@@ -287,6 +291,8 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporter do
       model_identifier: String.downcase(attrs.model_identifier),
       price_version: attrs.price_version,
       revision: attrs.config["importer_format_revision"],
+      catalog_schema_version: attrs.config["catalog_schema_version"],
+      context_pricing: ContextPricing.semantics(attrs.config["context_pricing"]),
       service_tier: attrs.config["service_tier"],
       price_bucket: attrs.config["price_bucket"],
       currency_code: attrs.currency_code,

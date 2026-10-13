@@ -1,6 +1,7 @@
 defmodule CodexPooler.Catalog.OpenAIPricingPreflightTest do
   use ExUnit.Case, async: true
 
+  alias CodexPooler.Catalog.ContextPricing
   alias CodexPooler.Catalog.OpenAIPricingFormat
   alias CodexPooler.Catalog.OpenAIPricingPreflight
 
@@ -93,6 +94,116 @@ defmodule CodexPooler.Catalog.OpenAIPricingPreflightTest do
              "models.text-embedding-3-small.prices.standard.default",
              "models.text-embedding-ada-002.prices.standard.default"
            ]
+  end
+
+  test "v2 non-importable modality and per-minute shapes omit context rules" do
+    for {type, buckets} <- [
+          {"per_minute", %{"default" => %{"price_per_minute" => 0.02}}},
+          {"per_1m_tokens", %{"image" => %{"input" => 1, "cached_input" => 0.5}}}
+        ] do
+      payload =
+        valid_payload()
+        |> Map.put("schema_version", 2)
+        |> put_in(["models", "future-model", "pricing_type"], type)
+        |> put_in(["models", "future-model", "pricing_types"], [type])
+        |> put_in(["models", "future-model", "prices", "standard"], buckets)
+        |> update_in(["models", "future-model"], &Map.delete(&1, "timestamp"))
+
+      assert %{compatible?: true, summary: %{importable_rows: 0}} = OpenAIPricingPreflight.validate_payload(payload)
+      refute OpenAIPricingPreflight.validate_payload(put_in(payload, ["models", "future-model", "context_pricing"], nil)).compatible?
+    end
+  end
+
+  test "normalized rule semantics remove only the descriptor provenance path" do
+    assert ContextPricing.semantics(%{"status" => "unknown", "provenance" => %{"locator" => "source"}, "other" => %{"provenance" => "semantic"}}) == %{"status" => "unknown", "other" => %{"provenance" => "semantic"}}
+  end
+
+  test "v2 context rule validation rejects malformed schema, values, provenance and tier coverage" do
+    payload = context_payload()
+    model_path = ["models", "future-model"]
+    context_path = model_path ++ ["context_pricing"]
+    rule_path = context_path ++ ["tiers", "standard"]
+    rule = get_in(payload, rule_path)
+
+    mutations =
+      Enum.map([nil, true, 1, 2.0, "2", 3], &Map.put(payload, "schema_version", &1)) ++
+        Enum.map([nil, false, 0, -1, 1.5, "500000", 9_007_199_254_740_992], &put_in(payload, rule_path ++ ["long_context_input_tokens_gt"], &1)) ++
+        Enum.map([nil, true, 1.0, "1", 2], &put_in(payload, context_path ++ ["version"], &1)) ++
+        Enum.map([nil, "", " ", String.duplicate("é", 129)], &put_in(payload, rule_path ++ ["provenance", "locator"], &1)) ++
+        Enum.map([nil, String.duplicate("A", 64), String.duplicate("a", 63), String.duplicate("a", 65)], &put_in(payload, rule_path ++ ["provenance", "evidence_sha256"], &1)) ++
+        Enum.map([nil, "", "2026-07-29T00:00:00Z"], &put_in(payload, model_path ++ ["timestamp"], &1)) ++
+        [
+          update_in(payload, model_path, &Map.delete(&1, "context_pricing")),
+          put_in(payload, context_path, nil),
+          put_in(payload, context_path ++ ["tiers"], %{}),
+          put_in(payload, context_path ++ ["tiers", "priority"], rule),
+          put_in(payload, rule_path ++ ["unit"], "tokens"),
+          put_in(payload, rule_path ++ ["operator"], "gt"),
+          put_in(payload, rule_path ++ ["provenance", "timestamp"], payload["generated_at"]),
+          Map.delete(payload, "schema_version")
+        ]
+
+    for {candidate, index} <- Enum.with_index(mutations) do
+      result = OpenAIPricingPreflight.validate_payload(candidate)
+      refute result.compatible?, "malformed v2 candidate #{index} accepted"
+      assert result.errors != []
+    end
+
+    for cutoff <- [1, 500_000, 9_007_199_254_740_991] do
+      assert OpenAIPricingPreflight.validate_payload(put_in(payload, rule_path ++ ["long_context_input_tokens_gt"], cutoff)).compatible?
+    end
+  end
+
+  test "v2 unknown observations require exact sorted distinct rules and uniform forbids long context" do
+    payload = context_payload()
+    rule_path = ["models", "future-model", "context_pricing", "tiers", "standard"]
+    provenance = get_in(payload, rule_path ++ ["provenance"])
+    long = %{"bucket" => "long_context", "operator" => "gt", "input_tokens" => 500_000}
+    short = %{"bucket" => "short_context", "operator" => "lte", "input_tokens" => 272_000}
+    unknown = %{"status" => "unknown", "reason" => "conflicting_source", "observed_rules" => [long, short], "provenance" => provenance}
+
+    for reason <- ~w(unsupported_source conflicting_source), observations <- [[], [long], [long, short]] do
+      descriptor = unknown |> Map.put("reason", reason) |> Map.put("observed_rules", observations)
+      assert OpenAIPricingPreflight.validate_payload(put_in(payload, rule_path, descriptor)).compatible?
+    end
+
+    assert OpenAIPricingPreflight.validate_payload(put_in(payload, rule_path, %{unknown | "reason" => "missing_source", "observed_rules" => []})).compatible?
+    refute OpenAIPricingPreflight.validate_payload(put_in(payload, rule_path, %{unknown | "reason" => "missing_source"})).compatible?
+
+    for observations <- [nil, %{}, [short, long], [long, long], [Map.put(long, "operator", "eq")], [Map.put(long, "input_tokens", true)], [Map.put(long, "extra", 1)], [%{}]] do
+      refute OpenAIPricingPreflight.validate_payload(put_in(payload, rule_path, Map.put(unknown, "observed_rules", observations))).compatible?
+    end
+
+    for descriptor <- [Map.put(unknown, "reason", "invented"), Map.put(unknown, "long_context_input_tokens_gt", 1), Map.delete(unknown, "observed_rules"), %{"status" => "legacy", "provenance" => provenance}] do
+      refute OpenAIPricingPreflight.validate_payload(put_in(payload, rule_path, descriptor)).compatible?
+    end
+
+    uniform = put_in(payload, rule_path, %{"status" => "uniform", "provenance" => provenance})
+    assert OpenAIPricingPreflight.validate_payload(uniform).compatible?
+    refute OpenAIPricingPreflight.validate_payload(put_in(uniform, ["models", "future-model", "prices", "standard", "long_context"], %{"available" => false})).compatible?
+  end
+
+  test "v2 requires matching prices and rules before normalizing aliases" do
+    payload = context_payload()
+    rule = get_in(payload, ["models", "future-model", "context_pricing", "tiers", "standard"])
+    prices = get_in(payload, ["models", "future-model", "prices", "standard"])
+
+    aliases =
+      payload
+      |> put_in(["models", "future-model", "prices"], %{"fast" => prices, "priority" => prices})
+      |> put_in(["models", "future-model", "context_pricing", "tiers"], %{"fast" => rule, "priority" => put_in(rule, ["provenance", "locator"], "other/source")})
+
+    assert %{compatible?: true, summary: %{importable_rows: 1}} = OpenAIPricingPreflight.validate_payload(aliases)
+    changed = put_in(aliases, ["models", "future-model", "context_pricing", "tiers", "priority", "long_context_input_tokens_gt"], 272_000)
+    assert %{compatible?: false, errors: [%{code: :conflicting_service_tier_alias}]} = OpenAIPricingPreflight.validate_payload(changed)
+    lower = put_in(payload, ["models", "future-model", "prices", "standard", "short_context"], prices["default"])
+    assert OpenAIPricingPreflight.validate_payload(lower).compatible?
+    same_reasoning = put_in(lower, ["models", "future-model", "prices", "standard", "short_context", "reasoning"], prices["default"]["output"])
+    assert OpenAIPricingPreflight.validate_payload(same_reasoning).compatible?
+
+    for prices <- [%{"input" => 99, "output" => 2}, %{"available" => false}, %{"input" => 1}] do
+      refute OpenAIPricingPreflight.validate_payload(put_in(lower, ["models", "future-model", "prices", "standard", "default"], prices)).compatible?
+    end
   end
 
   test "strict root, model, and tool objects reject missing, extra, and wrong typed values" do
@@ -667,6 +778,12 @@ defmodule CodexPooler.Catalog.OpenAIPricingPreflightTest do
              "long_context" => 1,
              "short_context" => 0
            }
+  end
+
+  defp context_payload do
+    valid_payload()
+    |> Map.put("schema_version", 2)
+    |> put_in(["models", "future-model", "context_pricing"], %{"version" => 1, "tiers" => %{"standard" => %{"status" => "known", "long_context_input_tokens_gt" => 500_000, "provenance" => %{"locator" => "example/standard", "evidence_sha256" => String.duplicate("a", 64)}}}})
   end
 
   defp valid_payload do
