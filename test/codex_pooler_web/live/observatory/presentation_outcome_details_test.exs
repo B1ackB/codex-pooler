@@ -50,7 +50,7 @@ defmodule CodexPoolerWeb.Observatory.PresentationOutcomeDetailsTest do
 
     for client <- [nil, %{kind: "unknown-client"}, %{kind: %{malformed: true}}] do
       [unknown] = Presentation.build_outcomes([%{client: client}])
-      assert unknown.client == ClientIdentity.from_kind(nil)
+      assert unknown.client == %{ClientIdentity.from_kind(nil) | label: "Unknown client"}
     end
   end
 

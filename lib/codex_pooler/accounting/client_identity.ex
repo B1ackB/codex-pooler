@@ -2,7 +2,8 @@ defmodule CodexPooler.Accounting.ClientIdentity do
   @moduledoc """
   Normalized client identities with static labels and local icon metadata.
 
-  Classification never returns the supplied user agent or any part of it.
+  Classification returns static metadata. Observatory additionally uses a
+  bounded compact user-agent label for unrecognized clients.
   """
 
   @type css_class :: String.t() | [String.t() | false | nil]
@@ -17,6 +18,7 @@ defmodule CodexPooler.Accounting.ClientIdentity do
 
   @patterns [
     {:prefix, "codex desktop/", "codex_desktop", "Codex Desktop", "hero-computer-desktop", :info},
+    {:prefix, "codex-computer-use/", "codex_computer_use", "Codex Computer Use", "hero-computer-desktop", :info},
     {:custom, :codex_cli, "codex", "Codex", "hero-command-line", :info},
     {:contains, ["opencode"], "opencode", "opencode", "hero-code-bracket-square", :primary},
     {:contains, ["openclaw"], "openclaw", "OpenClaw", "hero-bolt", :primary},
@@ -48,6 +50,7 @@ defmodule CodexPooler.Accounting.ClientIdentity do
 
   @logo_names %{
     "codex_desktop" => "codex",
+    "codex_computer_use" => "codex",
     "codex" => "codex",
     "opencode" => "opencode",
     "openclaw" => "openclaw",
@@ -85,6 +88,35 @@ defmodule CodexPooler.Accounting.ClientIdentity do
   end
 
   def classify(nil), do: client("unknown", "Client", "hero-window", :neutral)
+
+  @spec compact_user_agent(term()) :: String.t() | nil
+  def compact_user_agent(value) when is_binary(value) do
+    if String.valid?(value) do
+      value = value |> String.replace(~r/[[:cntrl:]]/u, " ") |> String.trim()
+
+      compact =
+        case Regex.run(~r/^([^\/\(]+)\/([^\s\(]+)(?:\s+\(([^)]*)\))?/, value) do
+          [_match, product, version | _ignored] -> String.trim(product) <> " " <> String.trim(version)
+          _ -> value
+        end
+
+      cond do
+        compact == "" -> nil
+        String.length(compact) > 72 -> String.slice(compact, 0, 69) <> "..."
+        true -> compact
+      end
+    end
+  end
+
+  def compact_user_agent(_value), do: nil
+
+  @spec observatory_identity(String.t() | nil) :: classification()
+  def observatory_identity(user_agent) do
+    case classify(user_agent) do
+      %{kind: "unknown"} = identity -> %{identity | label: compact_user_agent(user_agent) || "Unknown client"}
+      identity -> identity
+    end
+  end
 
   @spec from_kind(term()) :: classification()
   def from_kind(kind) do

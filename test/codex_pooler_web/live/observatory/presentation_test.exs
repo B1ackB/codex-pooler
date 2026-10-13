@@ -5,6 +5,36 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
 
   @windows [{"1h", "1h"}, {"5h", "5h"}, {"24h", "24h"}, {"7d", "7d"}]
 
+  test "model colors agree across chart, distribution and outcomes after rank changes" do
+    projection = complete_projection()
+
+    for models <- [projection.models, Enum.reverse(Enum.take(projection.models, 3))] do
+      rendered = Presentation.build(%{projection | models: models})
+      series = CodexPooler.JSON.decode!(rendered.traffic.chart.series)
+      colors = CodexPooler.JSON.decode!(rendered.traffic.chart.colors)
+
+      for {series, color} <- Enum.zip(series, colors), series["name"] not in ["Other", "Cost"] do
+        distribution = Enum.find(rendered.models, &(&1.label == series["name"]))
+        outcome = hd(Presentation.build_outcomes([%{model: series["name"], endpoint_class: "responses"}], rendered.model_colors))
+        assert color == distribution.color
+        assert color == outcome.model_color
+        assert color == rendered.model_colors[series["name"]]
+      end
+    end
+  end
+
+  test "human chart labels preserve model-code bucket matching" do
+    projection = complete_projection()
+    models = Enum.map(projection.models, &Map.put(&1, :display_name, "Sample Model"))
+    rendered = Presentation.build(%{projection | models: models})
+    [first, second | _] = CodexPooler.JSON.decode!(rendered.traffic.chart.series)
+    assert first["name"] == "Sample Model"
+    assert second["name"] == "Sample Model"
+    assert first["data"] == [50, 20]
+    assert second["data"] == [30, 10]
+    assert hd(rendered.models).label == "Sample Model"
+  end
+
   test "builds a bounded safe render model and exact Apex chart contract" do
     model = Presentation.build(complete_projection())
 
@@ -45,18 +75,8 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
     assert top.token_label == "129"
     assert top.cost_label == "1.29"
 
-    # Cards reuse the chart palette by rank so a model's tint matches its column:
-    # top-5 get the model colors, the rest fold into the muted "Other" color.
-    other = "var(--admin-chart-other-models)"
-
     assert Enum.map(model.models, & &1.color) ==
-             [
-               "var(--color-primary)",
-               "var(--color-info)",
-               "var(--color-warning)",
-               "var(--color-reset-bank)",
-               "var(--admin-chart-requests)"
-             ] ++ List.duplicate(other, 7)
+             ["var(--color-primary)", "var(--color-info)", "var(--color-warning)", "var(--color-reset-bank)", "var(--admin-chart-requests)"] ++ List.duplicate("var(--admin-chart-other-models)", 7)
 
     chart = model.traffic.chart
     assert CodexPooler.JSON.decode!(chart.categories) == ["07-17 11:00", "07-17 12:00"]
@@ -168,6 +188,7 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
                  :effort,
                  :endpoint,
                  :model,
+                 :model_color,
                  :speed_level,
                  :status,
                  :timestamp,

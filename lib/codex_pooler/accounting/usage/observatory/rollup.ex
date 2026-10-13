@@ -59,6 +59,7 @@ defmodule CodexPooler.Accounting.Usage.Observatory.Rollup do
 
       %{
         label: label,
+        display_name: Map.get(hd(grouped), :model_name, label),
         request_count: totals.request_count,
         total_tokens: totals.total_tokens,
         settled_cost_micros: totals.settled_cost_micros,
@@ -92,6 +93,7 @@ defmodule CodexPooler.Accounting.Usage.Observatory.Rollup do
     |> Map.new(fn key -> {key, to_integer(Map.get(row, key))} end)
     |> Map.put(:bucket_index, to_integer(Map.get(row, :bucket_index)))
     |> Map.put(:model_label, Map.get(row, :model_label))
+    |> Map.put(:model_name, Map.get(row, :model_name, Map.get(row, :model_label)))
   end
 
   defp to_integer(nil), do: 0

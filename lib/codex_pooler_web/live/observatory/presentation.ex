@@ -7,7 +7,7 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
   alias CodexPoolerWeb.Admin.RequestLogsDisplay
   alias CodexPoolerWeb.Observatory.Presentation.Safety
 
-  @endpoint_classes ["responses", "chat_completions", "completions", "embeddings"]
+  @endpoint_classes ["responses", "chat_completions", "completions", "embeddings", "compaction", "models", "usage", "files", "audio"]
   @windows [{"1h", "1h"}, {"5h", "5h"}, {"24h", "24h"}, {"7d", "7d"}]
   def window_options, do: @windows
   def valid_window?(key), do: Enum.any?(@windows, fn {window, _} -> window == key end)
@@ -18,6 +18,7 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
     requests = map(get(totals, :requests))
     tokens = map(get(totals, :tokens))
     total = non_negative(get(requests, :total))
+    model_colors = model_colors(get(p, :models))
 
     %{
       window: window(get(p, :window)),
@@ -30,7 +31,8 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
           map(get(p, :trends))
         ),
       models: models(get(p, :models), non_negative(get(tokens, :total))),
-      outcomes: build_outcomes(get(p, :outcomes)),
+      outcomes: build_outcomes(get(p, :outcomes), model_colors),
+      model_colors: model_colors,
       traffic: traffic(get(p, :buckets), get(p, :model_buckets), get(p, :models), tokens)
     }
   end
@@ -135,15 +137,7 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
   defp percent_measure(nil), do: %{value: "not available", unit: nil}
   defp percent_measure(percent), do: %{value: "#{percent}", unit: "%"}
 
-  # Cost is the green line; keep green out of the model columns so the two
-  # never collide (mirrors the admin tokens-vs-cost chart palette).
-  @chart_model_colors [
-    "var(--color-primary)",
-    "var(--color-info)",
-    "var(--color-warning)",
-    "var(--color-reset-bank)",
-    "var(--admin-chart-requests)"
-  ]
+  @chart_model_colors ["var(--color-primary)", "var(--color-info)", "var(--color-warning)", "var(--color-reset-bank)", "var(--admin-chart-requests)"]
   @chart_other_color "var(--admin-chart-other-models)"
   @chart_cost_color "var(--color-success)"
   @max_chart_models 5
@@ -196,13 +190,14 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
     base =
       models_value
       |> chart_models()
-      |> Enum.map(fn %{raw: raw, name: name} ->
-        %{name: name, data: Enum.map(0..(bucket_count - 1)//1, &Map.get(index, {&1, raw}, 0))}
+      |> Enum.with_index()
+      |> Enum.map(fn {%{raw: raw, name: name}, index_position} ->
+        %{name: name, color: Enum.at(@chart_model_colors, index_position, @chart_other_color), data: Enum.map(0..(bucket_count - 1)//1, &Map.get(index, {&1, raw}, 0))}
       end)
       |> Enum.reject(fn %{data: data} -> Enum.sum(data) == 0 end)
 
     case base do
-      [] -> [%{name: "Tokens", data: totals}]
+      [] -> [%{name: "Tokens", color: @chart_other_color, data: totals}]
       series -> append_other(series, totals)
     end
   end
@@ -218,7 +213,7 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
         max(total - covered, 0)
       end)
 
-    if Enum.sum(other) > 0, do: series ++ [%{name: "Other", data: other}], else: series
+    if Enum.sum(other) > 0, do: series ++ [%{name: "Other", color: @chart_other_color, data: other}], else: series
   end
 
   defp chart_models(models) when is_list(models) do
@@ -226,7 +221,7 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
     |> Enum.take(@max_chart_models)
     |> Enum.map(fn model ->
       raw = get(map(model), :label)
-      %{raw: raw, name: Safety.sanitize_text(raw, "Unknown model")}
+      %{raw: raw, name: display_model_name(get(map(model), :display_name), raw)}
     end)
   end
 
@@ -247,13 +242,7 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
   defp model_bucket_index(_rows), do: %{}
 
   defp chart_colors(model_series) do
-    model_series
-    |> Enum.with_index()
-    |> Enum.map(fn {%{name: name}, position} ->
-      if name == "Other",
-        do: @chart_other_color,
-        else: Enum.at(@chart_model_colors, position, @chart_other_color)
-    end)
+    Enum.map(model_series, & &1.color)
   end
 
   defp series(name, data), do: %{"name" => name, "type" => "column", "data" => data}
@@ -292,15 +281,12 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
       share = get(row, :share_percent)
 
       %{
-        label: Safety.sanitize_text(get(row, :label), "Unknown model"),
+        label: display_model_name(get(row, :display_name), get(row, :label)),
         requests_label: request_short(non_negative(get(row, :request_count))),
         share_label: model_share_label(share),
         token_label: token_label(non_negative(get(row, :total_tokens))),
         cost_label: money_amount(non_negative(get(row, :cost_micros))),
         bar_percent: model_bar_percent(share),
-        # Same palette + rank order as the traffic chart columns, so a model's
-        # distribution bar matches its chart series (top-5 colored, rest folded
-        # into the "Other" color).
         color: Enum.at(@chart_model_colors, index, @chart_other_color),
         shine_delay: shine_delay(index)
       }
@@ -323,24 +309,38 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
   defp shine_delay(index), do: Float.round(rem(index, 6) * 0.4, 2)
 
   @doc "Builds one bounded page of safe holder-facing outcomes."
-  @spec build_outcomes(term()) :: [map()]
-  def build_outcomes(value) when is_list(value), do: Enum.take(value, 200) |> Enum.map(&outcome/1)
-  def build_outcomes(_value), do: []
+  @spec build_outcomes(term(), map()) :: [map()]
+  def build_outcomes(value, colors \\ %{})
+  def build_outcomes(value, colors) when is_list(value), do: Enum.take(value, 200) |> Enum.map(&outcome(&1, colors))
+  def build_outcomes(_value, _colors), do: []
 
-  defp outcome(value) do
+  defp model_colors(models) when is_list(models) do
+    models
+    |> Enum.reject(&(non_negative(get(map(&1), :total_tokens)) == 0))
+    |> Enum.take(12)
+    |> Enum.with_index()
+    |> Map.new(fn {model, index} -> {get(map(model), :label), Enum.at(@chart_model_colors, index, @chart_other_color)} end)
+  end
+
+  defp model_colors(_models), do: %{}
+
+  defp outcome(value, colors) do
     row = map(value)
     tokens = non_negative(get(row, :total_tokens))
     code = Safety.sanitize_code(get(row, :code))
     cost = cost(get(row, :cost), ["settled", "estimated"])
+    endpoint = endpoint(get(row, :endpoint_class))
+    model_applicable? = endpoint not in ["models", "usage", "files"]
 
     %{
-      client: ClientIdentity.from_kind(get(get(row, :client), :kind)),
+      client: outcome_client(get(row, :client)),
       code: code,
       cost: cost,
-      effort: Safety.sanitize_text(get(row, :reasoning_effort), nil),
-      endpoint: endpoint(get(row, :endpoint_class)),
-      model: Safety.sanitize_text(get(row, :model), "Unknown model"),
-      speed_level: speed_level(row, cost),
+      effort: if(model_applicable?, do: Safety.sanitize_text(get(row, :reasoning_effort), nil)),
+      endpoint: endpoint,
+      model: if(model_applicable?, do: display_model_name(get(row, :model_display_name), get(row, :model)), else: "Not applicable"),
+      model_color: if(model_applicable?, do: outcome_model_color(get(row, :model), colors)),
+      speed_level: if(model_applicable?, do: speed_level(row, cost)),
       status: status(get(row, :status), code),
       timestamp: outcome_timestamp(get(row, :timestamp)),
       tokens: tokens(row, tokens)
@@ -358,6 +358,26 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
       actual_service_tier: get(row, :actual_service_tier),
       metadata: nil
     })
+  end
+
+  defp display_model_name(name, code), do: Safety.sanitize_text(name, Safety.sanitize_text(code, "Unknown model"))
+
+  defp outcome_client(value) do
+    identity = ClientIdentity.from_kind(get(value, :kind))
+
+    if identity.kind == "unknown" do
+      %{identity | label: ClientIdentity.compact_user_agent(get(value, :label)) || "Unknown client"}
+    else
+      identity
+    end
+  end
+
+  defp outcome_model_color(code, colors) do
+    case Safety.sanitize_text(code, nil) do
+      nil -> nil
+      "Unknown model" -> nil
+      model -> Map.get(colors, model, @chart_other_color)
+    end
   end
 
   defp tokens(row, total) do

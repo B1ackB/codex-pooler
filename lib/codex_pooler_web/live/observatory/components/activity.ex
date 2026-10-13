@@ -168,7 +168,7 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
             <tr>
               <th scope="col">Time</th>
               <th scope="col">Model</th>
-              <th scope="col">Endpoint</th>
+              <th scope="col">Activity</th>
               <th scope="col" class="observatory-outcome-client">Client</th>
               <th scope="col" class="text-center">Status</th>
               <th scope="col" class="text-right">Tokens</th>
@@ -197,7 +197,8 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
               >
                 <div class="flex min-w-0 items-center gap-2">
                   <span class="flex min-w-0 items-baseline gap-1 text-sm leading-4">
-                    <span data-role="outcome-model" class="min-w-0 truncate font-semibold" title={outcome.model}>{outcome.model}</span>
+                    <span :if={Map.get(outcome, :model_color)} data-role="model-swatch" aria-hidden="true" class="size-2 shrink-0 self-center rounded-xs" style={"background-color: #{outcome.model_color}"}></span>
+                    <span data-role="outcome-model" class={["min-w-0 truncate", if(outcome.model == "Not applicable", do: "text-xs font-normal text-base-content/55", else: "font-semibold")]} title={outcome.model}>{outcome.model}</span>
                     <span
                       :if={Map.get(outcome, :effort)}
                       data-role="outcome-effort"
@@ -225,11 +226,11 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
                 scope="row"
                 data-label="Model"
                 data-role="observatory-outcome-group"
-                class="max-w-56 truncate font-normal text-base-content/55"
+                class="max-w-56 truncate text-xs font-normal text-base-content/55"
               >
-                — no model · {outcome.count} requests
+                {outcome.model} · {outcome.count} requests
               </th>
-              <td data-label="Endpoint" class="truncate text-xs text-base-content/70" title={outcome.endpoint}>{outcome.endpoint}</td>
+              <td data-label="Activity" class="truncate text-xs text-base-content/70" title={activity_label(outcome.endpoint)}>{activity_label(outcome.endpoint)}</td>
               <td data-label="Client" class="observatory-outcome-client max-w-40 text-xs text-base-content/70">
                 <.client client={Map.get(outcome, :client)} />
               </td>
@@ -353,9 +354,22 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
   defp flush(nil, rows, next), do: {:cont, rows, next}
   defp flush(acc, rows, next), do: {:cont, [acc | rows], next}
 
-  defp unattributed?(outcome), do: outcome.model == "Unknown model" and get_in(outcome, [:tokens, :total]) == 0
+  defp unattributed?(outcome), do: outcome.model in ["Unknown model", "Not applicable"] and outcome.endpoint not in ["responses", "chat_completions", "completions", "compaction", "audio", "embeddings"] and get_in(outcome, [:tokens, :total]) == 0
 
-  defp same_group?(group, outcome), do: group.endpoint == outcome.endpoint and group.status == outcome.status and Map.get(group, :client) == Map.get(outcome, :client)
+  defp same_group?(group, outcome), do: group.model == outcome.model and group.endpoint == outcome.endpoint and group.status == outcome.status and Map.get(group, :client) == Map.get(outcome, :client)
+
+  defp activity_label(endpoint) do
+    case endpoint do
+      "models" -> "Catalog"
+      "usage" -> "Usage"
+      "files" -> "Files"
+      "audio" -> "Transcription"
+      "compaction" -> "Compaction"
+      generation when generation in ["responses", "chat_completions", "completions"] -> "Generation"
+      "embeddings" -> "Embeddings"
+      _ -> "Other"
+    end
+  end
 
   defp start_group(outcome), do: Map.put(outcome, :count, 1)
 end

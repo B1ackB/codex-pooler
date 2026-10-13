@@ -267,7 +267,7 @@ defmodule CodexPoolerWeb.ObservatoryLive do
 
   defp apply_outcomes_result(socket, {:ok, {:ok, %{outcomes: outcomes, outcomes_page: page}}}) do
     report = socket.assigns.observatory_report
-    report = %{report | outcomes: report.outcomes ++ Presentation.build_outcomes(outcomes)}
+    report = %{report | outcomes: report.outcomes ++ Presentation.build_outcomes(outcomes, report.model_colors)}
     assign(socket, observatory_report: report, outcomes_page: page, loading_outcomes: false, outcomes_load_error: false)
   end
 

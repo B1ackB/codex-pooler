@@ -109,23 +109,76 @@ defmodule CodexPooler.Accounting.ObservatoryOutcomesPagingTest do
     end
   end
 
-  test "outcomes expose static client identity without raw user agent details", context do
+  test "outcomes expose known identities and compact unknown user agents", context do
     for {user_agent, offset} <- Enum.with_index(["codex-tui/1.2.3 private-marker-alpha", "custom-client/1.0 private-marker-beta", nil], 1) do
       timed_request(context, DateTime.add(@as_of, -offset), %{user_agent: user_agent})
     end
 
     assert {:ok, report} = Observatory.read_outcomes(context.principal, as_of: @as_of)
     assert Enum.map(report.outcomes, & &1.client.kind) == ["codex", "unknown", "unknown"]
-    assert Enum.map(report.outcomes, & &1.client.label) == ["Codex", "Client", "Client"]
+    assert Enum.map(report.outcomes, & &1.client.label) == ["Codex", "custom-client 1.0", "Unknown client"]
     assert hd(report.outcomes).client.logo == %{asset: "codex.svg", format: :svg}
     refute Enum.any?(report.outcomes, &Map.has_key?(&1, :user_agent))
     refute inspect(report) =~ "private-marker"
-    refute inspect(report) =~ "custom-client"
+    assert inspect(report) =~ "custom-client 1.0"
     refute inspect(report) =~ "1.2.3"
   end
 
   defp principal(pool, api_key) do
     DashboardPrincipal.new(%{api_key_id: api_key.id, pool_id: pool.id, display_name: api_key.display_name, key_prefix: api_key.key_prefix})
+  end
+
+  test "display names reach outcomes and charts without merging distinct model codes", context do
+    for {code, offset} <- Enum.with_index(["sample-model-a", "sample-model-b"], 1) do
+      model = model_fixture(context.pool, %{exposed_model_id: code, display_name: "Sample Model"})
+      request = timed_request(context, DateTime.add(@as_of, -offset), %{model_id: model.id})
+      ledger_entry_fixture(request, %{total_tokens: offset * 10})
+    end
+
+    assert {:ok, report} = Observatory.read(context.principal, "1h", as_of: @as_of)
+    assert Enum.map(report.outcomes, & &1.model_display_name) == ["Sample Model", "Sample Model"]
+    assert Enum.map(report.models, & &1.label) == ["sample-model-b", "sample-model-a"]
+    assert Enum.map(report.models, & &1.display_name) == ["Sample Model", "Sample Model"]
+    assert Enum.map(report.models, & &1.total_tokens) == [20, 10]
+  end
+
+  test "unusable display names fall back to the exposed code", context do
+    for {name, offset} <- Enum.with_index(["<invalid>", String.duplicate("x", 81)], 1) do
+      model = model_fixture(context.pool, %{exposed_model_id: "sample-#{offset}", display_name: name})
+      timed_request(context, DateTime.add(@as_of, -offset), %{model_id: model.id})
+    end
+
+    assert {:ok, report} = Observatory.read_outcomes(context.principal, as_of: @as_of)
+    assert Enum.map(report.outcomes, & &1.model_display_name) == ["sample-1", "sample-2"]
+  end
+
+  test "recent outcomes classify supported routes without guessing from substrings", context do
+    routes = [
+      {"/backend-api/codex/models", "models"},
+      {"/v1/models", "models"},
+      {"/api/codex/usage", "usage"},
+      {"/wham/usage", "usage"},
+      {"/backend-api/wham/usage", "usage"},
+      {"/v1/usage", "usage"},
+      {"/v1/responses", "responses"},
+      {"/backend-api/codex/responses", "responses"},
+      {"/backend-api/codex/responses/compact", "compaction"},
+      {"/backend-api/files", "files"},
+      {"/backend-api/files/uploaded", "files"},
+      {"/v1/files", "files"},
+      {"/v1/files/delete", "files"},
+      {"/v1/files/content", "files"},
+      {"/backend-api/transcribe", "audio"},
+      {"/backend-api/codex/images/generations", "other"}
+    ]
+
+    for {{endpoint, _class}, offset} <- Enum.with_index(routes, 1) do
+      timed_request(context, DateTime.add(@as_of, -offset), %{endpoint: endpoint})
+    end
+
+    assert {:ok, report} = Observatory.read_outcomes(context.principal, as_of: @as_of)
+    assert Enum.map(report.outcomes, & &1.endpoint_class) == Enum.map(routes, &elem(&1, 1))
+    refute Enum.any?(report.outcomes, &Map.has_key?(&1, :endpoint))
   end
 
   defp timed_request(context, timestamp, attrs \\ %{}) do

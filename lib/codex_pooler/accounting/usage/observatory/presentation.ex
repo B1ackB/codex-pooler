@@ -173,6 +173,7 @@ defmodule CodexPooler.Accounting.Usage.Observatory.Presentation do
     Enum.map(rows, fn row ->
       %{
         label: row.label,
+        display_name: Map.get(row, :display_name, row.label),
         request_count: integer(row.request_count),
         total_tokens: integer(row.total_tokens),
         share_percent: percentage(row.total_tokens, total_tokens),
@@ -199,7 +200,8 @@ defmodule CodexPooler.Accounting.Usage.Observatory.Presentation do
     %{
       timestamp: row.timestamp,
       model: row.model,
-      client: ClientIdentity.classify(Map.get(row, :user_agent)),
+      model_display_name: Map.get(row, :model_display_name, row.model),
+      client: ClientIdentity.observatory_identity(Map.get(row, :user_agent)),
       endpoint_class: row.endpoint_class,
       status: row.status,
       code: row.code,

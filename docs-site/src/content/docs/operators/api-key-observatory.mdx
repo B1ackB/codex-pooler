@@ -52,7 +52,11 @@ The **Traffic** chart plots tokens per time bucket as stacked columns, one colou
 
 **Model distribution** sits beside the chart. For each model with settled tokens (up to 12) it shows the request count, the share of tokens, the token total and the cost, with a bar in the colour of the model's chart column.
 
+Model colours match across chart columns, distribution bars and the squares beside recent model names within the selected window. Squares follow Observatory's existing chart palette; models outside that palette use a neutral colour.
+
 ### Recent outcomes
+
+Model names throughout Observatory use the catalog's human-readable display name, falling back to the model code when unavailable. Chart and distribution totals remain separated by model code, even when display names match.
 
 The table shows requests admitted in the last 60 minutes, newest first, independently of the selected chart window. It loads 200 requests at a time; **Load older requests** adds more from the same hour. Desktop rows keep the request details on one line; narrow screens use labelled cards. At smaller widths the client column is hidden to keep tokens and cost visible:
 
@@ -60,13 +64,13 @@ The table shows requests admitted in the last 60 minutes, newest first, independ
 | --- | --- |
 | Time | The admission time of the request, in UTC. |
 | Model | The model, then the reasoning effort after a dot, and an inline speed indicator: one bolt for normal speed, two for the fast priority tier, three for ultrafast. |
-| Endpoint | A sanitized endpoint class: `responses`, `chat_completions`, `completions`, `embeddings` or `other`. |
-| Client | A recognized client name with its icon. Unrecognized user agents show a generic client label; raw user agents are never shown. |
+| Activity | `Catalog`, `Usage`, `Generation`, `Compaction`, `Files` or `Transcription`. Unclassified calls show `Other`. |
+| Client | A recognized client name with its icon. Unrecognized clients show the compact User-Agent (product and version when available, at most 72 characters) with a generic icon. Missing values show `Unknown client`. |
 | Status | The outcome: `Succeeded`, `Failed` or `Rejected` with a sanitized reason (`Rate limited`, `Authentication issue`, `Timed out`, `Service unavailable`, `Invalid request` or `Request failed`), `Accepted`, `In progress` or `Client cancelled`. |
 | Tokens | The total and the cached share of input, such as `47.4k (98.6% cached)`. The percentage is omitted when the recorded breakdown is incomplete. |
 | Cost | The settled or estimated cost, or a dash when none is available. |
 
-Consecutive requests with the same endpoint class, status and client that name no model and carry no tokens, such as clients listing models, fold into one `— no model · N requests` row that shows the newest time of the group. Refreshing starts a new hour snapshot and replaces any older pages already loaded.
+Catalog, Usage and Files show `Not applicable` in Model, without reasoning effort or speed indicators. Generation, Compaction and Transcription retain the recorded model or `Unknown model` when unavailable. Consecutive token-free utility calls with the same activity, model label, status and client fold into one `Not applicable · N requests` row showing the newest time. Unclassified model-free calls can also group, retaining `Unknown model`; model-dependent calls remain separate. Refreshing starts a new hour snapshot and replaces any older pages already loaded.
 
 A failed request classified as `Client cancelled` can reflect an explicit stop, automatic client interruption, or connection loss. The label alone does not identify the cause or prove user intent; a recorded server idle timeout stays a failure. The success rate excludes client cancellations from its succeeded and failed counts, and its detail line says how many there were.
 

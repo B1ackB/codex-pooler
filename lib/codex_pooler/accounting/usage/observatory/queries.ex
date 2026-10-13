@@ -20,10 +20,11 @@ defmodule CodexPooler.Accounting.Usage.Observatory.Queries do
     |> then(fn facts ->
       Repo.all(
         from(fact in subquery(facts),
-          group_by: [fact.bucket_index, fact.model_label],
+          group_by: [fact.bucket_index, fact.model_label, fact.model_name],
           select: %{
             bucket_index: fact.bucket_index,
             model_label: fact.model_label,
+            model_name: fact.model_name,
             request_count: count(fact.request_id),
             succeeded: sum(fact.succeeded),
             failed: sum(fact.failed),

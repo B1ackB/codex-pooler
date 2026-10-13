@@ -193,6 +193,7 @@ defmodule CodexPooler.Accounting.ObservatoryContractTest do
                  :endpoint_class,
                  :input_tokens,
                  :model,
+                 :model_display_name,
                  :output_tokens,
                  :reasoning_effort,
                  :requested_service_tier,

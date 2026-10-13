@@ -5,6 +5,64 @@ defmodule CodexPoolerWeb.Observatory.ComponentsOutcomeGroupsTest do
 
   alias CodexPooler.Accounting.ClientIdentity
   alias CodexPoolerWeb.Observatory.Components.{Activity, Telemetry}
+  alias CodexPoolerWeb.Observatory.Presentation
+
+  test "unknown client fallbacks render escaped text and keep different clients separate" do
+    rows =
+      Enum.map(["sample-a/1.0 (Sample OS)", "sample-b/2.0", "<script>alert(1)</script>", nil], fn agent ->
+        %{endpoint_class: "models", total_tokens: 0, client: ClientIdentity.observatory_identity(agent)}
+      end)
+
+    fragment = rows |> Presentation.build_outcomes() |> render_outcomes()
+    assert LazyHTML.query(fragment, "[data-role='observatory-outcome-row']") |> Enum.count() == 4
+    assert LazyHTML.query(fragment, "[data-role='outcome-client']") |> Enum.map(&(LazyHTML.text(&1) |> String.trim())) == ["sample-a 1.0", "sample-b 2.0", "<script>alert(1)</script>", "Unknown client"]
+    assert LazyHTML.query(fragment, "script") |> Enum.empty?()
+  end
+
+  test "model swatches center beside known model names and use a neutral fallback outside the chart" do
+    outcomes =
+      Presentation.build_outcomes([
+        %{endpoint_class: "responses", model: "sample-model", model_display_name: "Sample Model"},
+        %{endpoint_class: "responses", model: "Unknown model"},
+        %{endpoint_class: "models", model: "sample-model"}
+      ])
+
+    assert hd(outcomes).model_color == "var(--admin-chart-other-models)"
+    fragment = render_outcomes(outcomes)
+    swatches = LazyHTML.query(fragment, "[data-role='model-swatch']")
+    assert Enum.count(swatches) == 1
+    assert LazyHTML.query(fragment, "[data-role='model-swatch'].self-center.size-2[aria-hidden='true']") |> Enum.count() == 1
+  end
+
+  test "recent models use human names with safe code fallback and retain utility placeholders" do
+    outcomes =
+      Presentation.build_outcomes([
+        %{endpoint_class: "responses", model: "sample-model", model_display_name: "Sample Model"},
+        %{endpoint_class: "responses", model: "sample-model", model_display_name: ""},
+        %{endpoint_class: "models", model: "sample-model", model_display_name: "Sample Model"}
+      ])
+
+    assert render_outcomes(outcomes) |> LazyHTML.query("[data-role='outcome-model']") |> Enum.map(&LazyHTML.text/1) == ["Sample Model", "sample-model", "Not applicable"]
+  end
+
+  test "activity labels and model applicability survive presentation and rendering" do
+    classes = ["models", "usage", "responses", "compaction", "files", "audio"]
+
+    outcomes = Presentation.build_outcomes(Enum.map(classes, &%{endpoint_class: &1, model: "sample-model", reasoning_effort: "high", total_tokens: 0}))
+    fragment = render_outcomes(outcomes)
+    assert LazyHTML.query(fragment, "[data-label='Activity']") |> Enum.map(&LazyHTML.text/1) == ["Catalog", "Usage", "Generation", "Compaction", "Files", "Transcription"]
+    assert LazyHTML.query(fragment, "[data-role='outcome-model']") |> Enum.map(&LazyHTML.text/1) == ["Not applicable", "Not applicable", "sample-model", "sample-model", "Not applicable", "sample-model"]
+    assert LazyHTML.query(fragment, "[data-role='outcome-effort']") |> Enum.count() == 3
+    assert LazyHTML.query(fragment, "[data-role='outcome-speed']") |> Enum.count() == 3
+  end
+
+  test "catalog groups preserve applicability while missing generation models remain separate" do
+    outcomes = Presentation.build_outcomes(Enum.map(["models", "models", "usage", "responses", "responses"], &%{endpoint_class: &1, total_tokens: 0}))
+    fragment = render_outcomes(outcomes)
+    assert LazyHTML.query(fragment, "[data-role='observatory-outcome-row']") |> Enum.count() == 4
+    assert LazyHTML.query(fragment, "[data-role='observatory-outcome-group']") |> LazyHTML.text() =~ "Not applicable · 2 requests"
+    assert LazyHTML.query(fragment, "[data-role='outcome-model']") |> Enum.map(&LazyHTML.text/1) == ["Not applicable", "Unknown model", "Unknown model"]
+  end
 
   test "consecutive requests without a model and without tokens fold into one row" do
     outcomes = [

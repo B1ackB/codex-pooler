@@ -122,14 +122,24 @@ defmodule CodexPooler.Accounting.Usage.Observatory.QueryScope do
   defmacrop endpoint_class(endpoint) do
     quote do
       fragment(
-        "CASE WHEN ? LIKE '%responses%' THEN 'responses' WHEN ? LIKE '%files%' THEN 'files' WHEN ? LIKE '%audio%' OR ? LIKE '%transcribe%' THEN 'audio' WHEN ? LIKE '%models%' THEN 'models' WHEN ? LIKE '%usage%' OR ? LIKE '%wham%' THEN 'usage' ELSE 'other' END",
-        unquote(endpoint),
+        "CASE WHEN ? = '/backend-api/codex/responses/compact' THEN 'compaction' WHEN ? IN ('/v1/responses', '/backend-api/codex/responses') THEN 'responses' WHEN ? IN ('/backend-api/files', '/backend-api/files/uploaded', '/v1/files', '/v1/files/content', '/v1/files/delete') THEN 'files' WHEN ? = '/backend-api/transcribe' THEN 'audio' WHEN ? IN ('/v1/models', '/backend-api/codex/models') THEN 'models' WHEN ? IN ('/api/codex/usage', '/wham/usage', '/backend-api/wham/usage', '/v1/usage') THEN 'usage' ELSE 'other' END",
         unquote(endpoint),
         unquote(endpoint),
         unquote(endpoint),
         unquote(endpoint),
         unquote(endpoint),
         unquote(endpoint)
+      )
+    end
+  end
+
+  defmacrop model_name(display_name, exposed_model_id) do
+    quote do
+      fragment(
+        "CASE WHEN BTRIM(?) ~ '^[A-Za-z0-9][A-Za-z0-9 ._:/()+-]{0,79}$' THEN BTRIM(?) ELSE ? END",
+        unquote(display_name),
+        unquote(display_name),
+        model_label(unquote(exposed_model_id))
       )
     end
   end
@@ -188,6 +198,7 @@ defmodule CodexPooler.Accounting.Usage.Observatory.QueryScope do
         request_id: request.id,
         bucket_index: bucket_index(request.admitted_at, ^window.started_at, ^window.bucket_seconds),
         model_label: model_label(model.exposed_model_id),
+        model_name: model_name(model.display_name, model.exposed_model_id),
         succeeded: fragment("CASE WHEN ? = 'succeeded' THEN 1 ELSE 0 END", request.status),
         in_progress:
           fragment(
@@ -276,6 +287,7 @@ defmodule CodexPooler.Accounting.Usage.Observatory.QueryScope do
         user_agent: request.user_agent,
         timestamp: request.admitted_at,
         model: model_label(model.exposed_model_id),
+        model_display_name: model_name(model.display_name, model.exposed_model_id),
         endpoint_class: endpoint_class(request.endpoint),
         response_status_code: request.response_status_code,
         total_tokens: known_usage(fact.latest_settlement_usage_status, fact.latest_total_tokens),
