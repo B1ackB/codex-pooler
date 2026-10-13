@@ -65,6 +65,7 @@ defmodule CodexPooler.Accounting.ObservatoryDashboardPrincipalTest do
     assert report.models == [
              %{
                label: "gpt-observatory-principal",
+               display_name: "Shared generic model",
                request_count: 3,
                total_tokens: 25,
                share_percent: 100.0,
