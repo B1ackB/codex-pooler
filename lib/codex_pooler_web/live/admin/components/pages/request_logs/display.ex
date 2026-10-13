@@ -246,7 +246,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
   def format_model_reasoning_slot(log) do
     cond do
       reasoning = format_model_reasoning(log) -> reasoning
-      model_default_reasoning?(log) -> "model default"
+      model_default_reasoning?(log) -> "default"
       true -> nil
     end
   end

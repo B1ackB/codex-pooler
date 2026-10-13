@@ -1404,9 +1404,10 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     assert has_element?(
              view,
              "#{default_cell} [data-role='model-identity-line'] #request-log-#{default_effort_request.id}-reasoning-default[data-role='model-reasoning-default']",
-             "model default"
+             "default"
            )
 
+    assert has_element?(view, "#{default_cell} [data-role='model-identity-line']", "gpt-6-luna · default")
     refute has_element?(view, "#{default_cell} [data-role='model-reasoning']")
     refute has_element?(view, "#{default_cell} [data-role='model-service-tier']")
     assert has_element?(view, "#{default_cell} [data-role='model-context-line'] [data-role='model-speed'][data-speed-level='1'][title='Normal speed']")
@@ -1414,7 +1415,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
-             "#{default_cell}[title='gpt-6-luna model default / tier default']"
+             "#{default_cell}[title='gpt-6-luna default / tier default']"
            )
 
     explicit_cell = "#request-log-#{explicit_effort_request.id}-model-details"
@@ -1439,7 +1440,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
       cell = "#request-log-#{request.id}-model-details"
 
       refute has_element?(view, "#{cell} [data-role='model-reasoning-default']")
-      refute has_element?(view, cell, "model default")
       refute has_element?(view, "#{cell} [data-role='model-service-tier']")
       assert has_element?(view, "#{cell} [data-role='model-speed'][data-speed-level='1']")
       assert has_element?(view, "#request-log-row-#{request.id} [data-role='status-text'].text-error")

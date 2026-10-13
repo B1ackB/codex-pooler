@@ -408,7 +408,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
             class="text-base-content/45"
             title="No reasoning effort recorded; the backend used the model default"
           >
-            model default
+            default
           </span>
         </span>
       </span>
