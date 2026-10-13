@@ -69,6 +69,65 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressRawHTTPTest do
     {:ok, port: port, sockets: sockets, upstream: upstream, gateway: gateway}
   end
 
+  for form <- [:origin, :absolute],
+      route <- ["/v1/responses", "/backend-api/codex/responses"],
+      upgrade? <- [false, true],
+      values <- [:identical, :conflicting] do
+    @tag :capture_log
+    test "rejects #{form} #{route} duplicate Host fields (upgrade=#{upgrade?}, #{values})", ctx do
+      assert_duplicate_host_rejected(ctx, unquote(form), unquote(route), unquote(upgrade?), unquote(values))
+    end
+  end
+
+  @tag :capture_log
+  test "duplicate Host fields reject an authenticated incomplete body before reading it", ctx do
+    for form <- [:origin, :absolute],
+        route <- ["/v1/responses", "/backend-api/codex/responses"],
+        upgrade? <- [false, true] do
+      headers =
+        [
+          {"authorization", ctx.gateway.authorization},
+          {"x-forwarded-for", "198.51.100.20"},
+          {"content-type", "application/json"}
+        ] ++ upgrade_headers(upgrade?)
+
+      response = raw_request(ctx, request_method(upgrade?), request_target(form, route), headers, host_fields: duplicate_hosts(:conflicting), content_length: 100)
+
+      assert response.status == 400
+      refute List.keymember?(response.headers, "x-request-id", 0)
+      assert_no_gateway_side_effects(ctx.upstream)
+    end
+  end
+
+  test "single Host ordinary and upgrade controls still reach runtime authentication", ctx do
+    for form <- [:origin, :absolute],
+        route <- ["/v1/responses", "/backend-api/codex/responses"],
+        upgrade? <- [false, true] do
+      headers = [{"x-forwarded-for", "198.51.100.20"}] ++ upgrade_headers(upgrade?)
+      response = raw_request(ctx, request_method(upgrade?), request_target(form, route), headers, host_fields: [{"hOsT", "example.com"}])
+
+      assert response.status == 401
+      assert json_field(response, ["error", "code"]) == "api_key_missing"
+      assert List.keymember?(response.headers, "x-request-id", 0)
+    end
+
+    assert_no_gateway_side_effects(ctx.upstream)
+  end
+
+  @tag :capture_log
+  test "absolute-form single comma-valued or absent Host fields retain adapter behavior", ctx do
+    for host_fields <- [[], [{"Host", "example.com, example.net"}]] do
+      response = raw_request(ctx, "POST", request_target(:absolute, "/v1/responses"), [{"x-forwarded-for", "198.51.100.20"}], host_fields: host_fields)
+
+      assert response.status == 401
+      assert json_field(response, ["error", "code"]) == "api_key_missing"
+    end
+
+    response = raw_request(ctx, "POST", "/v1/responses", [], host_fields: [])
+    assert response.status == 400
+    assert_no_gateway_side_effects(ctx.upstream)
+  end
+
   @tag :capture_log
   test "literal encoded v1 and encoded websocket upgrades are denied before side effects", ctx do
     for {target, headers} <- [
@@ -169,7 +228,34 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressRawHTTPTest do
     assert_no_gateway_side_effects(ctx.upstream)
   end
 
-  defp raw_request(ctx, method, target, headers \\ []) do
+  defp assert_duplicate_host_rejected(ctx, form, route, upgrade?, values) do
+    headers = [{"x-forwarded-for", "198.51.100.20"}] ++ upgrade_headers(upgrade?)
+    response = raw_request(ctx, request_method(upgrade?), request_target(form, route), headers, host_fields: duplicate_hosts(values))
+
+    assert response.status == 400
+    refute List.keymember?(response.headers, "x-request-id", 0)
+    if form == :absolute, do: assert(response.body == "Bad Request")
+    assert_no_gateway_side_effects(ctx.upstream)
+  end
+
+  defp duplicate_hosts(:identical), do: [{"Host", "example.com"}, {"hOsT", "example.com"}]
+  defp duplicate_hosts(:conflicting), do: [{"HOST", "example.com"}, {"host", "example.net"}]
+  defp request_target(:origin, route), do: route
+  defp request_target(:absolute, route), do: "http://example.com" <> route
+  defp request_method(true), do: "GET"
+  defp request_method(false), do: "POST"
+  defp upgrade_headers(false), do: []
+
+  defp upgrade_headers(true) do
+    [
+      {"connection", "upgrade"},
+      {"upgrade", "websocket"},
+      {"sec-websocket-version", "13"},
+      {"sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="}
+    ]
+  end
+
+  defp raw_request(ctx, method, target, headers \\ [], opts \\ []) do
     {:ok, socket} =
       :gen_tcp.connect(
         ~c"127.0.0.1",
@@ -185,12 +271,13 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressRawHTTPTest do
       " ",
       target,
       " HTTP/1.1\r\n",
-      "host: 127.0.0.1:",
-      Integer.to_string(ctx.port),
-      "\r\n",
+      Enum.map(Keyword.get(opts, :host_fields, [{"host", "127.0.0.1:#{ctx.port}"}]), fn {name, value} -> [name, ": ", value, "\r\n"] end),
       Enum.map(headers, fn {name, value} -> [name, ": ", value, "\r\n"] end),
-      "content-length: 0\r\n",
-      "connection: close\r\n\r\n"
+      "content-length: ",
+      Integer.to_string(Keyword.get(opts, :content_length, 0)),
+      "\r\n",
+      if(List.keymember?(headers, "connection", 0), do: [], else: "connection: close\r\n"),
+      "\r\n"
     ]
 
     try do
@@ -230,11 +317,11 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressRawHTTPTest do
   defp parse_response(response) do
     case :binary.split(response, "\r\n\r\n") do
       [head, body] ->
-        [status_line | _headers] = :binary.split(head, "\r\n", [:global])
+        [status_line | headers] = :binary.split(head, "\r\n", [:global])
 
         case :binary.split(status_line, " ", [:global]) do
-          ["HTTP/1.1", status, _reason | _rest] ->
-            %{status: String.to_integer(status), body: body}
+          [version, status, _reason | _rest] when version in ["HTTP/1.0", "HTTP/1.1"] ->
+            %{status: String.to_integer(status), body: body, headers: Enum.map(headers, &split_header/1)}
 
           _other ->
             flunk("raw HTTP response had an invalid status line")

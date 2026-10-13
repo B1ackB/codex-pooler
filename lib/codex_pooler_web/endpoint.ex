@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Endpoint do
 
   alias CodexPoolerWeb.Plugs.{
     BackendFilesMultipartGuard,
+    RejectDuplicateHost,
     RuntimeIngress,
     TrustedProxyRemoteIp
   }
@@ -21,6 +22,8 @@ defmodule CodexPoolerWeb.Endpoint do
   socket "/live", Phoenix.LiveView.Socket,
     websocket: [connect_info: [session: @session_options]],
     longpoll: [connect_info: [session: @session_options]]
+
+  plug RejectDuplicateHost
 
   plug Plug.Static,
     at: "/",
