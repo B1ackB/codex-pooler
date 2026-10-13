@@ -334,7 +334,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.SocketLifecycleTest do
           assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
           assert {:push, {:text, ^delta_frame}, state} = receive_socket_push(state)
           assert {:push, {:text, ^terminal_frame}, state} = receive_socket_push(state)
-          settle_direct_socket_turn(state)
+          state = settle_direct_socket_turn(state)
+          # The receipt producer logs before its DB merge, but both run after
+          # the socket receives its delivery acknowledgement. Keep CaptureLog
+          # open through that producer event, then flush the Logger queue.
+          await_delivered_receipt!(setup.pool.id)
+          Logger.flush()
+          state
         end)
 
       assert MapSet.size(state.tasks) == 0
@@ -1394,6 +1400,34 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.SocketLifecycleTest do
       queued_response_payloads: :queue.new(),
       native_turn_output_task_pids: MapSet.new()
     }
+  end
+
+  defp await_delivered_receipt!(pool_id, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + @detection_timeout_ms
+
+    attempt =
+      Repo.one(
+        from(a in Attempt,
+          join: r in Request,
+          on: r.id == a.request_id,
+          where: r.pool_id == ^pool_id,
+          order_by: [desc: a.started_at],
+          limit: 1
+        )
+      )
+
+    if is_map(attempt) and is_map(get_in(attempt.response_metadata || %{}, ["downstream_delivery"])) do
+      attempt
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("expected the websocket delivery receipt to settle")
+      else
+        receive do
+        after
+          5 -> await_delivered_receipt!(pool_id, deadline)
+        end
+      end
+    end
   end
 
   defp socket_test_task do
