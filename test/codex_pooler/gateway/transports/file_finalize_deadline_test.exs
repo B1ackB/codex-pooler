@@ -15,15 +15,16 @@ defmodule CodexPooler.Gateway.Transports.FileFinalizeDeadlineTest do
       supervisor = start_supervised!(Task.Supervisor)
       parent = self()
 
+      %{pool: pool} = CodexPooler.PoolerFixtures.active_api_key_fixture()
+      %{assignment: assignment, identity: identity} = CodexPooler.PoolerFixtures.active_upstream_assignment_fixture(pool, %{metadata: %{"base_url" => "http://127.0.0.1:#{port}"}, access_token: "synthetic-token"})
+      selection = %RoutingSelection{assignment: assignment, identity: identity, route_metadata: %{}}
+
       server =
         Task.Supervisor.async_nolink(supervisor, fn ->
           {:ok, socket} = :gen_tcp.accept(listener, @budget)
           on_socket(socket, listener, parent, retry_first)
         end)
 
-      %{pool: pool} = CodexPooler.PoolerFixtures.active_api_key_fixture()
-      %{assignment: assignment, identity: identity} = CodexPooler.PoolerFixtures.active_upstream_assignment_fixture(pool, %{metadata: %{"base_url" => "http://127.0.0.1:#{port}"}, access_token: "synthetic-token"})
-      selection = %RoutingSelection{assignment: assignment, identity: identity, route_metadata: %{}}
       task = Task.Supervisor.async_nolink(supervisor, fn -> FileBridge.finalize_file("file_synthetic", %{finalize_retry_timeout_ms: 300, finalize_retry_interval_ms: 0, receive_timeout_ms: 30_000}, selection) end)
 
       on_exit(fn ->
