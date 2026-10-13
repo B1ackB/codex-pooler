@@ -445,7 +445,7 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFence do
   defp await_receipts(owner, tokens, actors, deadline, timeout) do
     # Test-only, read-only snapshots: receipt_cohort/0 would close the producer
     # barrier. Sensitive ResponseTasks cannot be classified by their dictionary.
-    %{delivery_receipts: receipts} = cleanup_snapshot!(CodexPooler.Gateway.Transports.Websocket.ActivityRegistry, deadline)
+    %{delivery_receipts: receipts, activities: activities} = cleanup_snapshot!(CodexPooler.Gateway.Transports.Websocket.ActivityRegistry, deadline)
     {checkouts, mode} = sandbox_ownership_snapshot!(deadline)
 
     tokens =
@@ -455,6 +455,11 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFence do
 
     selected = Map.take(receipts, MapSet.to_list(tokens))
     actors = Enum.reduce(selected, MapSet.new(actors), fn {_token, entry}, seen -> if is_pid(entry.actor), do: MapSet.put(seen, entry.actor), else: seen end)
+
+    # A local-owner failure settles before it creates any delivery receipt.
+    # Keep the actor until DOWN even if it unregisters its activity meanwhile.
+    actors = include_local_owner_actors(actors, activities, owner, checkouts, mode)
+
     # Native receipt actors can be long-lived owners. Their acknowledged SQL
     # completion releases the obligation without requiring that owner to exit.
     completed = for {_token, %{finished?: true, result: :ok, actor: actor}} <- selected, do: actor
@@ -482,6 +487,17 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFence do
             end
         end
     end
+  end
+
+  defp include_local_owner_actors(actors, activities, owner, checkouts, mode) do
+    Enum.reduce(activities, actors, fn
+      {_token, %{kind: :local_owner, pid: pid} = entry}, seen ->
+        ownership = %{actor: pid, task: pid, socket: Map.get(entry, :direct_parent)}
+        if receipt_owner(ownership, checkouts, mode) == owner, do: MapSet.put(seen, pid), else: seen
+
+      _entry, seen ->
+        seen
+    end)
   end
 
   defp sandbox_ownership_snapshot!(deadline) do

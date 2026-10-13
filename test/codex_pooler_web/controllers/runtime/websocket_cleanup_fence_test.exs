@@ -136,6 +136,64 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFenceTest do
       CodexPooler.DataCase.setup_sandbox(tags)
     end
 
+    test "sandbox fence includes active local owner failure settlement before a receipt", %{sandbox_owner: owner} do
+      alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
+      alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
+      alias CodexPooler.Gateway.Websocket.ResponseTask
+      alias CodexPooler.Repo
+
+      setup = CodexPooler.AccountingTestSupport.accounting_setup()
+      {:ok, reserved} = CodexPooler.Accounting.reserve(setup.auth, setup.model, %{"model" => setup.model.exposed_model_id, "input" => []}, %{endpoint: "/backend-api/codex/responses", transport: "websocket", correlation_id: Ecto.UUID.generate()})
+      {:ok, attempt} = CodexPooler.Accounting.create_attempt(reserved.request, setup.assignment)
+      parent = self()
+      tag = {__MODULE__, make_ref()}
+      cleanup_ref = make_ref()
+
+      on_exit(fn ->
+        :telemetry.detach(tag)
+
+        for entry <- ActivityRegistry.activities(), Map.get(entry, :direct_ref) == cleanup_ref do
+          monitor = Process.monitor(entry.pid)
+          send(entry.pid, :begin)
+          send(entry.pid, {tag, :release})
+          assert_receive {:DOWN, ^monitor, :process, _, _}, 5_000
+        end
+      end)
+
+      {:ok, actor} =
+        ResponseTask.start(
+          parent,
+          :local_owner,
+          fn _ ->
+            receive do
+              :begin -> :ok
+            end
+
+            AttemptSettlement.finalize_partial_stream_failure(reserved.request, attempt, %{status: "usage_unknown"}, %{response_status_code: 502, last_error_code: "upstream_stream_error"})
+          end,
+          fn _, _ -> :ok end,
+          direct_cleanup_ref: cleanup_ref
+        )
+
+      monitor = Process.monitor(actor)
+      :ok = :telemetry.attach(tag, [:codex_pooler, :repo, :query], &__MODULE__.hold_failure_notify/4, %{actor: actor, parent: parent, tag: tag})
+      send(actor, :begin)
+
+      try do
+        assert_receive {^tag, :held}, 5_000
+        state = :sys.get_state(ActivityRegistry)
+        assert Enum.any?(state.activities, fn {_, entry} -> entry.kind == :local_owner and entry.pid == actor end)
+        refute Enum.any?(state.delivery_receipts, fn {_, entry} -> entry.actor == actor end)
+        assert_raise ExUnit.AssertionError, ~r/still running/, fn -> WebsocketCleanupFence.await_sandbox_cleanups!(owner, 100) end
+      after
+        :telemetry.detach(tag)
+        send(actor, {tag, :release})
+        assert_receive {:DOWN, ^monitor, :process, ^actor, :normal}, 5_000
+      end
+
+      assert Repo.get!(CodexPooler.Accounting.Request, reserved.request.id).status == "failed"
+    end
+
     test "the sandbox fence waits for real ResponseTask receipt SQL", %{sandbox_owner: owner} do
       alias CodexPooler.Accounting.Attempt
       alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
@@ -253,6 +311,18 @@ defmodule CodexPoolerWeb.Runtime.WebsocketCleanupFenceTest do
       assert %{finished?: true, result: :ok} = :sys.get_state(ActivityRegistry).delivery_receipts[receipt.token]
     end
   end
+
+  def hold_failure_notify(_, _, %{query: "SELECT pg_notify($1, $2)"}, %{actor: actor, parent: parent, tag: tag}) when self() == actor do
+    send(parent, {tag, :held})
+
+    receive do
+      {^tag, :release} -> :ok
+    after
+      15_000 -> raise "task17 notify barrier unreleased"
+    end
+  end
+
+  def hold_failure_notify(_, _, _, _), do: :ok
 
   defp start_owned_receipt!(owner) do
     alias CodexPooler.Gateway.Websocket.{DeliveryReceipt, DeliveryReceiptHandoff, ResponseTask}
