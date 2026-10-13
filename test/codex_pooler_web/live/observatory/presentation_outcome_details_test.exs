@@ -8,13 +8,13 @@ defmodule CodexPoolerWeb.Observatory.PresentationOutcomeDetailsTest do
     [outcome] = Presentation.build_outcomes([token_row(47_400, 47_000, 46_342, 400)])
 
     assert outcome.tokens.label == "47.4k"
-    assert outcome.tokens.cache_percentage_label == "(98.6% cached)"
+    assert outcome.tokens.cache_percentage_label == "98.6%"
     assert outcome.tokens.total == 47_400
   end
 
   test "zero cached input remains a known zero percentage" do
     [outcome] = Presentation.build_outcomes([token_row(100, 80, 0, 20)])
-    assert outcome.tokens.cache_percentage_label == "(0% cached)"
+    assert outcome.tokens.cache_percentage_label == "0%"
   end
 
   for {scenario, row} <- [

@@ -395,11 +395,11 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
 
   defp valid_token_counts?(counts), do: Enum.all?(counts, &(is_integer(&1) and &1 >= 0))
 
-  defp cache_percentage_label(0, input) when input > 0, do: "(0% cached)"
+  defp cache_percentage_label(0, input) when input > 0, do: "0%"
 
   defp cache_percentage_label(cached, input) when input > 0 do
     rate = Float.round(cached / input * 100, 1)
-    "(#{rate}% cached)"
+    "#{rate}%"
   end
 
   defp cache_percentage_label(_cached, _input), do: nil

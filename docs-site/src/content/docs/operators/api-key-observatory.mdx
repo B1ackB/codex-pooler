@@ -67,7 +67,7 @@ The table shows requests admitted in the last 60 minutes, newest first, independ
 | Activity | `Catalog`, `Usage`, `Generation`, `Compaction`, `Files` or `Transcription`. Unclassified calls show `Other`. |
 | Client | A recognized client name with its icon. Unrecognized clients show the compact User-Agent (product and version when available, at most 72 characters) with a generic icon. Missing values show `Unknown client`. |
 | Status | The outcome: `Succeeded`, `Failed` or `Rejected` with a sanitized reason (`Rate limited`, `Authentication issue`, `Timed out`, `Service unavailable`, `Invalid request` or `Request failed`), `Accepted`, `In progress` or `Client cancelled`. |
-| Tokens | The total and the cached share of input, such as `47.4k (98.6% cached)`. The percentage is omitted when the recorded breakdown is incomplete. |
+| Tokens · Cache | The total and the cached share of input, such as `47.4k 98.6%`. The percentage is omitted when the recorded breakdown is incomplete. |
 | Cost | The settled or estimated cost, or a dash when none is available. |
 
 Catalog, Usage and Files show `Not applicable` in Model, without reasoning effort or speed indicators. Generation, Compaction and Transcription retain the recorded model or `Unknown model` when unavailable. Consecutive token-free utility calls with the same activity, model label, status and client fold into one `Not applicable · N requests` row showing the newest time. Unclassified model-free calls can also group, retaining `Unknown model`; model-dependent calls remain separate. Refreshing starts a new hour snapshot and replaces any older pages already loaded.

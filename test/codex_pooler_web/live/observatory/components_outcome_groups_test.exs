@@ -122,7 +122,7 @@ defmodule CodexPoolerWeb.Observatory.ComponentsOutcomeGroupsTest do
         tokens: %{
           total: 100,
           label: "100",
-          cache_percentage_label: "(75.0% cached)"
+          cache_percentage_label: "75.0%"
         }
       })
 
@@ -131,7 +131,7 @@ defmodule CodexPoolerWeb.Observatory.ComponentsOutcomeGroupsTest do
     assert LazyHTML.query(fragment, "[data-role='outcome-speed'][data-speed-level='2']") |> LazyHTML.text() =~ "Fast (priority tier)"
     assert LazyHTML.query(fragment, "[data-role='outcome-effort']") |> LazyHTML.text() =~ "high"
     assert LazyHTML.query(fragment, "[data-role='outcome-tokens']") |> LazyHTML.text() == "100"
-    assert LazyHTML.query(fragment, "[data-role='outcome-cached']") |> LazyHTML.text() |> String.trim() == "(75.0% cached)"
+    assert LazyHTML.query(fragment, "[data-role='outcome-cached']") |> LazyHTML.text() |> String.trim() == "75.0%"
     assert LazyHTML.query(fragment, "[data-role='outcome-client'][data-client-kind='opencode']") |> LazyHTML.text() |> String.trim() == "opencode"
     assert LazyHTML.query(fragment, "[data-role='outcome-client'] .request-client-logo") |> Enum.count() == 1
   end

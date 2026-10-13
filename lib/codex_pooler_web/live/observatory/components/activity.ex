@@ -171,7 +171,7 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
               <th scope="col">Activity</th>
               <th scope="col" class="observatory-outcome-client">Client</th>
               <th scope="col" class="text-center">Status</th>
-              <th scope="col" class="text-right">Tokens</th>
+              <th scope="col" class="text-right">Tokens · Cache</th>
               <th scope="col" class="text-right">Cost</th>
             </tr>
           </thead>
@@ -248,7 +248,7 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
                   {outcome.status.label}
                 </span>
               </td>
-              <td data-label="Tokens" class="whitespace-nowrap text-right tabular-nums">
+              <td data-label="Tokens · Cache" class="whitespace-nowrap text-right tabular-nums">
                 <div class="observatory-outcome-tokens flex items-center justify-end gap-2">
                   <span class="flex items-center justify-end gap-2 text-sm leading-4">
                     <span data-role="outcome-tokens" class="text-right font-semibold">{outcome.tokens.label}</span>
