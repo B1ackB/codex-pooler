@@ -2160,6 +2160,20 @@ body {
   background: color-mix(in oklab, var(--color-base-200) 35%, transparent);
 }
 
+@media (width > 40rem) {
+  #observatory-outcomes-scroll {
+    overflow: visible;
+  }
+
+  #observatory-outcomes-table thead {
+    position: sticky;
+    top: var(--observatory-toolbar-height, 3rem);
+    z-index: 20;
+    background: var(--color-base-100);
+    box-shadow: 0 1px 0 var(--color-base-300);
+  }
+}
+
 #observatory-outcomes-table tbody tr:nth-child(odd) {
   background: color-mix(in oklab, var(--color-base-200) 40%, transparent);
 }
@@ -2183,31 +2197,45 @@ body {
 
   #observatory-outcomes-table th,
   #observatory-outcomes-table td {
-    @apply px-2;
+    @apply px-1;
   }
 
   #observatory-outcomes-table .observatory-outcome-time {
-    width: 17%;
+    width: 16%;
   }
 
   #observatory-outcomes-table .observatory-outcome-model {
-    width: 25%;
+    width: 34%;
   }
 
   #observatory-outcomes-table .observatory-outcome-endpoint {
-    width: 10%;
+    width: 12%;
   }
 
   #observatory-outcomes-table .observatory-outcome-status {
-    width: 13%;
+    width: 6%;
   }
 
   #observatory-outcomes-table .observatory-outcome-tokens-column {
-    width: 24%;
+    width: 22%;
   }
 
   #observatory-outcomes-table .observatory-outcome-cost {
-    width: 11%;
+    width: 10%;
+  }
+
+  #observatory-outcomes-table .observatory-outcome-status-chip {
+    padding: 0 !important;
+    border: 0;
+    background: transparent;
+  }
+
+  .observatory-outcome-status-icon {
+    display: inline-block;
+  }
+
+  .observatory-outcome-status-label {
+    @apply sr-only;
   }
 }
 

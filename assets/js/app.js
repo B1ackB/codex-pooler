@@ -25,6 +25,7 @@ import {
 	observatoryRefreshConnectParams,
 } from "./observatory_refresh.mjs";
 import { PoolTrafficVisibility } from "./pool_traffic_visibility.mjs";
+import { ObservatoryToolbar } from "./observatory_toolbar.mjs";
 import { createQuotaDialogPreservation } from "./quota_dialog_preservation.js";
 import { RelativeCountdown } from "./relative_countdown.mjs";
 import {
@@ -1374,6 +1375,7 @@ const liveSocket = new LiveSocket("/live", Socket, {
 		ModelServingTools,
 		OtpInput,
 		ObservatoryRefresh,
+		ObservatoryToolbar,
 		PoolTrafficVisibility,
 		QuotaPressureChart,
 		RelativeCountdown,

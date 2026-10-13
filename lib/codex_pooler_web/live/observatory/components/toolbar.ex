@@ -15,6 +15,7 @@ defmodule CodexPoolerWeb.Observatory.Components.Toolbar do
     ~H"""
     <header
       id="observatory-toolbar"
+      phx-hook="ObservatoryToolbar"
       class="observatory-toolbar"
       aria-label="Observatory toolbar"
     >

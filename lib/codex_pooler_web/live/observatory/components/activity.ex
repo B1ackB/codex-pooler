@@ -238,14 +238,16 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
                 <span
                   class={[
                     AdminBadges.status_chip_class(status_for_tone(outcome.status.tone)),
-                    "observatory-metadata-chip max-w-full truncate !px-2 !py-0.5"
+                    "observatory-outcome-status-chip observatory-metadata-chip max-w-full truncate !px-2 !py-0.5"
                   ]}
                   data-role="outcome-status"
                   data-status={status_data_status(outcome.status.data_status)}
                   role="status"
                   title={outcome.status.label}
+                  aria-label={outcome.status.label}
                 >
-                  {outcome.status.label}
+                  <.icon name={outcome_status_icon(outcome.status.label)} class="observatory-outcome-status-icon hidden size-4" />
+                  <span class="observatory-outcome-status-label">{outcome.status.label}</span>
                 </span>
               </td>
               <td data-label="Tokens · Cache" class="whitespace-nowrap text-right tabular-nums">
@@ -296,6 +298,12 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
   defp status_for_tone(:warning), do: :disabled
   defp status_for_tone(:error), do: :failed
   defp status_for_tone(_tone), do: :unknown
+
+  defp outcome_status_icon("Succeeded"), do: "hero-check-circle"
+  defp outcome_status_icon("Client cancelled"), do: "hero-no-symbol"
+  defp outcome_status_icon("In progress"), do: "hero-arrow-path"
+  defp outcome_status_icon("Accepted"), do: "hero-clock"
+  defp outcome_status_icon(_label), do: "hero-exclamation-triangle"
   defp speed_title(3), do: "Ultrafast"
   defp speed_title(2), do: "Fast (priority tier)"
   defp speed_title(_level), do: "Normal speed"
