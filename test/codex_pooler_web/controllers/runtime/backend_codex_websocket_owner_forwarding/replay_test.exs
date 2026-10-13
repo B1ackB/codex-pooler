@@ -32,6 +32,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.ReplayTest
   alias CodexPoolerWeb.CodexResponsesSocket
   alias CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport.ReplayRemoteNodeClient
   alias CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport.TurnBudgetNodeClient
+  alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
   alias CodexPoolerWeb.WebsocketConnectionLogger
   alias Ecto.Adapters.SQL.Sandbox
 
@@ -996,11 +997,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.ReplayTest
         }
       })
 
+    sockets_before_first = WebsocketCleanupFence.listener_sockets()
     {first_conn, first_ws, first_ref} = public_websocket_connect!(port, setup, turn_state)
+    first_socket = WebsocketCleanupFence.await_new_listener_socket!(sockets_before_first)
     {first_conn, first_ws} = public_websocket_send_text!(first_conn, first_ws, first_ref, payload)
     _ = public_websocket_receive_text!(first_conn, first_ws, first_ref)
 
+    sockets_before_retry = WebsocketCleanupFence.listener_sockets()
     {retry_conn, retry_ws, retry_ref} = public_websocket_connect!(port, setup, turn_state)
+    retry_socket = WebsocketCleanupFence.await_new_listener_socket!(sockets_before_retry)
     {retry_conn, retry_ws} = public_websocket_send_text!(retry_conn, retry_ws, retry_ref, payload)
 
     {_retry_conn, _retry_ws, error} =
@@ -1008,16 +1013,27 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.ReplayTest
 
     assert CodexPooler.JSON.decode!(error)["error"]["code"] == "duplicate_turn"
 
-    Mint.HTTP.close(first_conn)
-    Mint.HTTP.close(retry_conn)
+    {_result, cleanup_log} =
+      ExUnit.CaptureLog.with_log([level: :warning], fn ->
+        Mint.HTTP.close(first_conn)
+        Mint.HTTP.close(retry_conn)
 
-    session =
-      Repo.one!(from session in CodexSession, order_by: [desc: session.created_at], limit: 1)
+        # A raw client close starts asynchronous server-side detach. Keep the
+        # session owner alive until both exact sockets have finished using it.
+        WebsocketCleanupFence.await_listener_socket_cleanup!(first_socket)
+        WebsocketCleanupFence.await_listener_socket_cleanup!(retry_socket)
 
-    case WebsocketOwnerSession.lookup(session.id) do
-      {:ok, owner_pid} -> stop_retirable_owner!(owner_pid)
-      {:error, :owner_unavailable} -> :ok
-    end
+        session = Repo.one!(from session in CodexSession, where: session.pool_id == ^setup.pool.id)
+
+        case WebsocketOwnerSession.lookup(session.id) do
+          {:ok, owner_pid} -> stop_retirable_owner!(owner_pid)
+          {:error, :owner_unavailable} -> :ok
+        end
+      end)
+
+    refute cleanup_log =~ "websocket owner lifecycle recovery failed"
+    refute cleanup_log =~ "websocket owner detach failed"
+    assert cleanup_log |> WebsocketCleanupFence.without_deferred_cleanup() |> String.trim() == ""
   end
 
   @tag :replay_race
