@@ -9,6 +9,7 @@ defmodule CodexPooler.Platform.ExecutionProofPublisherTest do
 
   import ExUnit.CaptureLog
 
+  alias CodexPooler.ExecutionProofSupport
   alias CodexPooler.Platform.{ExecutionProofPublisher, ExecutionRegistry, ExecutionTerminalProof, ExecutionTerminalProofs}
   alias CodexPooler.Platform.InstancePresence.Identity
 
@@ -42,7 +43,7 @@ defmodule CodexPooler.Platform.ExecutionProofPublisherTest do
       :ok = ExecutionRegistry.complete(id, registry)
     end
 
-    publisher = start_supervised!({ExecutionProofPublisher, enabled: true, name: nil, registry: registry, interval_ms: @tick_ms})
+    publisher = ExecutionProofSupport.start_publisher!(enabled: true, name: nil, registry: registry, interval_ms: @tick_ms)
     :sys.get_state(publisher)
     execution = start_execution!(registry)
     Process.exit(execution.pid, :kill)
@@ -107,6 +108,8 @@ defmodule CodexPooler.Platform.ExecutionProofPublisherTest do
   end
 
   test "a failed newer proof does not starve an older proof after the publisher restarts" do
+    # Runs after publisher cleanup but before the sandbox owner is stopped.
+    on_exit(fn -> assert %{rows: [[1]]} = Repo.query!("SELECT 1") end)
     registry = start_supervised!({ExecutionRegistry, name: nil})
     older = start_execution!(registry)
     send(older.pid, :complete)
@@ -117,14 +120,16 @@ defmodule CodexPooler.Platform.ExecutionProofPublisherTest do
     send(newer.pid, :complete)
     assert_receive {:completed, ^id}
 
-    log =
-      capture_log(fn ->
-        start_supervised!({ExecutionProofPublisher, enabled: true, name: nil, registry: registry, interval_ms: @tick_ms})
+    {publisher, log} =
+      with_log(fn ->
+        publisher = ExecutionProofSupport.start_publisher!(enabled: true, name: nil, registry: registry, interval_ms: @tick_ms)
         :ok = await_published!(older.identity)
+        publisher
       end)
 
     assert log =~ "execution terminal proof publication unavailable; pending proofs retained: 2\n"
     assert ExecutionRegistry.pending_proofs([id], registry) != []
+    hold_publication_until_cleanup!(publisher)
   end
 
   # The warning claims only what the registry holds: a publisher that cannot reach its registry cannot say, so it names no
@@ -132,7 +137,7 @@ defmodule CodexPooler.Platform.ExecutionProofPublisherTest do
   test "a publisher that cannot reach its registry warns without claiming retained proofs" do
     log =
       capture_log(fn ->
-        publisher = start_supervised!({ExecutionProofPublisher, enabled: true, name: nil, registry: :execution_proof_publisher_test_absent_registry, interval_ms: @tick_ms})
+        publisher = ExecutionProofSupport.start_publisher!(enabled: true, name: nil, registry: :execution_proof_publisher_test_absent_registry, interval_ms: @tick_ms)
         assert %{failed: true} = :sys.get_state(publisher)
       end)
 
@@ -145,7 +150,7 @@ defmodule CodexPooler.Platform.ExecutionProofPublisherTest do
   # publications again after the publisher's next tick.
   test "a restarted registry asks for early publications again after the next tick" do
     registry = start_supervised!({ExecutionRegistry, name: @registry})
-    publisher = start_supervised!({ExecutionProofPublisher, enabled: true, name: nil, registry: @registry, interval_ms: @tick_ms})
+    publisher = ExecutionProofSupport.start_publisher!(enabled: true, name: nil, registry: @registry, interval_ms: @tick_ms)
     :sys.get_state(publisher)
 
     ref = Process.monitor(registry)
@@ -243,12 +248,44 @@ defmodule CodexPooler.Platform.ExecutionProofPublisherTest do
 
   defp start_pair! do
     registry = start_supervised!({ExecutionRegistry, name: nil})
-    publisher = start_supervised!({ExecutionProofPublisher, enabled: true, name: nil, registry: registry, interval_ms: @tick_ms})
+    publisher = ExecutionProofSupport.start_publisher!(enabled: true, name: nil, registry: registry, interval_ms: @tick_ms)
     # Its first publication, which subscribes it to the registry, runs before
     # it reads any message.
     :sys.get_state(publisher)
     {registry, publisher}
   end
+
+  # An already-visible proof does not mean the next retry released the shared
+  # connection. End this test with a real publication transaction in flight.
+  defp hold_publication_until_cleanup!(publisher) do
+    handler = {__MODULE__, make_ref()}
+    config = %{publisher: publisher, test_pid: self(), handler: handler}
+
+    on_exit(fn ->
+      send(publisher, {handler, :release})
+      :telemetry.detach(handler)
+    end)
+
+    :ok = :telemetry.attach(handler, [:codex_pooler, :repo, :query], &__MODULE__.hold_publication/4, config)
+    send(publisher, :publish)
+    assert_receive {:publication_transaction_held, ^handler, ^publisher}, @detection_timeout_ms
+  end
+
+  @doc false
+  def hold_publication(_event, _measurements, %{source: "execution_terminal_proofs", query: "INSERT" <> _}, %{publisher: publisher} = config) when self() == publisher do
+    :ok = :telemetry.detach(config.handler)
+    true = Repo.in_transaction?()
+    send(config.test_pid, {:publication_transaction_held, config.handler, self()})
+    handler = config.handler
+
+    receive do
+      {^handler, :release} -> :ok
+    after
+      @detection_timeout_ms -> raise "publication transaction was not released by test cleanup"
+    end
+  end
+
+  def hold_publication(_event, _measurements, _metadata, _config), do: :ok
 
   # One execution registered from its own process, as a response task
   # registers the one it runs; `:complete` retires it as delivered.
