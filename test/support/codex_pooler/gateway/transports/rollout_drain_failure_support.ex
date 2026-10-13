@@ -52,6 +52,7 @@ defmodule CodexPooler.Gateway.Transports.RolloutDrainFailureSupport do
   defp phase(:begin_drain), do: :begin
   defp phase({:begin_drain, _}), do: :begin
   defp phase({:status, _}), do: :status
+  defp phase(:receipt_cohort), do: :receipts
   defp phase({:cancel, _, _, _}), do: :cancel
   defp phase({:complete_drain, _}), do: :complete
   defp phase({:start_drain, _, _}), do: :join
@@ -143,7 +144,9 @@ defmodule CodexPooler.Gateway.Transports.RolloutDrainFailureSupport do
 
   @doc false
   @spec observe_shutdown(map(), term(), term()) :: map()
-  def observe_shutdown(probe, {:in, {:rollout_drain_finished, _ref, summary}}, _name) do
+  # A receipt worker exit can end the coordinator without its finished message.
+  # Observe the summary the server actually returned, including that fallback.
+  def observe_shutdown(probe, {:noreply, %{active_drain: nil, last_summary: summary}}, _name) when is_map(summary) do
     send(probe.parent, {:shutdown_drain_summary, Map.take(summary, [:result, :direct_turns_seen, :direct_turns_failed])})
     probe
   end

@@ -1418,20 +1418,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainShutdownFailureTe
     drain = :erpc.call(peer.node, Process, :whereis, [RolloutDrain])
     activity_monitor = Process.monitor(activity)
     supervisor_monitor = Process.monitor(supervisor)
-    {held, ^registry} = FailureSupport.hold_call!(registry, :status)
+    {held, ^registry} = FailureSupport.hold_call!(registry, :receipts)
     observer = make_ref()
     :ok = :sys.install(drain, {observer, &FailureSupport.observe_shutdown/3, %{parent: self()}})
     publisher = :erpc.call(peer.node, Process, :whereis, [CodexPooler.Platform.ExecutionProofPublisher])
     :ok = :sys.install(publisher, {make_ref(), &FailureSupport.observe_shutdown/3, %{parent: self()}})
     task = Task.async(fn -> :erpc.call(peer.node, Application, :stop, [:codex_pooler], @budget) end)
     assert_receive {^held, :call_held, ^registry, worker}, @budget
-    worker_monitor = Process.monitor(worker)
+    worker_monitor = CodexPooler.TestProcess.monitor_flushed(worker)
+    # Hold the receipt cohort so its registry call must exit, exercising the
+    # coordinator-down summary instead of racing receipt completion with status.
     # The fault affects only the disposable peer's registry, while prep_stop drains.
     :ok = :erpc.call(peer.node, Supervisor, :terminate_child, [CodexPooler.Supervisor, {ActivityRegistry, ActivityRegistry}])
     assert_receive {:shutdown_drain_summary, %{result: :error, direct_turns_seen: 1, direct_turns_failed: 1}}, @budget
     assert :ok = Task.await(task, @budget)
     assert_receive :shutdown_proof_flush_reached, @budget
-    assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _}, @budget
+    assert_receive {:DOWN, ^worker_monitor, :process, ^worker, {:shutdown, {GenServer, :call, [ActivityRegistry, :receipt_cohort, 5_000]}}}, @budget
     assert_receive {:DOWN, ^activity_monitor, :process, ^activity, _}, @budget
     assert_receive {:DOWN, ^supervisor_monitor, :process, ^supervisor, _}, @budget
     assert is_nil(:erpc.call(peer.node, Process, :whereis, [CodexPooler.Supervisor]))
