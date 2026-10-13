@@ -459,7 +459,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RetainedUs
     FakeUpstream.set_mode(upstream, FakeUpstream.websocket_text_frames([encode(successor_frame)]))
     {conn, ws, ref, _} = public_websocket_connect_with_request_headers!(port, setup, Ecto.UUID.generate(), "/backend-api/codex/responses", headers)
     {conn, ws} = public_websocket_send_text!(conn, ws, ref, encode(%{"type" => "response.create", "model" => setup.model.exposed_model_id, "instructions" => "synthetic instructions", "input" => [%{"role" => "user", "content" => "synthetic successor"}], "tools" => [], "stream" => true}))
-    {conn, _ws, text} = public_websocket_receive_text!(conn, ws, ref)
+    {_conn, _ws, text} = receive_successor_terminal!(conn, ws, ref, "resp_held_successor")
     assert get_in(CodexPooler.JSON.decode!(text), ["response", "id"]) == "resp_held_successor"
     successor = Repo.one!(from(r in Request, where: r.pool_id == ^setup.pool.id and r.id != ^request_id))
     successor = await_request!(successor.id, "succeeded", deadline())
@@ -471,6 +471,18 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.RetainedUs
     assert Repo.get!(CodexTurn, turn.id).status == turn.status
     assert FakeUpstream.count(upstream) == 2
     successor
+  end
+
+  defp receive_successor_terminal!(conn, websocket, ref, response_id) do
+    {conn, websocket, text} = public_websocket_receive_text!(conn, websocket, ref)
+    frame = CodexPooler.JSON.decode!(text)
+
+    if frame["type"] == "response.completed" and
+         get_in(frame, ["response", "id"]) == response_id do
+      {conn, websocket, text}
+    else
+      receive_successor_terminal!(conn, websocket, ref, response_id)
+    end
   end
 
   defp assert_namespace! do
