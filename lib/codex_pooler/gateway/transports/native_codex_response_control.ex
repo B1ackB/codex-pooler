@@ -102,7 +102,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCodexResponseControl do
       headers =
         provider_headers
         |> projected_map()
-        |> Map.take(["openai-model"])
+        |> Map.take(["openai-model", "x-reasoning-included"])
         |> Map.put("x-models-etag", models_etag)
 
       %{"type" => "codex.response.metadata", "headers" => headers}

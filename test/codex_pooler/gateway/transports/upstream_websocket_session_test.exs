@@ -1492,11 +1492,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     refute_received {:native_metadata_frame, _extra}
   end
 
-  test "native snapshot takes model only from successful handshake headers" do
+  test "native snapshot preserves model and reasoning inclusion from the current upstream handshake" do
     peer =
       start_raw_websocket_peer(
         upgrade_headers: [
           {"OpenAI-Model", "handshake-model"},
+          {"x-reasoning-included", "false"},
           {"x-models-etag", "provider-etag"},
           {"set-cookie", "hostile-cookie"},
           {"openai-request-id", "hostile-request-id"}
@@ -1516,6 +1517,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     assert metadata_event(metadata) == %{
              "openai-model" => "handshake-model",
+             "x-reasoning-included" => "true",
              "x-models-etag" => "pooler-etag"
            }
 
@@ -1532,6 +1534,17 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert_receive {:upstream_websocket_frame, reused_accepted}
     assert %{"id" => _id} = CodexPooler.JSON.decode!(reused_accepted)
     refute_received {:upstream_websocket_frame, _extra}
+
+    for {headers, included?} <- [{[], false}, {[{"x-reasoning-included", ""}], true}] do
+      Agent.update(peer.state, &%{&1 | upgrade_headers: headers})
+      request = %{request | headers: request.headers ++ [{"x-fixture-connection", to_string(included?)}]}
+      assert {:ok, fresh_result} = UpstreamWebsocketSession.request(session, request)
+      refute fresh_result.upstream_websocket_connection.reused
+      assert_receive {:upstream_websocket_frame, fresh_metadata}
+      assert Map.has_key?(metadata_event(fresh_metadata), "x-reasoning-included") == included?
+      assert_receive {:upstream_websocket_frame, fresh_response}
+      assert %{"id" => _id} = CodexPooler.JSON.decode!(fresh_response)
+    end
   end
 
   test "native snapshot removes malformed top-level and nested header containers" do

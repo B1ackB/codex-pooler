@@ -324,11 +324,11 @@ defmodule CodexPooler.Gateway.Transports.NativeCodexResponseControlTest do
   end
 
   describe "pooler_metadata_event/2" do
-    test "constructs Pooler-owned metadata from the trusted ETag and safe provider model only" do
+    test "constructs Pooler-owned metadata from the trusted ETag and observed provider controls" do
       provider_headers = %{
         "OpenAI-Model" => "gpt-provider",
         "x-models-etag" => "hostile-provider-etag-sentinel",
-        "x-reasoning-included" => "hostile-reasoning-sentinel",
+        "x-reasoning-included" => "false",
         "x-codex-safety-buffering-enabled" => "hostile-buffering-sentinel"
       }
 
@@ -339,8 +339,16 @@ defmodule CodexPooler.Gateway.Transports.NativeCodexResponseControlTest do
                "type" => "codex.response.metadata",
                "headers" => %{
                  "openai-model" => "gpt-provider",
+                 "x-reasoning-included" => "true",
                  "x-models-etag" => ~s(W/"cp-models-v1-safe")
                }
+             }
+    end
+
+    test "never invents reasoning inclusion when the current upstream omits the header" do
+      assert NativeCodexResponseControl.pooler_metadata_event("pooler-etag", %{}) == %{
+               "type" => "codex.response.metadata",
+               "headers" => %{"x-models-etag" => "pooler-etag"}
              }
     end
 

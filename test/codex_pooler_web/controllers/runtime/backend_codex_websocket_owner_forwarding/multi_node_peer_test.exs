@@ -272,6 +272,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.MultiNodeP
         )
       )
 
+    :ok = FakeUpstream.set_websocket_upgrade_headers(upstream, [{"x-reasoning-included", "false"}])
     setup = gateway_setup(upstream)
     register_unboxed_pool_cleanup!(setup)
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
@@ -310,6 +311,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.MultiNodeP
       [task_pid] = MapSet.to_list(state.tasks)
       refute_received {:websocket_response_activity, _task_pid, _activity_token}
       send(barrier_pid, {:fake_upstream_release_websocket, release_ref})
+
+      assert_receive {:websocket_owner_frame, _correlation_id, _epoch, _owner_turn_id, {:data, metadata}} = metadata_message, 5_000
+      assert %{"type" => "codex.response.metadata", "headers" => %{"x-reasoning-included" => "true"}} = CodexPooler.JSON.decode!(metadata)
+      assert {:push, {:text, ^metadata}, state} = CodexResponsesSocket.handle_info(metadata_message, state)
+      Process.put(socket_state_key, state)
 
       assert_receive {:websocket_owner_frame, correlation_id, epoch, _owner_turn_id, {:data, ^terminal}} =
                        terminal_message,

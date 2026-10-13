@@ -172,6 +172,11 @@ defmodule CodexPooler.FakeUpstream do
   @doc "Returns the base URL for the fake upstream."
   def url(%__MODULE__{url: url}), do: url
 
+  @doc "Sets response headers on subsequent successful websocket upgrades."
+  @spec set_websocket_upgrade_headers(t(), [{String.t(), String.t()}]) :: :ok
+  def set_websocket_upgrade_headers(%__MODULE__{pid: pid}, headers) when is_list(headers),
+    do: Agent.update(pid, &Map.put(&1, :websocket_upgrade_headers, headers))
+
   @doc "Returns captured HTTP and websocket request frames in order; steering controls are separate in websocket_steers/1."
   def requests(%__MODULE__{pid: pid}) do
     Agent.get(pid, fn state -> Enum.reverse(state.requests) end)
@@ -1094,6 +1099,7 @@ defmodule CodexPooler.FakeUpstream do
       physical_ordinal: 0,
       route_counts: %{},
       websocket_connection_count: 0,
+      websocket_upgrade_headers: [],
       websocket_connection_ids: [],
       websocket_pids: MapSet.new(),
       websocket_pids_by_connection: %{},
@@ -1179,6 +1185,11 @@ defmodule CodexPooler.FakeUpstream do
   defp handle_websocket(pid, conn, mode), do: upgrade_websocket(pid, conn, mode)
 
   defp upgrade_websocket(pid, conn, mode) do
+    conn =
+      Enum.reduce(Agent.get(pid, & &1.websocket_upgrade_headers), conn, fn {name, value}, current ->
+        Plug.Conn.put_resp_header(current, name, value)
+      end)
+
     WebSockAdapter.upgrade(
       conn,
       CodexPooler.FakeUpstream.Websocket,
