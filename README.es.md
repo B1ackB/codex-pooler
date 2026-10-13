@@ -1183,6 +1183,8 @@ formulario de la integracion no tiene un campo para el endpoint personalizado y
 la documentacion oficial de Home Assistant no recomienda endpoints de terceros.
 Esta es la configuracion de Container probada con Codex Pooler.
 
+Para configurar el razonamiento, abre **OpenAI → subentrada Conversation → Reconfigure conversation agent** y desactiva **Recommended model settings**. Introduce el ID exacto del modelo devuelto por `GET /v1/models` (por ejemplo, `gpt-6-luna` si aparece en la lista) y elige un **Reasoning effort** compatible con ese modelo. **Reasoning summary: Off** solo oculta el resumen; **Reasoning effort: None** desactiva el razonamiento si el modelo lo admite.
+
 **[Configuracion completa y opciones adicionales](https://www.codex-pooler.com/docs/clients/home-assistant/)** — entorno del contenedor, modelos, verificacion y limites de compatibilidad.
 
 </details>

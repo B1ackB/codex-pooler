@@ -1153,6 +1153,8 @@ services:
 工具时使用 Full 模式。集成表单没有自定义端点字段，Home Assistant 官方文档也
 不认可第三方端点。这是 Codex Pooler 已验证的 Container 配置。
 
+要配置推理，请打开 **OpenAI → Conversation 子条目 → Reconfigure conversation agent**，关闭 **Recommended model settings**。输入 `GET /v1/models` 返回的准确模型 ID（例如列表中存在的 `gpt-6-luna`），再选择该模型支持的 **Reasoning effort**。**Reasoning summary: Off** 仅隐藏推理摘要；如果模型支持，选择 **Reasoning effort: None** 才会禁用推理。
+
 **[完整配置与扩展选项](https://www.codex-pooler.com/docs/clients/home-assistant/)** — 容器环境、模型选择、验证方式和兼容性限制。
 
 </details>

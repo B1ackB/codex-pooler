@@ -1102,6 +1102,8 @@ services:
 Home Assistant の公式ドキュメントもサードパーティーのエンドポイントを推奨
 していません。これは Codex Pooler で検証した Container 設定です。
 
+推論を設定するには、**OpenAI → Conversation サブエントリ → Reconfigure conversation agent** を開き、**Recommended model settings** を無効にします。`GET /v1/models` が返す正確なモデル ID（一覧にある場合は `gpt-6-luna` など）を入力し、そのモデルが対応する **Reasoning effort** を選択してください。**Reasoning summary: Off** は要約を非表示にするだけです。推論を無効にするには、モデルが対応している場合に **Reasoning effort: None** を選択します。
+
 **[詳しい設定と追加機能](https://www.codex-pooler.com/docs/clients/home-assistant/)** — コンテナ環境、モデル選択、確認方法、互換性の制限。
 
 </details>

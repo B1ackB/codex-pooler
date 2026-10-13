@@ -1173,6 +1173,8 @@ form has no custom endpoint field, and Home Assistant's official docs do not
 endorse third-party endpoints. This is the tested Container setup for Codex
 Pooler.
 
+To configure reasoning, open **OpenAI → Conversation subentry → Reconfigure conversation agent** and disable **Recommended model settings**. Enter the exact model ID returned by `GET /v1/models` (for example, `gpt-6-luna` if listed), then choose a **Reasoning effort** supported by that model. **Reasoning summary: Off** only hides the summary; **Reasoning effort: None** disables reasoning where the model supports it.
+
 **[Full setup & extras](https://www.codex-pooler.com/docs/clients/home-assistant/)** — container environment, model selection, request verification and compatibility limits.
 
 </details>

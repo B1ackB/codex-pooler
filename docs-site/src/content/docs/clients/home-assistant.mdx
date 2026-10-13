@@ -44,6 +44,14 @@ curl --fail --silent \
 
 Select one of the returned model ids in the OpenAI Conversation integration. If you use the integration's Assist tools, keep the selected model and Pool on Full mode and make sure the model assignment accepts tool requests.
 
+## Enable reasoning
+
+Reasoning is selected in Home Assistant before the request reaches Pooler. Open the **Conversation** subentry for **OpenAI Conversation**, choose **Reconfigure conversation agent**, and turn off **Recommended model settings**. In **Additional settings**, select the exact model returned by `/v1/models`; then open **Model-specific options** and set **Reasoning effort** to **Low**, **Medium**, or another value offered for that model. Set **Reasoning summary** to **Auto** when you want reasoning summaries in the conversation.
+
+For a model such as `gpt-6-luna`, the current Home Assistant release emits a `reasoning` object when the model-specific option is saved. **Reasoning summary → Off** hides the summary field but does not disable reasoning. **Reasoning effort → None** is an explicit request for no reasoning and is different from leaving the field unset. Home Assistant's default model, or a model name that does not begin with a reasoning-capable prefix such as `gpt-5` or `gpt-6`, does not emit reasoning even if Pooler later routes to a reasoning-capable model.
+
+If Pooler logs show the model but no `reasoning` field, check the Home Assistant release, the selected model and the saved **Reasoning effort** option. Pooler does not invent reasoning settings for a client request.
+
 ## Verify the connection
 
 Open an Assist conversation that uses the OpenAI Conversation agent and send a short text request. A successful reply confirms that Home Assistant completed a conversation, but it does not prove which endpoint handled it. In Codex Pooler's request logs, match the request time, Pool API key, model and final status; stock Home Assistant requests identify themselves through the OpenAI Python SDK, so the request log does not contain a Home Assistant-specific user agent.
