@@ -85,6 +85,7 @@ defmodule CodexPooler.RuntimeStateCleanupTest do
              expired_idempotency_keys: 1,
              expired_owner_leases: 1,
              expired_owner_sessions_recovered: 0,
+             expired_owner_sessions_failed: 0,
              closed_retired_sessions: 0
            }
 

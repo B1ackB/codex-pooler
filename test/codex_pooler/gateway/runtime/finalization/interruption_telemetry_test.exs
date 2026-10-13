@@ -272,9 +272,9 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.InterruptionTelemetryTest do
     # `release_unattempted_request!/6`'s `Repo.get_by!(LedgerEntry, ...)` raises
     # `Ecto.NoResultsError` — past `rollback_interrupted_accounting/4`, which
     # never runs, and past both of that function's clauses, neither of which
-    # rescues. Nothing between here and `RuntimeStateCleanup.run_step/2`'s
-    # rescue catches it, which is why the failure reads `{:raised,
-    # :gateway_runtime, _}` and not `{:interrupt_accounting_failed, _}`. Two
+    # rescues. RuntimeCleanup's per-candidate boundary now catches the raise
+    # after its transaction rolls back, preserving `{:raised, Ecto.NoResultsError}`
+    # rather than `{:interrupt_accounting_failed, _}`. Two
     # reviews read this comment as the accounting-rollback path because the
     # error assertion was loose enough not to tell them apart.
     #
@@ -304,16 +304,17 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.InterruptionTelemetryTest do
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert {:error, {:runtime_state_cleanup_steps_failed, [:gateway_runtime], _summary}} =
+        assert {:error, {:runtime_state_cleanup_steps_failed, [:gateway_runtime], summary}} =
                  run_unboxed(fn -> perform_job(RuntimeStateCleanupWorker, %{}) end)
+
+        assert summary.expired_owner_sessions_failed == 1
+        assert summary.expired_owner_sessions_recovered == 0
       end)
 
-    # Which failure, not just that one happened. `run_step/2`'s rescue is the
-    # only producer of `{:raised, name, _}`; a step that returned an error
-    # instead — `rollback_interrupted_accounting/4` reaching its own
-    # `{:interrupt_accounting_failed, _}` — reports a different shape here.
+    # Pin the raised class, not only the failed phase. Per-candidate isolation
+    # must retain the cause without including the exception's query or payload.
     assert log =~ "runtime state cleanup step gateway_runtime failed"
-    assert log =~ "{:raised, :gateway_runtime,"
+    assert log =~ "{:raised, Ecto.NoResultsError}"
     assert log =~ "Ecto.NoResultsError"
     refute log =~ "expected at least one result but got none"
     refute log =~ "interrupt_accounting_failed"
@@ -342,8 +343,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.InterruptionTelemetryTest do
     # session's in-progress turns FIRST, so `recover_dead_request_execution/2`
     # raises out of `RequestLifecycle.lock_finalization_rows/2` before any turn
     # is interrupted. `recover_dead_request_execution/2` handles `{:error, _}`
-    # and not a raise, and nothing below `RuntimeStateCleanup.run_step/2`
-    # rescues, so the exception travels the whole way. Nothing is emitted
+    # and not a raise. RuntimeCleanup contains the exception at its candidate
+    # boundary and reports its class. Nothing is emitted
     # because nothing reached the code that builds a marker.
     #
     # So this test never exercised the interruption's accounting handling at
@@ -357,12 +358,15 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.InterruptionTelemetryTest do
     capture_outcomes(fn ->
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          assert {:error, {:runtime_state_cleanup_steps_failed, [:gateway_runtime], _summary}} =
+          assert {:error, {:runtime_state_cleanup_steps_failed, [:gateway_runtime], summary}} =
                    run_unboxed(fn -> perform_job(RuntimeStateCleanupWorker, %{}) end)
+
+          assert summary.expired_owner_sessions_failed == 1
+          assert summary.expired_owner_sessions_recovered == 0
         end)
 
       assert log =~ "runtime state cleanup step gateway_runtime failed"
-      assert log =~ "{:raised, :gateway_runtime,"
+      assert log =~ "{:raised, Ecto.NoResultsError}"
       assert log =~ "Ecto.NoResultsError"
       refute log =~ "expected at least one result but got none"
       refute log =~ "CodexPooler.Accounting.LedgerEntry"

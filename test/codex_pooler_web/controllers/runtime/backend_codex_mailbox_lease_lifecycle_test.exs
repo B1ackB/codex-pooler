@@ -95,7 +95,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
         close_transport!(fixture.transport, fixture.carrier)
         {cleanup, ref} = fixture.cleanup
         send(cleanup.pid, {:release_runtime_cleanup_owner_candidates, ref})
-        assert {:error, :owner_unavailable} = Task.await(cleanup, @budget)
+        assert :owner_unavailable = assert_cleanup_failure!(cleanup, fixture)
         assert_exact_fixture_executions_down!(fixture)
         attempt = Repo.get_by!(Attempt, request_id: fixture.original.id)
         assert {:ok, %{"phase" => "authorized"}} = ExpiredCleanup.read(attempt)
@@ -135,7 +135,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
         assert {:ok, renewed} = on_actor_node!(owner, SessionContinuity, :renew_owner_token, [fixture.old_session, fixture.old_session.owner_lease_token, opts, [take_over_expired: true]])
         assert renewed.owner_lease_token != fixture.old_session.owner_lease_token
         send(owner, {:release_expired_owner_generation_checkpoint, checkpoint})
-        assert {:error, {:stale_owner, _clause}} = Task.await(cleanup, @budget)
+        assert {:stale_owner, _clause} = assert_cleanup_failure!(cleanup, fixture)
         assert on_actor_node!(owner, Process, :alive?, [task])
         refute_receive {:DOWN, ^task_monitor, :process, ^task, _reason}, 20
         assert Process.alive?(fixture.handler)
@@ -171,7 +171,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
       waiter = await_session_waiter!(holder.backend, System.monotonic_time(:millisecond) + @budget)
       candidate = expired_candidate!(fixture.old_session.id)
       queued = Task.async(fn -> GenServer.call(fixture.actor, {:recover_expired_generation, candidate, expired_packet_deadline}, 5000) end)
-      assert {:error, :owner_unavailable} = Task.await(cleanup, @budget)
+      assert :owner_unavailable = assert_cleanup_failure!(cleanup, fixture)
       assert System.monotonic_time(:millisecond) - started < 5000
       assert {:error, :owner_unavailable} = Task.await(queued, @budget)
       assert {:ok, _status} = WebsocketOwnerSession.owner_status(fixture.actor)
@@ -211,7 +211,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
         release_provider(fixture.handler, fixture.carrier, fixture.gate)
         assert_receive {:DOWN, ^monitor, :process, ^task, :normal}, @budget
         release_session_row!(holder)
-        assert {:error, {:stale_owner, _clause}} = Task.await(cleanup, @budget)
+        assert {:stale_owner, _clause} = assert_cleanup_failure!(cleanup, fixture)
         {conn, ws, text} = public_websocket_receive_text!(fixture.transport.conn, fixture.transport.ws, fixture.transport.ref)
         assert CodexPooler.JSON.decode!(text)["type"] == "response.completed"
         [terminal] = await_settled!(fixture.setup, 1)
@@ -277,7 +277,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
         assert_receive {:expired_owner_generation_checkpoint, owner, ^checkpoint, observed_stage, witness}, @budget
         assert owner == fixture.actor and observed_stage == context.crash_stage
         assert true = on_actor_node!(owner, Process, :exit, [owner, :kill])
-        assert {:error, :owner_unavailable} = Task.await(cleanup, @budget)
+        assert :owner_unavailable = assert_cleanup_failure!(cleanup, fixture)
         assert_exact_fixture_executions_down!(fixture)
         assert FakeUpstream.count(fixture.upstream) == 1
         assert {:ok, %{"phase" => "authorized"}} = ExpiredCleanup.read(Repo.get!(Attempt, witness["attempt_id"]))
@@ -408,7 +408,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
       children = Task.Supervisor.children(CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.TaskSupervisor)
       [phase_child] = Enum.reject(children, &(&1 == old_task))
       assert true = Process.exit(phase_child, :kill)
-      assert {:error, :owner_unavailable} = Task.await(cleanup, @budget)
+      assert :owner_unavailable = assert_cleanup_failure!(cleanup, fixture)
       release_session_row!(holder)
       assert {:ok, ^original} = ExpiredCleanup.read(Repo.get!(Attempt, original["attempt_id"]))
       candidate = expired_candidate!(fixture.old_session.id)
@@ -447,7 +447,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
       send(cleanup.pid, {:release_runtime_cleanup_owner_candidates, ref})
       assert_receive {:expired_owner_generation_checkpoint, owner, ^checkpoint, :authorized, witness}, @budget
       assert :ok = on_actor_node!(owner, :init, :stop, [])
-      assert {:error, :owner_unavailable} = Task.await(cleanup, @budget)
+      assert :owner_unavailable = assert_cleanup_failure!(cleanup, fixture)
       assert_receive {:DOWN, generation_monitor, :process, handler, _reason}, @budget
       assert generation_monitor == fixture.generation_monitor and handler == fixture.generation_actor
       await_peer_disconnected!(node(owner), System.monotonic_time(:millisecond) + @budget)
@@ -502,7 +502,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
       assert {:ok, ^witness} = ExpiredCleanup.read(Repo.get!(Attempt, attempt.id))
       assert Process.alive?(fixture.handler)
       send(owner, {:release_expired_owner_generation_checkpoint, checkpoint})
-      assert {:error, :owner_unavailable} = Task.await(cleanup, @budget)
+      assert :owner_unavailable = assert_cleanup_failure!(cleanup, fixture)
       assert :none = ExpiredCleanup.read(Repo.get!(Attempt, attempt.id))
       release_provider(fixture.handler, fixture.carrier, fixture.gate)
       {conn, ws, text} = public_websocket_receive_text!(fixture.transport.conn, fixture.transport.ws, fixture.transport.ref)
@@ -526,7 +526,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
         task = active_owner_task!(fixture.actor)
         {cleanup, ref} = fixture.cleanup
         send(cleanup.pid, {:release_runtime_cleanup_owner_candidates, ref})
-        assert {:error, :sample_expired_owner_rollback} = Task.await(cleanup, @budget)
+        assert :sample_expired_owner_rollback = assert_cleanup_failure!(cleanup, fixture)
         assert on_actor_node!(fixture.actor, Process, :alive?, [task])
         assert Process.alive?(fixture.handler)
         assert :none = ExpiredCleanup.read(Repo.get_by!(Attempt, request_id: fixture.original.id))
@@ -590,7 +590,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
         assert_receive {:expired_owner_generation_checkpoint, owner, ^checkpoint, :authorized, witness}, @budget
         restore = mutate_expired_scope!(fixture, witness, context.guard_mutation)
         send(owner, {:release_expired_owner_generation_checkpoint, checkpoint})
-        assert {:error, _refusal} = Task.await(cleanup, @budget)
+        assert_cleanup_failure!(cleanup, fixture)
         assert Process.alive?(task) and Process.alive?(fixture.handler)
         assert Repo.get!(Request, fixture.original.id).status == "in_progress"
         assert ledger_kinds!(fixture.original.id) == %{"reservation" => 1}
@@ -656,7 +656,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
       holders = hold_peer_pool!(owner)
       assert Enum.map(holders, & &1.backend) |> Enum.uniq() |> length() == 2
       send(owner, {:release_expired_owner_generation_checkpoint, checkpoint})
-      assert {:error, :owner_unavailable} = Task.await(cleanup, @budget)
+      assert :owner_unavailable = assert_cleanup_failure!(cleanup, fixture)
       assert System.monotonic_time(:millisecond) - started < 5000
       assert Process.alive?(fixture.handler)
       assert {:ok, ^witness} = ExpiredCleanup.read(Repo.get!(Attempt, witness["attempt_id"]))
@@ -1210,6 +1210,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxLeaseLifecycleTest do
   defp release_cleanup!({task, ref}) do
     send(task.pid, {:release_runtime_cleanup_owner_candidates, ref})
     assert {:ok, _summary} = Task.await(task, @budget)
+  end
+
+  defp assert_cleanup_failure!(task, fixture) do
+    session_id = fixture.old_session.id
+
+    assert {:error, {:runtime_cleanup_failed, [owner_recovery: [{^session_id, reason}]]}, summary} = Task.await(task, @budget)
+    assert summary.expired_owner_sessions_failed == 1
+    assert summary.expired_owner_sessions_recovered == 0
+    reason
   end
 
   defp predecessor_response(:http, output, gate) do

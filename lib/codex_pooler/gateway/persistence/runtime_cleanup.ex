@@ -29,6 +29,7 @@ defmodule CodexPooler.Gateway.Persistence.RuntimeCleanup do
   alias CodexPooler.Repo
 
   @owner_lease_active OwnerLeaseStatus.active_status()
+  @failure_sample_limit 10
   # Generic prepared plans must see the fixed predicate of the retirement partial index.
   @reconnectable_statuses SessionStatus.reconnectable_statuses()
 
@@ -48,17 +49,64 @@ defmodule CodexPooler.Gateway.Persistence.RuntimeCleanup do
           required(:owner_lease_expires_at) => DateTime.t()
         }
 
-  @spec cleanup_expired_runtime_state(DateTime.t()) :: {:ok, map()} | {:error, term()}
+  @type cleanup_summary :: %{optional(atom()) => non_neg_integer()}
+  @type cleanup_failure :: atom() | {atom(), atom()} | {:raised, {module(), atom()}}
+  @type cleanup_phase_failure :: {:owner_recovery, [{Ecto.UUID.t(), cleanup_failure()}] | cleanup_failure()} | {:expired_records, cleanup_failure()}
+  @type cleanup_result :: {:ok, cleanup_summary()} | {:error, :caller_transaction} | {:error, {:runtime_cleanup_failed, [cleanup_phase_failure()]}, cleanup_summary()}
+
+  @spec cleanup_expired_runtime_state(DateTime.t()) :: cleanup_result()
   def cleanup_expired_runtime_state(now \\ now()) do
     cleanup_expired_outside_transaction(now)
   end
 
   defp cleanup_expired_outside_transaction(now) do
-    with {:ok, recovered_summary} <- recover_expired_owner_runtime_state(now),
-         {:ok, cleanup_summary} <- cleanup_expired(now) do
-      {:ok, Map.merge(cleanup_summary, recovered_summary)}
+    case run_cleanup_phase(fn -> recover_expired_owner_runtime_state(now) end) do
+      {:error, :caller_transaction} = error ->
+        error
+
+      owner_result ->
+        # Pending owner turns retain their exact lease in cleanup_expired/1.
+        # One unresolved owner must not prevent unrelated records from expiring.
+        expiry_result = run_cleanup_phase(fn -> cleanup_expired(now) end)
+        summarize_cleanup(owner_recovery: owner_result, expired_records: expiry_result)
     end
   end
+
+  defp summarize_cleanup(results) do
+    {summary, failures} =
+      Enum.reduce(results, {%{}, []}, fn
+        {_phase, {:ok, counts}}, {summary, failures} -> {Map.merge(summary, counts), failures}
+        {phase, {:error, reason, counts}}, {summary, failures} -> {Map.merge(summary, counts), [{phase, reason} | failures]}
+        {phase, {:error, reason}}, {summary, failures} -> {summary, [{phase, reason} | failures]}
+      end)
+
+    case failures do
+      [] -> {:ok, summary}
+      failures -> {:error, {:runtime_cleanup_failed, Enum.reverse(failures)}, summary}
+    end
+  end
+
+  defp run_cleanup_phase(operation) do
+    case operation.() do
+      {:error, reason} -> {:error, cleanup_failure(reason)}
+      result -> result
+    end
+  rescue
+    exception -> {:error, {:raised, cleanup_exception(exception)}}
+  catch
+    :exit, _reason -> {:error, :process_exit}
+  end
+
+  defp cleanup_exception(%Postgrex.Error{postgres: %{code: code}}) when is_atom(code), do: {Postgrex.Error, code}
+  defp cleanup_exception(exception), do: exception.__struct__
+
+  # Only fixed diagnostic classes leave cleanup. Driver messages, changesets,
+  # ownership tokens and arbitrary rollback payloads never become job errors.
+  defp cleanup_failure(reason) when is_atom(reason), do: reason
+  defp cleanup_failure({kind, detail}) when is_atom(kind) and is_atom(detail), do: {kind, detail}
+  defp cleanup_failure(reason) when is_tuple(reason) and tuple_size(reason) > 0 and is_atom(elem(reason, 0)), do: elem(reason, 0)
+  defp cleanup_failure(%{code: code}) when is_atom(code), do: code
+  defp cleanup_failure(_reason), do: :cleanup_failed
 
   @doc """
   Whether this request still has an in-progress turn held by a live owner.
@@ -322,11 +370,34 @@ defmodule CodexPooler.Gateway.Persistence.RuntimeCleanup do
 
     maybe_wait_after_expired_owner_candidates(candidates)
 
-    candidates
-    |> Enum.reduce_while({:ok, 0}, &recover_expired_owner_session/2)
-    |> case do
-      {:ok, recovered_count} -> {:ok, %{expired_owner_sessions_recovered: recovered_count}}
-      {:error, reason} -> {:error, reason}
+    if Repo.in_transaction?() and Enum.any?(candidates, &Interruption.physical_expiry_stop_required?(&1.session_id)) do
+      {:error, :caller_transaction}
+    else
+      {recovered, failed, failures} = Enum.reduce(candidates, {0, 0, []}, &collect_owner_recovery/2)
+      summary = %{expired_owner_sessions_recovered: recovered, expired_owner_sessions_failed: failed}
+
+      case failures do
+        [] -> {:ok, summary}
+        failures -> {:error, Enum.reverse(failures), summary}
+      end
+    end
+  end
+
+  defp collect_owner_recovery(candidate, {recovered, failed, failures}) do
+    case run_cleanup_phase(fn -> owner_recovery_result(candidate, recovered) end) do
+      {:ok, recovered} ->
+        {recovered, failed, failures}
+
+      {:error, reason} ->
+        examples = if failed < @failure_sample_limit, do: [{candidate.session_id, reason} | failures], else: failures
+        {recovered, failed + 1, examples}
+    end
+  end
+
+  defp owner_recovery_result(candidate, recovered) do
+    case recover_expired_owner_session(candidate, {:ok, recovered}) do
+      {:cont, result} -> result
+      {:halt, result} -> result
     end
   end
 
