@@ -3481,7 +3481,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
       replay_generation: descriptor.replay_generation
     }
 
-    case CodexPooler.Accounting.with_current_replay_generation(request, attempt, fn ->
+    case CodexPooler.Accounting.with_current_lifecycle_generation(request, attempt, fn ->
            send_downstream(
              state,
              DownstreamState.active_turn_downstream(state),
