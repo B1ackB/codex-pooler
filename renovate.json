@@ -157,6 +157,19 @@
       "allowedVersions": "<7"
     },
     {
+      "description": "Keep social-card font shaping on opentype.js 1 until its GSUB type 6 format 2 lookup is supported",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "docs-site/package.json"
+      ],
+      "matchPackageNames": [
+        "opentype.js"
+      ],
+      "allowedVersions": "<2"
+    },
+    {
       "description": "Classify dependency version updates as maintenance rather than product fixes",
       "matchPackageNames": ["*"],
       "semanticCommitType": "chore",
