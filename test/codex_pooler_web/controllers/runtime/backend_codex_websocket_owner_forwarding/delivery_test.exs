@@ -41,6 +41,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
   end
 
   test "owner-forwarded native turn records a delivered downstream receipt on the proxy side" do
+    lifecycle_frame = CodexPooler.JSON.encode!(%{"type" => "response.created", "response" => %{"id" => "resp_owner_delivery_receipt", "status" => "in_progress", "output" => []}})
+
     delta_frame =
       CodexPooler.JSON.encode!(%{
         "type" => "response.output_text.delta",
@@ -67,7 +69,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
             path: "/backend-api/codex/responses",
             websocket_connection_ordinal: 1,
             json: [valid: true, equals: %{"type" => "response.create"}],
-            respond: FakeUpstream.websocket_text_frames([delta_frame, terminal_frame])
+            respond: FakeUpstream.websocket_text_frames([lifecycle_frame, delta_frame, lifecycle_frame, terminal_frame])
           )
         ])
       )
@@ -76,28 +78,26 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     {:ok, state} =
-      CodexResponsesSocket.init(%{
-        auth: auth,
-        opts: %{
-          request_id: "ws-owner-delivery-receipt",
-          accepted_turn_state: "stable-ws-owner-delivery-receipt",
-          client_ip: "127.0.0.1"
-        }
-      })
+      owner_socket(auth, "ws-owner-delivery-receipt", "stable-ws-owner-delivery-receipt", websocket_owner_forwarder_opts: [upstream: query_measured_upstream_boundary(self())])
 
     try do
       assert state.codex_session.owner_instance_id == Atom.to_string(node())
 
       {state, logs} =
         with_info_log(fn ->
+          thread_id = Ecto.UUID.generate()
+          payload = websocket_payload(setup, "owner receipt", %{"client_metadata" => %{"x-codex-turn-metadata" => CodexPooler.JSON.encode!(%{"thread_id" => thread_id, "turn_id" => Ecto.UUID.generate(), "request_kind" => "turn"})}})
+
           assert {:ok, state} =
                    CodexResponsesSocket.handle_in(
-                     {websocket_payload(setup, "owner receipt"), [opcode: :text]},
+                     {payload, [opcode: :text]},
                      state
                    )
 
           task_monitors = Map.new(state.tasks, &{&1, Process.monitor(&1)})
+          assert {:push, {:text, ^lifecycle_frame}, state} = receive_owner_socket_push(state)
           assert {:push, {:text, ^delta_frame}, state} = receive_owner_socket_push(state)
+          assert {:push, {:text, ^lifecycle_frame}, state} = receive_owner_socket_push(state)
           assert {:push, {:text, ^terminal_frame}, state} = receive_owner_socket_push(state)
           state = settle_owner_socket_turn(state)
           await_owner_delivery_receipt!(task_monitors)
@@ -106,6 +106,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
 
       assert MapSet.size(state.tasks) == 0
       assert :ok = FakeUpstream.verify!(upstream)
+      assert_receive {:owner_writer_queries, "codex.response.metadata", metadata_selects}
+      assert metadata_selects == 9
+      assert_receive {:owner_writer_queries, "response.created", lifecycle_selects}
+      assert lifecycle_selects == 9
+      assert_receive {:owner_writer_queries, "response.output_text.delta", visible_selects}
+      assert visible_selects > 0
+      assert_receive {:owner_writer_queries, "response.created", 0}
+      assert_receive {:owner_writer_queries, "response.completed", 0}
+      refute_received {:owner_writer_queries, _, _}
+      refute_received {:websocket_owner_frame, _, _, _, {:data, _}}
 
       assert [request_log] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
       assert request_log.status == "succeeded"
@@ -118,7 +128,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
                "outcome" => "delivered",
                "terminal_class" => "response.completed",
                "pushed_at" => pushed_at,
-               "frames_after_visible" => 2,
+               "frames_after_visible" => 4,
                "transport" => "websocket"
              } = attempt.response_metadata["downstream_delivery"]
 
@@ -128,7 +138,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
       assert logs =~
                "websocket downstream terminal pushed request_id=#{request_log.id} " <>
                  "codex_session_id=#{state.codex_session.id} outcome=delivered " <>
-                 "terminal_class=response.completed frames_after_visible=2"
+                 "terminal_class=response.completed frames_after_visible=4"
 
       assert length(Regex.scan(~r/websocket downstream terminal pushed request_id=#{request_log.id} /, logs)) == 1
       assert Repo.aggregate(from(e in LedgerEntry, where: e.request_id == ^request_log.id and e.entry_kind == "settlement"), :count) == 1
@@ -850,6 +860,41 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwarding.DeliveryTe
       close: &UpstreamWebsocketSession.close/1
     }
   end
+
+  defp query_measured_upstream_boundary(test_pid) do
+    handler = {__MODULE__, make_ref()}
+    on_exit(fn -> :telemetry.detach(handler) end)
+    :ok = :telemetry.attach(handler, [:codex_pooler, :repo, :query], &__MODULE__.count_writer_select/4, handler)
+
+    %{
+      start: fn -> UpstreamWebsocketSession.start_link([]) end,
+      send: fn upstream_pid, request, writer ->
+        measured_writer = fn frame, discriminator ->
+          Process.put(handler, 0)
+
+          try do
+            result = writer.(frame, discriminator)
+            send(test_pid, {:owner_writer_queries, CodexPooler.JSON.decode!(frame)["type"], Process.get(handler)})
+            result
+          after
+            Process.delete(handler)
+          end
+        end
+
+        UpstreamWebsocketSession.request(upstream_pid, %{request | writer: measured_writer})
+      end,
+      close: &UpstreamWebsocketSession.close/1
+    }
+  end
+
+  @doc false
+  def count_writer_select(_event, _measurements, %{repo: Repo, query: query}, handler) do
+    if is_integer(Process.get(handler)) and String.starts_with?(String.trim_leading(query), "SELECT") do
+      Process.put(handler, Process.get(handler) + 1)
+    end
+  end
+
+  def count_writer_select(_event, _measurements, _metadata, _handler), do: :ok
 
   defp invoke_frame_observer(observer, frame, decoded) when is_function(observer, 2),
     do: observer.(frame, decoded)

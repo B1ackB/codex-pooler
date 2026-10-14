@@ -3634,7 +3634,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   defp authorize_writer_frame(_authority, _frame, _deliver), do: {:ok, :not_committed}
 
   defp authorize_writer_lifecycle_frame(request, attempt, deliver) do
-    CodexPooler.Accounting.with_current_replay_generation(request, attempt, fn ->
+    CodexPooler.Accounting.with_current_lifecycle_generation(request, attempt, fn ->
       deliver.(:not_committed)
       :delivered
     end)
