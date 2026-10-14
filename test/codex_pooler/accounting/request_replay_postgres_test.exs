@@ -6,6 +6,7 @@ defmodule CodexPooler.Accounting.RequestReplayPostgresTest do
   import CodexPooler.RequestReplayFixtures
   import CodexPooler.UnboxedFixture, only: [register_unboxed_cleanup!: 1]
   alias CodexPooler.Access.APIKey
+  alias CodexPooler.Accounting
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.Accounting.RequestReplay
   alias CodexPooler.Accounting.RequestReplayEntitlement
@@ -179,6 +180,120 @@ defmodule CodexPooler.Accounting.RequestReplayPostgresTest do
 
       cleanup_fixture(fixture)
     end
+  end
+
+  @tag slow: "proves both lifecycle/replay lock orders with committed barriers"
+  test "lifecycle authorization wins before replay arm and blocks it until commit" do
+    fixture = committed_replay_fixture!()
+    parent = self()
+    observer = start_observer!()
+
+    lifecycle =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          [[backend]] = Repo.query!("SELECT pg_backend_pid()", []).rows
+
+          result =
+            Accounting.with_current_lifecycle_generation(fixture.request, fixture.attempt, fn ->
+              send(parent, {:lifecycle_authorized, self(), backend})
+
+              receive do
+                :release_lifecycle -> :ok
+              end
+            end)
+
+          send(parent, {:lifecycle_result, result})
+          result
+        end)
+      end)
+
+    assert_receive {:lifecycle_authorized, lifecycle_pid, lifecycle_backend}, 15_000
+
+    arm =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          [[backend]] = Repo.query!("SELECT pg_backend_pid()", []).rows
+          send(parent, {:arm_backend, self(), backend})
+
+          receive do
+            :run_arm -> RequestReplay.arm(arm_input(fixture))
+          end
+        end)
+      end)
+
+    assert_receive {:arm_backend, _arm_pid, arm_backend}, 15_000
+    send(arm.pid, :run_arm)
+    await_backend_blocked!(observer, arm_backend, lifecycle_backend)
+    send(lifecycle_pid, :release_lifecycle)
+
+    assert {:ok, :ok} = Task.await(lifecycle, 15_000)
+    assert {:ok, _armed} = Task.await(arm, 15_000)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert Repo.aggregate(from(e in RequestReplayEntitlement, where: e.request_id == ^fixture.request.id), :count) == 1
+      assert request_attempt_count(fixture.request.id) == 1
+      assert terminal_ledger_count(fixture.request.id, "settlement") == 0
+      assert terminal_ledger_count(fixture.request.id, "release") == 0
+    end)
+
+    cleanup_fixture(fixture)
+  end
+
+  @tag slow: "proves replay arm suppresses an older lifecycle generation after commit"
+  test "replay arm wins and stale lifecycle callback is suppressed" do
+    fixture = committed_replay_fixture!()
+    parent = self()
+    observer = start_observer!()
+
+    arm_holder =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            Repo.one!(from(session in CodexSession, where: session.id == ^fixture.session.id, lock: "FOR UPDATE"))
+            [[backend]] = Repo.query!("SELECT pg_backend_pid()", []).rows
+            send(parent, {:replay_arm_locked, self(), backend})
+            assert {:ok, _armed} = RequestReplay.arm(arm_input(fixture))
+            send(parent, :replay_arm_ready)
+
+            receive do
+              :release_replay_arm -> :ok
+            end
+          end)
+        end)
+      end)
+
+    assert_receive {:replay_arm_locked, arm_pid, arm_backend}, 15_000
+    assert_receive :replay_arm_ready, 15_000
+
+    lifecycle =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          [[backend]] = Repo.query!("SELECT pg_backend_pid()", []).rows
+          send(parent, {:stale_lifecycle_backend, self(), backend})
+
+          Accounting.with_current_lifecycle_generation(fixture.request, fixture.attempt, fn ->
+            send(parent, :unexpected_stale_lifecycle_callback)
+            :should_not_run
+          end)
+        end)
+      end)
+
+    assert_receive {:stale_lifecycle_backend, _lifecycle_pid, lifecycle_backend}, 15_000
+    await_backend_blocked!(observer, lifecycle_backend, arm_backend)
+    send(arm_pid, :release_replay_arm)
+
+    assert {:error, :stale_generation} = Task.await(lifecycle, 15_000)
+    refute_received :unexpected_stale_lifecycle_callback
+    assert {:ok, :ok} = Task.await(arm_holder, 15_000)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert Repo.aggregate(from(e in RequestReplayEntitlement, where: e.request_id == ^fixture.request.id), :count) == 1
+      assert request_attempt_count(fixture.request.id) == 1
+      assert terminal_ledger_count(fixture.request.id, "settlement") == 0
+      assert terminal_ledger_count(fixture.request.id, "release") == 0
+    end)
+
+    cleanup_fixture(fixture)
   end
 
   test "PostgreSQL replay states preserve one request and one reservation through N2" do
@@ -687,6 +802,39 @@ defmodule CodexPooler.Accounting.RequestReplayPostgresTest do
 
       true ->
         flunk("consume did not wait on the session lock across expiry")
+    end
+  end
+
+  defp start_observer! do
+    start_supervised!(
+      {Postgrex,
+       Repo.config()
+       |> Keyword.take([:hostname, :port, :database, :username, :password])}
+    )
+  end
+
+  defp await_backend_blocked!(observer, waiter, holder, timeout \\ 15_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    %{rows: [[state, wait_event_type, blockers]]} =
+      Postgrex.query!(
+        observer,
+        """
+        SELECT activity.state, activity.wait_event_type, pg_blocking_pids($1)
+        FROM pg_stat_activity AS activity
+        WHERE activity.pid = $1
+        """,
+        [waiter]
+      )
+
+    if state == "active" and wait_event_type == "Lock" and holder in blockers do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) < deadline do
+        await_backend_blocked!(observer, waiter, holder, max(deadline - System.monotonic_time(:millisecond), 1))
+      else
+        flunk("backend #{waiter} did not block on #{holder}")
+      end
     end
   end
 
