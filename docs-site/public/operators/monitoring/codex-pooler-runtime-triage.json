@@ -975,6 +975,66 @@
       "type": "timeseries",
       "transparent": false,
       "repeatDirection": "h",
+      "title": "Lifecycle Authorization Query Attribution",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Websocket lifecycle authorization outcomes and duration by delivery operation. Use this with Repo Query Rate, Hot Query Sources, visibility/finalization outcomes, recovery evidence, and bounded pg_stat_statements or sampler snapshots to separate lifecycle SQL from admin pages, recovery pollers, and probes. The event is emitted by websocket serving nodes; OBAN_MODE=worker and scheduler do not run websocket delivery or the Prometheus reporter, so they are not expected to contribute here.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "asc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (operation, outcome) (rate(codex_pooler_gateway_lifecycle_authorization_count{namespace=\"$namespace\", job=\"codex-pooler-app\", pod=~\"${pod:regex}\"}[$__rate_interval]))",
+          "refId": "",
+          "legendFormat": "{{operation}} {{outcome}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, operation, outcome) (rate(codex_pooler_gateway_lifecycle_authorization_duration_seconds_bucket{namespace=\"$namespace\", job=\"codex-pooler-app\", pod=~\"${pod:regex}\"}[$__rate_interval])))",
+          "refId": "",
+          "legendFormat": "{{operation}} {{outcome}} p95",
+          "range": true,
+          "instant": false,
+          "editorMode": "code"
+        }
+      ],
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 8,
+        "y": 44
+      }
+    },
+    {
+      "type": "timeseries",
+      "transparent": false,
+      "repeatDirection": "h",
       "title": "Endpoint Duration p95",
       "datasource": {
         "type": "prometheus",
@@ -1019,7 +1079,7 @@
       "gridPos": {
         "h": 7,
         "w": 8,
-        "x": 8,
+        "x": 20,
         "y": 44
       }
     },
@@ -1071,8 +1131,8 @@
       "gridPos": {
         "h": 7,
         "w": 8,
-        "x": 16,
-        "y": 44
+        "x": 0,
+        "y": 53
       }
     },
     {
@@ -1131,8 +1191,8 @@
       "gridPos": {
         "h": 7,
         "w": 12,
-        "x": 0,
-        "y": 51
+        "x": 8,
+        "y": 53
       }
     },
     {
@@ -1191,8 +1251,8 @@
       "gridPos": {
         "h": 7,
         "w": 12,
-        "x": 12,
-        "y": 51
+        "x": 20,
+        "y": 53
       }
     },
     {
@@ -1244,7 +1304,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 58
+        "y": 60
       }
     },
     {
@@ -1328,7 +1388,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 58
+        "y": 60
       }
     },
     {
@@ -1388,7 +1448,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 58
+        "y": 60
       }
     },
     {
@@ -1448,7 +1508,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 65
+        "y": 67
       }
     },
     {
@@ -1459,7 +1519,7 @@
       "title": "Database / Ecto Query Pressure",
       "gridPos": {
         "x": 0,
-        "y": 72,
+        "y": 74,
         "h": 1,
         "w": 24
       }
@@ -1513,7 +1573,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 73
+        "y": 75
       }
     },
     {
@@ -1565,7 +1625,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 73
+        "y": 75
       }
     },
     {
@@ -1617,7 +1677,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 73
+        "y": 75
       }
     },
     {
@@ -1669,7 +1729,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 80
+        "y": 82
       }
     },
     {
@@ -1721,7 +1781,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 80
+        "y": 82
       }
     },
     {
@@ -1773,7 +1833,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 80
+        "y": 82
       }
     },
     {
@@ -1825,7 +1885,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 87
+        "y": 89
       }
     },
     {
@@ -1877,7 +1937,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 87
+        "y": 89
       }
     },
     {
@@ -1929,7 +1989,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 87
+        "y": 89
       }
     },
     {
@@ -1940,7 +2000,7 @@
       "title": "Restart Evidence",
       "gridPos": {
         "x": 0,
-        "y": 94,
+        "y": 96,
         "h": 1,
         "w": 24
       }
@@ -2001,7 +2061,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 95
+        "y": 97
       }
     },
     {
@@ -2034,7 +2094,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 95
+        "y": 97
       }
     },
     {
@@ -2045,7 +2105,7 @@
       "title": "Admin Stats Dashboard",
       "gridPos": {
         "x": 0,
-        "y": 102,
+        "y": 104,
         "h": 1,
         "w": 24
       }
@@ -2099,7 +2159,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 103
+        "y": 105
       }
     },
     {
@@ -2151,7 +2211,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 103
+        "y": 105
       }
     },
     {
@@ -2203,7 +2263,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 103
+        "y": 105
       }
     },
     {
@@ -2255,7 +2315,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 110
+        "y": 112
       }
     },
     {
@@ -2307,7 +2367,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 110
+        "y": 112
       }
     },
     {
@@ -2318,7 +2378,7 @@
       "title": "Gateway Outcomes",
       "gridPos": {
         "x": 0,
-        "y": 117,
+        "y": 119,
         "h": 1,
         "w": 24
       }
@@ -2372,7 +2432,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 118
+        "y": 120
       }
     },
     {
@@ -2424,7 +2484,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 118
+        "y": 120
       }
     },
     {
@@ -2476,7 +2536,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 127
+        "y": 129
       }
     },
     {
@@ -2536,7 +2596,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 127
+        "y": 129
       }
     },
     {
@@ -2588,7 +2648,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 136
+        "y": 138
       }
     },
     {
@@ -2640,7 +2700,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 136
+        "y": 138
       }
     },
     {
@@ -2692,7 +2752,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 145
+        "y": 147
       }
     },
     {
@@ -2703,7 +2763,7 @@
       "title": "Saved-reset Post-consume Convergence",
       "gridPos": {
         "x": 0,
-        "y": 154,
+        "y": 156,
         "h": 1,
         "w": 24
       }
@@ -2757,7 +2817,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 155
+        "y": 157
       }
     },
     {
@@ -2825,7 +2885,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 155
+        "y": 157
       }
     },
     {
@@ -2877,7 +2937,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 164
+        "y": 166
       }
     },
     {
@@ -2929,7 +2989,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 164
+        "y": 166
       }
     },
     {
@@ -2981,7 +3041,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 173
+        "y": 175
       }
     },
     {
@@ -3033,7 +3093,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 173
+        "y": 175
       }
     },
     {
@@ -3044,7 +3104,7 @@
       "title": "Job Telemetry Relay",
       "gridPos": {
         "x": 0,
-        "y": 182,
+        "y": 184,
         "h": 1,
         "w": 24
       }
@@ -3106,7 +3166,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 183
+        "y": 185
       }
     },
     {
@@ -3158,7 +3218,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 183
+        "y": 185
       }
     },
     {
@@ -3218,7 +3278,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 191
+        "y": 193
       }
     }
   ]

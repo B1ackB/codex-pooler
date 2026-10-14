@@ -52,6 +52,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   alias CodexPooler.Platform.InstancePresence
   alias CodexPooler.Platform.TransientDatabaseError
   alias CodexPooler.Repo
+  alias CodexPoolerWeb.Telemetry, as: WebTelemetry
 
   defmodule ForwardedSendWitnessState do
     @moduledoc false
@@ -3471,6 +3472,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   end
 
   defp deliver_internal_frame(state, request_id, attempt_id, payload) do
+    started_at = System.monotonic_time()
     descriptor = state.active_turn.descriptor
 
     request = %CodexPooler.Accounting.Request{id: request_id}
@@ -3481,22 +3483,40 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
       replay_generation: descriptor.replay_generation
     }
 
-    case CodexPooler.Accounting.with_current_lifecycle_generation(request, attempt, fn ->
-           send_downstream(
-             state,
-             DownstreamState.active_turn_downstream(state),
-             {:data, payload}
-           )
-         end) do
-      {:ok, result} -> result
-      {:error, _reason} -> :stale_generation
-    end
-  rescue
-    Ecto.NoResultsError ->
-      :stale_generation
+    try do
+      case CodexPooler.Accounting.with_current_lifecycle_generation(request, attempt, fn ->
+             send_downstream(
+               state,
+               DownstreamState.active_turn_downstream(state),
+               {:data, payload}
+             )
+           end) do
+        {:ok, result} ->
+          WebTelemetry.emit_lifecycle_authorization(:internal_delivery, :authorized, started_at)
+          result
 
-    error in [DBConnection.ConnectionError, Postgrex.Error] ->
-      if TransientDatabaseError.transient?(error), do: :visible_output_unavailable, else: reraise(error, __STACKTRACE__)
+        {:error, :stale_generation} ->
+          WebTelemetry.emit_lifecycle_authorization(:internal_delivery, :stale_generation, started_at)
+          :stale_generation
+
+        {:error, _reason} ->
+          WebTelemetry.emit_lifecycle_authorization(:internal_delivery, :other, started_at)
+          :stale_generation
+      end
+    rescue
+      Ecto.NoResultsError ->
+        WebTelemetry.emit_lifecycle_authorization(:internal_delivery, :missing_row, started_at)
+        :stale_generation
+
+      error in [DBConnection.ConnectionError, Postgrex.Error] ->
+        if TransientDatabaseError.transient?(error) do
+          WebTelemetry.emit_lifecycle_authorization(:internal_delivery, :transient_db_error, started_at)
+          :visible_output_unavailable
+        else
+          WebTelemetry.emit_lifecycle_authorization(:internal_delivery, :other, started_at)
+          reraise(error, __STACKTRACE__)
+        end
+    end
   end
 
   defp authorize_visible_delivery(
@@ -3634,16 +3654,39 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   defp authorize_writer_frame(_authority, _frame, _deliver), do: {:ok, :not_committed}
 
   defp authorize_writer_lifecycle_frame(request, attempt, deliver) do
-    CodexPooler.Accounting.with_current_lifecycle_generation(request, attempt, fn ->
-      deliver.(:not_committed)
-      :delivered
-    end)
-  rescue
-    Ecto.NoResultsError ->
-      {:error, :stale_generation}
+    started_at = System.monotonic_time()
 
-    error in [DBConnection.ConnectionError, Postgrex.Error] ->
-      if TransientDatabaseError.transient?(error), do: {:error, :visible_output_unavailable}, else: reraise(error, __STACKTRACE__)
+    try do
+      case CodexPooler.Accounting.with_current_lifecycle_generation(request, attempt, fn ->
+             deliver.(:not_committed)
+             :delivered
+           end) do
+        {:ok, _result} = ok ->
+          WebTelemetry.emit_lifecycle_authorization(:writer_delivery, :authorized, started_at)
+          ok
+
+        {:error, :stale_generation} = stale ->
+          WebTelemetry.emit_lifecycle_authorization(:writer_delivery, :stale_generation, started_at)
+          stale
+
+        {:error, _reason} = other ->
+          WebTelemetry.emit_lifecycle_authorization(:writer_delivery, :other, started_at)
+          other
+      end
+    rescue
+      Ecto.NoResultsError ->
+        WebTelemetry.emit_lifecycle_authorization(:writer_delivery, :missing_row, started_at)
+        {:error, :stale_generation}
+
+      error in [DBConnection.ConnectionError, Postgrex.Error] ->
+        if TransientDatabaseError.transient?(error) do
+          WebTelemetry.emit_lifecycle_authorization(:writer_delivery, :transient_db_error, started_at)
+          {:error, :visible_output_unavailable}
+        else
+          WebTelemetry.emit_lifecycle_authorization(:writer_delivery, :other, started_at)
+          reraise(error, __STACKTRACE__)
+        end
+    end
   end
 
   defp send_authorized_writer_frame(owner, ref, capability, authority, frame, discriminator, :not_committed) do

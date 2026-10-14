@@ -54,6 +54,12 @@ defmodule CodexPoolerWeb.Telemetry do
   @type bridge_fallback_tags :: %{reason: String.t()}
   @type pre_attempt_release_tags :: %{phase: String.t(), transport: String.t(), via: String.t()}
   @type saved_reset_convergence_tags :: %{source: String.t(), outcome: String.t()}
+  @type lifecycle_authorization_tags :: %{
+          phase: String.t(),
+          operation: String.t(),
+          transport: String.t(),
+          outcome: String.t()
+        }
 
   @native_compaction_topologies ~w(direct forwarded)
   @native_compaction_admission_stages %{
@@ -110,6 +116,8 @@ defmodule CodexPoolerWeb.Telemetry do
   )
   @quota_cycle_sources ~w(provider_usage runtime unknown)
   @saved_reset_convergence_buckets [0, 1, 5, 15, 30, 60, 120, 300, 600, 900]
+  @lifecycle_authorization_operations ~w(writer_delivery internal_delivery)
+  @lifecycle_authorization_outcomes ~w(authorized stale_generation missing_row transient_db_error other)
   @prometheus_reporter_disabled_oban_modes ~w(worker scheduler)
   @repo_source_pattern ~r/\A[a-zA-Z0-9_.-]+\z/
   @safe_route_pattern ~r/\A[a-zA-Z0-9_.*:\/{}-]+\z/
@@ -219,6 +227,22 @@ defmodule CodexPoolerWeb.Telemetry do
     ]
   end
 
+  @doc "Emits bounded lifecycle authorization attribution for websocket delivery callers."
+  @spec emit_lifecycle_authorization(atom(), atom(), integer()) :: :ok
+  def emit_lifecycle_authorization(operation, outcome, started_at)
+      when is_integer(started_at) do
+    elapsed = max(System.monotonic_time() - started_at, 0)
+    duration_ms = System.convert_time_unit(elapsed, :native, :millisecond)
+
+    :telemetry.execute(
+      [:codex_pooler, :gateway, :lifecycle_authorization],
+      %{count: 1, duration_ms: duration_ms},
+      %{phase: "lifecycle_authorization", operation: operation, transport: "websocket", outcome: outcome}
+    )
+
+    :ok
+  end
+
   @spec prometheus_metrics() :: [metric()]
   def prometheus_metrics do
     # Prometheus Core 1.2.1 enumerates metric.tags and invokes metric.tag_values.
@@ -303,6 +327,28 @@ defmodule CodexPoolerWeb.Telemetry do
         tags: [:source, :command],
         tag_values: &repo_query_tag_values/1,
         description: "Total Ecto repository queries by source and SQL command. Split-role coverage: OBAN_MODE=web includes only queries on scraped web pods; OBAN_MODE=worker and scheduler run no Prometheus reporter, so their query activity is omitted. OBAN_MODE=all includes co-located job queries."
+      ),
+      counter("codex_pooler.gateway.lifecycle_authorization.count",
+        event_name: [:codex_pooler, :gateway, :lifecycle_authorization],
+        measurement: :count,
+        tags: [:phase, :operation, :transport, :outcome],
+        tag_values: &lifecycle_authorization_tag_values/1,
+        description:
+          "Websocket lifecycle authorization outcomes by bounded delivery operation. " <>
+            "The event is emitted on serving nodes only; worker and scheduler roles do not " <>
+            "run websocket delivery or the Prometheus reporter."
+      ),
+      distribution("codex_pooler.gateway.lifecycle_authorization.duration.seconds",
+        event_name: [:codex_pooler, :gateway, :lifecycle_authorization],
+        measurement: :duration_ms,
+        unit: {:millisecond, :second},
+        tags: [:phase, :operation, :transport, :outcome],
+        tag_values: &lifecycle_authorization_tag_values/1,
+        description:
+          "Websocket lifecycle authorization duration by bounded delivery operation and outcome. " <>
+            "The event is emitted on serving nodes only; worker and scheduler roles do not " <>
+            "run websocket delivery or the Prometheus reporter.",
+        reporter_options: [buckets: @repo_query_buckets]
       ),
       counter("codex_pooler.instance_presence.heartbeat_failure.count",
         event_name: [:codex_pooler, :instance_presence, :heartbeat],
@@ -930,6 +976,16 @@ defmodule CodexPoolerWeb.Telemetry do
       phase: admin_stats_enum_value(metadata[:phase], PreAttemptRelease.phases()),
       transport: admin_stats_enum_value(metadata[:transport], @pre_attempt_release_transports),
       via: via_tag(metadata[:via])
+    }
+  end
+
+  @spec lifecycle_authorization_tag_values(map()) :: lifecycle_authorization_tags()
+  defp lifecycle_authorization_tag_values(metadata) do
+    %{
+      phase: admin_stats_enum_value(metadata[:phase], ["lifecycle_authorization"]),
+      operation: admin_stats_enum_value(metadata[:operation], @lifecycle_authorization_operations),
+      transport: admin_stats_enum_value(metadata[:transport], ["websocket"]),
+      outcome: admin_stats_enum_value(metadata[:outcome], @lifecycle_authorization_outcomes)
     }
   end
 
