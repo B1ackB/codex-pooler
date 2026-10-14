@@ -228,16 +228,17 @@ defmodule CodexPoolerWeb.Telemetry do
   end
 
   @doc "Emits bounded lifecycle authorization attribution for websocket delivery callers."
-  @spec emit_lifecycle_authorization(atom(), atom(), integer()) :: :ok
+  @spec emit_lifecycle_authorization(term(), term(), integer()) :: :ok
   def emit_lifecycle_authorization(operation, outcome, started_at)
       when is_integer(started_at) do
     elapsed = max(System.monotonic_time() - started_at, 0)
     duration_ms = System.convert_time_unit(elapsed, :native, :millisecond)
+    tags = lifecycle_authorization_tag_values(%{phase: "lifecycle_authorization", operation: operation, transport: "websocket", outcome: outcome})
 
     :telemetry.execute(
       [:codex_pooler, :gateway, :lifecycle_authorization],
       %{count: 1, duration_ms: duration_ms},
-      %{phase: "lifecycle_authorization", operation: operation, transport: "websocket", outcome: outcome}
+      tags
     )
 
     :ok

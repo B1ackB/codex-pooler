@@ -69,5 +69,22 @@ defmodule CodexPoolerWeb.Telemetry.LifecycleAuthorizationTelemetryTest do
     refute body =~ "pool_id"
   end
 
+  test "emitter sanitizes untrusted values before dispatch" do
+    handler_id = {__MODULE__, :sanitization, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      @event,
+      fn _event, _measurements, metadata, _config -> send(self(), {:lifecycle_tags, metadata}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    Telemetry.emit_lifecycle_authorization(String.duplicate("x", 128), "provider-secret", System.monotonic_time())
+
+    assert_receive {:lifecycle_tags, %{phase: "lifecycle_authorization", operation: "unknown", transport: "websocket", outcome: "unknown"}}
+  end
+
   defp metric(name), do: Enum.find(Telemetry.prometheus_metrics(), &(&1.name == name))
 end
