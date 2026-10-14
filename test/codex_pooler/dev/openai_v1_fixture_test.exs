@@ -32,7 +32,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
     pool = Repo.get!(Pool, setup["pool_id"])
     key = Repo.get!(APIKey, setup["created"]["api_key_id"])
     assignment = Repo.get!(PoolUpstreamAssignment, setup["created"]["assignment_id"])
-    model = Repo.get_by!(Model, pool_id: pool.id, exposed_model_id: "gpt-6-sol")
+    model = Repo.get_by!(Model, pool_id: pool.id, exposed_model_id: "gpt-6.1-sol")
     request = request_fixture(%{pool: pool, api_key: key}, %{model_id: model.id})
     attempt = attempt_fixture(request, assignment)
 
@@ -114,7 +114,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
              supports_reasoning: true,
              metadata: text_metadata
            } =
-             Repo.get_by(Model, pool_id: pool_id, exposed_model_id: "gpt-6-sol")
+             Repo.get_by(Model, pool_id: pool_id, exposed_model_id: "gpt-6.1-sol")
 
     assert %{"source_assignment_models" => source_models} = text_metadata
 
@@ -138,7 +138,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
     assert %{"visibility" => "hide", "priority" => 0} = ModelMetadata.metadata(decoy)
 
     assert %{"visibility" => "list", "priority" => 20} =
-             ModelMetadata.metadata(Repo.get_by!(Model, pool_id: pool_id, exposed_model_id: "gpt-6-sol"))
+             ModelMetadata.metadata(Repo.get_by!(Model, pool_id: pool_id, exposed_model_id: "gpt-6.1-sol"))
 
     assert %Model{
              supports_responses: true,
@@ -187,7 +187,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
 
     assert %Pool{} = pool = Repo.get_by(Pool, slug: @pool_slug)
 
-    model = Repo.get_by(Model, pool_id: pool.id, exposed_model_id: "gpt-6-sol")
+    model = Repo.get_by(Model, pool_id: pool.id, exposed_model_id: "gpt-6.1-sol")
     assert %Model{} = model
 
     assignment = Repo.get(PoolUpstreamAssignment, setup["created"]["assignment_id"])
@@ -244,7 +244,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
     assignment = Repo.get!(PoolUpstreamAssignment, setup["created"]["assignment_id"])
     identity = Repo.get!(UpstreamIdentity, assignment.upstream_identity_id)
 
-    for exposed_model_id <- ["gpt-6-sol", "gpt-6-luna"] do
+    for exposed_model_id <- ["gpt-6.1-sol", "gpt-6-luna"] do
       model = Repo.get_by!(Model, pool_id: pool.id, exposed_model_id: exposed_model_id)
       payload = %{"model" => exposed_model_id, "service_tier" => @bundled_client_default_service_tier}
       request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
@@ -285,7 +285,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
       assert snapshot.undecodable_models == [], inspect(representation)
 
       served = Map.new(snapshot.body["models"], &{&1["slug"], &1})
-      assert ["fixture-review-host", "gpt-4o-transcribe", "gpt-6-luna", "gpt-6-sol", "gpt-image-1"] -- Map.keys(served) == [], inspect(representation)
+      assert ["fixture-review-host", "gpt-4o-transcribe", "gpt-6-luna", "gpt-6.1-sol", "gpt-image-1"] -- Map.keys(served) == [], inspect(representation)
 
       for {slug, entry} <- served do
         violations = CodexModelDecodeContract.violations(entry)

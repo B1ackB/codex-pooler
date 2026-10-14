@@ -16,7 +16,7 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Models do
   # configures one, and the runtime filter refuses a non-default tier the
   # assignment does not declare (`503 no_compatible_backend`).
   @fast_tier %{"id" => "priority", "name" => "Fast", "description" => "1.5x speed"}
-  @provider_service_tiers Map.new(["gpt-6-sol", "gpt-6-luna"], fn id ->
+  @provider_service_tiers Map.new(["gpt-6.1-sol", "gpt-6-luna"], fn id ->
                             {id, %{"service_tiers" => [@fast_tier], "default_service_tier" => nil, "additional_speed_tiers" => ["fast"]}}
                           end)
 
@@ -97,8 +97,8 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Models do
 
   defp text_attributes(assignment) do
     model_attributes(
-      "gpt-6-sol",
-      "GPT 6 Sol",
+      "gpt-6.1-sol",
+      "GPT 6.1 Sol",
       true,
       true,
       true,

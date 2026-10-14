@@ -816,14 +816,14 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmoke do
   defp aggregate_probe_status(statuses), do: statuses |> Enum.sort() |> Enum.join("+")
 
   # The certified model is the one the Pool both stores and advertises among the
-  # exact gpt-6 family: gpt-6-sol when it qualifies, otherwise the first by id.
+  # gpt-6 family or exact gpt-6.1-sol: gpt-6.1-sol when it qualifies, otherwise the first by id.
   @doc false
   @spec select_certification_model(URI.t(), map()) :: {:ok, Model.t()} | {:error, String.t()}
   def select_certification_model(base_url, fixture) do
     with {:ok, candidates} <- certification_models(base_url, fixture) do
       selected =
         Enum.min_by(candidates, fn model ->
-          {if(model.exposed_model_id == "gpt-6-sol", do: 0, else: 1), model.exposed_model_id}
+          {if(model.exposed_model_id == "gpt-6.1-sol", do: 0, else: 1), model.exposed_model_id}
         end)
 
       {:ok, selected}
@@ -867,7 +867,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmoke do
       model.supports_responses and model.supports_streaming and model.supports_tools
   end
 
-  defp certification_family?(id), do: id == "gpt-6" or String.starts_with?(id, "gpt-6-")
+  defp certification_family?(id), do: id in ["gpt-6", "gpt-6.1-sol"] or String.starts_with?(id, "gpt-6-")
 
   defp optional_model_id?(:error, _id), do: true
   defp optional_model_id?({:ok, value}, id), do: is_binary(value) and value == id

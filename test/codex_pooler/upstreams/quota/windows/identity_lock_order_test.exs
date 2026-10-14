@@ -165,7 +165,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.IdentityLockOrderTest do
         fixture = committed_pending_redemption_fixture!()
 
       {:ok, probe} =
-        ResetProbe.bind(ResetProbe.new(), assignment.id, identity.id, "gpt-6-sol", "proxy_http")
+        ResetProbe.bind(ResetProbe.new(), assignment.id, identity.id, "gpt-6.1-sol", "proxy_http")
 
       Map.put(fixture, :probe, probe)
     end
@@ -255,7 +255,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.IdentityLockOrderTest do
           current = CodexPooler.ProviderCreditsFixtures.persist_usage!(current, CodexPooler.ProviderCreditsFixtures.usage_payload(:weekly_credit_only, now: now, credits: :none), now)
           redemption = current.metadata["saved_reset_redemption"] |> Map.put("included_window_descriptors", [%{"window_kind" => "secondary", "window_minutes" => 10_080}])
           Repo.update!(Ecto.Changeset.change(current, metadata: Map.put(current.metadata, "saved_reset_redemption", redemption)))
-          %ProbeLease.VerifiedConfirmation{credential_epoch: CredentialFencing.credential_epoch(current), probe: probe, upstream_model: "gpt-6-sol", serving_mode: :full, transport: :http_json}
+          %ProbeLease.VerifiedConfirmation{credential_epoch: CredentialFencing.credential_epoch(current), probe: probe, upstream_model: "gpt-6.1-sol", serving_mode: :full, transport: :http_json}
         end)
 
       results =

@@ -245,7 +245,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     %{request: model_default_request} =
       request_log_fixture(pool, %{
         correlation_id: "req-live-model-default",
-        requested_model: "gpt-6-sol",
+        requested_model: "gpt-6.1-sol",
         requested_service_tier: "default",
         actual_service_tier: "default",
         status: "succeeded"
@@ -437,7 +437,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     refute has_element?(view, "#request-log-#{fast_request.id}-requested-tier")
 
-    assert has_element?(view, "#request-log-row-#{model_default_request.id}", "gpt-6-sol")
+    assert has_element?(view, "#request-log-row-#{model_default_request.id}", "gpt-6.1-sol")
     assert has_element?(view, "#request-log-row-#{model_default_request.id}", "default")
 
     refute has_element?(view, "#{speed(model_default_request, 2)}")
@@ -1293,7 +1293,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     %{request: in_progress_request} =
       request_log_fixture(pool, %{
         correlation_id: "req-model-in-progress",
-        requested_model: "gpt-6-sol",
+        requested_model: "gpt-6.1-sol",
         reasoning_effort: "high",
         status: "in_progress"
       })
@@ -1342,7 +1342,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(view, "#request-log-#{no_suffix_request.id}-model-details", "gpt-4o")
 
-    assert has_element?(view, "#request-log-#{in_progress_request.id}-model-details", "gpt-6-sol · high")
+    assert has_element?(view, "#request-log-#{in_progress_request.id}-model-details", "gpt-6.1-sol · high")
     refute has_element?(view, "#request-log-#{in_progress_request.id}-model-details [data-role='model-service-tier']")
   end
 
@@ -1363,7 +1363,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     %{request: explicit_effort_request} =
       request_log_fixture(pool, %{
         correlation_id: "req-model-explicit-effort",
-        requested_model: "gpt-6-sol",
+        requested_model: "gpt-6.1-sol",
         endpoint: "/backend-api/codex/responses",
         reasoning_effort: "xhigh",
         service_tier: "default",
@@ -1422,7 +1422,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(view, "#{explicit_cell} [data-role='model-identity-line'] [data-role='model-reasoning']", "xhigh")
     refute has_element?(view, "#{explicit_cell} [data-role='model-reasoning-default']")
-    assert has_element?(view, "#{explicit_cell} [data-role='model-identity-line']", "gpt-6-sol · xhigh")
+    assert has_element?(view, "#{explicit_cell} [data-role='model-identity-line']", "gpt-6.1-sol · xhigh")
     assert has_element?(view, "#{explicit_cell} [data-role='model-context-line'] [data-role='model-speed'][data-speed-level='1']")
 
     transcription_cell = "#request-log-#{transcription_request.id}-model-details"
@@ -2897,7 +2897,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     %{request: request} =
       request_log_fixture(pool, %{
         correlation_id: "req-quota-exhausted",
-        requested_model: "gpt-6-sol",
+        requested_model: "gpt-6.1-sol",
         status: "rejected",
         usage_status: "not_applicable",
         last_error_code: "quota_exhausted",

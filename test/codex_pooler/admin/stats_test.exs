@@ -997,8 +997,8 @@ defmodule CodexPooler.Admin.StatsTest do
 
     m55 =
       model_fixture(pool, %{
-        exposed_model_id: "gpt-6-sol",
-        display_name: "Display name must not label gpt-6-sol"
+        exposed_model_id: "gpt-6.1-sol",
+        display_name: "Display name must not label gpt-6.1-sol"
       })
 
     m54 =
@@ -1144,19 +1144,19 @@ defmodule CodexPooler.Admin.StatsTest do
 
     assert model_usage_series_order(model_usage) == [
              "gpt-5.3",
-             "gpt-6-sol",
+             "gpt-6.1-sol",
              "gpt-6-luna",
              "gpt-5.0",
              "gpt-5.1",
              "Other"
            ]
 
-    assert model_usage_total(model_usage, "gpt-6-sol") == 9
+    assert model_usage_total(model_usage, "gpt-6.1-sol") == 9
     assert model_usage_total(model_usage, "Other") == 1
     assert model_usage_bucket_labels(model_usage) == hourly_bucket_labels(as_of, 6)
     assert length(model_usage) <= 6 * 6
 
-    assert_model_usage_point!(model_usage, "gpt-6-sol", hourly_bucket(current_bucket), %{
+    assert_model_usage_point!(model_usage, "gpt-6.1-sol", hourly_bucket(current_bucket), %{
       request_count: 1,
       input_tokens: 9,
       cached_input_tokens: 0,
@@ -1249,7 +1249,7 @@ defmodule CodexPooler.Admin.StatsTest do
 
     model =
       model_fixture(pool, %{
-        exposed_model_id: "gpt-5.5-daily",
+        exposed_model_id: "gpt-6.1-sol-daily",
         display_name: "Daily display name must not label"
       })
 
@@ -1306,11 +1306,11 @@ defmodule CodexPooler.Admin.StatsTest do
 
     model_usage = Map.fetch!(dashboard.charts, :model_usage)
 
-    assert model_usage_series_order(model_usage) == ["gpt-5.5-daily"]
+    assert model_usage_series_order(model_usage) == ["gpt-6.1-sol-daily"]
     assert model_usage_bucket_labels(model_usage) == daily_bucket_labels(as_of, 8)
     assert length(model_usage) <= 8
 
-    assert_model_usage_point!(model_usage, "gpt-5.5-daily", Date.to_iso8601(in_range_date), %{
+    assert_model_usage_point!(model_usage, "gpt-6.1-sol-daily", Date.to_iso8601(in_range_date), %{
       request_count: 3,
       input_tokens: 200,
       cached_input_tokens: 20,
@@ -1323,7 +1323,7 @@ defmodule CodexPooler.Admin.StatsTest do
 
     assert_model_usage_point!(
       model_usage,
-      "gpt-5.5-daily",
+      "gpt-6.1-sol-daily",
       Date.to_iso8601(first_visible_date),
       %{
         request_count: 2,

@@ -337,10 +337,10 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
              Smoke.accept_catalog_sync_result(:unexpected)
   end
 
-  # findings#206 206-138: the certification only considers the exact gpt-6
-  # family the Pool advertises; a lookalike id or a retired family must never
+  # Certification only considers the gpt-6 family and exact gpt-6.1-sol
+  # that the Pool advertises; a lookalike id or a retired family must never
   # become the model a tool-compatibility receipt certifies.
-  test "certification discovery keeps only exact gpt-6 family models the Pool advertises", %{
+  test "certification discovery keeps only supported family models the Pool advertises", %{
     run_id: run_id,
     run_dir: run_dir
   } do
@@ -349,21 +349,24 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
     port =
       start_models_endpoint(
         raw_key,
-        ~w(gpt-6 gpt-6-sol gpt-6-astra gpt-6-luna gpt-60 gpt-6sol gpt-5.5 gpt-5.6-sol gpt-6-sol-context)
+        ~w(gpt-6 gpt-6.1-sol gpt-6-astra gpt-6-luna gpt-60 gpt-6sol gpt-5.5 gpt-5.6-sol gpt-6.1-sol-context gpt-6.1sol gpt-6.10-sol gpt-6.1-sol-extra)
       )
 
     model = &certification_candidate/2
 
     models = [
       model.("gpt-6", %{}),
-      model.("gpt-6-sol", %{metadata: %{"upstream_model" => %{"slug" => "gpt-6-sol"}}}),
+      model.("gpt-6.1-sol", %{metadata: %{"upstream_model" => %{"slug" => "gpt-6.1-sol"}}}),
       model.("gpt-6-astra", %{}),
       model.("gpt-6-luna", %{}),
       model.("gpt-60", %{}),
       model.("gpt-6sol", %{}),
       model.("gpt-5.5", %{}),
       model.("gpt-5.6-sol", %{}),
-      model.("gpt-6-sol-context", %{supports_tools: false}),
+      model.("gpt-6.1-sol-context", %{supports_tools: false}),
+      model.("gpt-6.1sol", %{}),
+      model.("gpt-6.10-sol", %{}),
+      model.("gpt-6.1-sol-extra", %{}),
       model.("gpt-6-nano", %{})
     ]
 
@@ -382,26 +385,28 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
     # Each surviving model reaches its profile setup, which fails on the absent
     # run journal before any database write, so its id is the only signal.
     results = Process.get(:responses_tool_candidate_capability_results)
-    assert Enum.map(results, & &1.model) == ~w(gpt-6 gpt-6-astra gpt-6-sol)
+    assert Enum.map(results, & &1.model) == ~w(gpt-6 gpt-6-astra gpt-6.1-sol)
     assert Enum.all?(results, &(&1.status == "profile_setup_failed"))
   end
 
-  # findings#206 206-258: the default matrix runner certifies gpt-6-sol whenever
+  # The default matrix runner certifies gpt-6.1-sol whenever
   # the Pool stores and advertises it with tools, ahead of every other exact
   # gpt-6 model that sorts before it; otherwise the first qualifying id.
-  test "certification selection prefers a qualifying gpt-6-sol over earlier ids" do
+  test "certification selection prefers a qualifying gpt-6.1-sol over earlier ids" do
     raw_key = "sk-test-#{random_hex(8)}"
-    base_url = URI.parse("http://127.0.0.1:#{start_models_endpoint(raw_key, ~w(gpt-6 gpt-6-astra gpt-6-luna gpt-6-sol))}")
+    base_url = URI.parse("http://127.0.0.1:#{start_models_endpoint(raw_key, ~w(gpt-6 gpt-6-astra gpt-6-luna gpt-6.1-sol))}")
     select = fn models -> Smoke.select_certification_model(base_url, %{raw_key: raw_key, models: models}) end
     ids = fn models -> Enum.map(models, &certification_candidate(&1, %{})) end
 
-    assert {:ok, %{exposed_model_id: "gpt-6-sol"}} = select.(ids.(~w(gpt-6 gpt-6-astra gpt-6-sol gpt-6-luna)))
+    assert {:ok, %{exposed_model_id: "gpt-6.1-sol"}} = select.(ids.(~w(gpt-6 gpt-6-astra gpt-6.1-sol gpt-6-luna)))
 
-    # Without a qualifying gpt-6-sol the first exact family id wins.
+    assert {:ok, %{exposed_model_id: "gpt-6.1-sol"}} = select.(ids.(~w(gpt-6.1-sol)))
+
+    # Without a qualifying gpt-6.1-sol the first exact family id wins.
     assert {:ok, %{exposed_model_id: "gpt-6"}} = select.(ids.(~w(gpt-6-luna gpt-6-astra gpt-6)))
     assert {:ok, %{exposed_model_id: "gpt-6-astra"}} = select.(ids.(~w(gpt-6-luna gpt-6-astra)))
 
-    no_tools = certification_candidate("gpt-6-sol", %{supports_tools: false})
+    no_tools = certification_candidate("gpt-6.1-sol", %{supports_tools: false})
     assert {:ok, %{exposed_model_id: "gpt-6-astra"}} = select.([no_tools | ids.(~w(gpt-6-astra gpt-6-luna))])
 
     not_advertised_port = start_models_endpoint(raw_key, ~w(gpt-6-astra gpt-6-luna))
@@ -409,7 +414,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
     assert {:ok, %{exposed_model_id: "gpt-6-astra"}} =
              Smoke.select_certification_model(
                URI.parse("http://127.0.0.1:#{not_advertised_port}"),
-               %{raw_key: raw_key, models: ids.(~w(gpt-6-sol gpt-6-astra gpt-6-luna))}
+               %{raw_key: raw_key, models: ids.(~w(gpt-6.1-sol gpt-6-astra gpt-6-luna))}
              )
   end
 

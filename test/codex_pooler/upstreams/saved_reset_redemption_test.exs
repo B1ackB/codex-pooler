@@ -9693,7 +9693,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
              |> ResetProbe.bind(
                fixture.assignment_id,
                fixture.identity_id,
-               "gpt-6-sol",
+               "gpt-6.1-sol",
                "proxy_http"
              )
 

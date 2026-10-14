@@ -2632,7 +2632,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
     test "OMP GPT-6 clean first turn preserves supported Responses fields" do
       payload = %{
-        "model" => "gpt-6-sol",
+        "model" => "gpt-6.1-sol",
         "input" => [
           %{
             "role" => "user",
@@ -7949,7 +7949,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     options = %{"mode" => "explicit", "ttl" => "30m"}
 
     payload = %{
-      "model" => "gpt-6-sol",
+      "model" => "gpt-6.1-sol",
       "prompt_cache_options" => options,
       "input" => [
         %{
@@ -8069,7 +8069,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         ] do
       assert {:ok, result} =
                Responses.coerce(%{
-                 "model" => "gpt-6-sol",
+                 "model" => "gpt-6.1-sol",
                  "input" => "fixture",
                  "prompt_cache_options" => options
                })
@@ -8084,7 +8084,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     breakpoint = prompt_cache_breakpoint()
 
     payload = %{
-      "model" => "gpt-6-sol",
+      "model" => "gpt-6.1-sol",
       "prompt_cache_options" => %{"mode" => "explicit", "ttl" => "30m"},
       "messages" => [
         %{
@@ -8141,7 +8141,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
   test "Chat preserves message-part grouping around repeated special tool parts" do
     payload = %{
-      "model" => "gpt-6-sol",
+      "model" => "gpt-6.1-sol",
       "messages" => [
         %{
           "role" => "user",
@@ -8207,7 +8207,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     ]
 
     for {message, expected} <- cases do
-      assert {:error, ^expected} = Chat.coerce(%{"model" => "gpt-6-sol", "messages" => [message]})
+      assert {:error, ^expected} = Chat.coerce(%{"model" => "gpt-6.1-sol", "messages" => [message]})
     end
   end
 
@@ -8232,7 +8232,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                 param: "messages"
               }} =
                Chat.coerce(%{
-                 "model" => "gpt-6-sol",
+                 "model" => "gpt-6.1-sol",
                  "messages" => [
                    %{"role" => "tool", "tool_call_id" => "call_fixture", "content" => [part]}
                  ]
@@ -8290,7 +8290,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     for {options, expected} <- cases do
       assert {:error, ^expected} =
                Responses.coerce(%{
-                 "model" => "gpt-6-sol",
+                 "model" => "gpt-6.1-sol",
                  "input" => "fixture",
                  "prompt_cache_options" => options
                })
@@ -8333,7 +8333,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     for {breakpoint, expected} <- invalid_breakpoints do
       assert {:error, ^expected} =
                Responses.coerce(%{
-                 "model" => "gpt-6-sol",
+                 "model" => "gpt-6.1-sol",
                  "input" => [
                    %{
                      "role" => "user",
@@ -8415,7 +8415,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                 message: "message content part is not translatable",
                 param: "input"
               }} =
-               Responses.coerce(%{"model" => "gpt-6-sol", "input" => [message]})
+               Responses.coerce(%{"model" => "gpt-6.1-sol", "input" => [message]})
     end
 
     for item <- [
@@ -8472,7 +8472,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                 code: "invalid_request",
                 message: "message content part is not translatable",
                 param: "input"
-              }} = Responses.coerce(%{"model" => "gpt-6-sol", "input" => [item]})
+              }} = Responses.coerce(%{"model" => "gpt-6.1-sol", "input" => [item]})
     end
   end
 
@@ -8488,13 +8488,13 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     ]
 
     assert {:ok, %{payload: payload}} =
-             Responses.coerce(%{"model" => "gpt-6-sol", "input" => [%{"role" => "user", "content" => parts}]})
+             Responses.coerce(%{"model" => "gpt-6.1-sol", "input" => [%{"role" => "user", "content" => parts}]})
 
     assert [%{"role" => "user", "content" => ^parts}] = payload["input"]
 
     assert {:error, %{message: "message content part is not translatable"}} =
              Responses.coerce(%{
-               "model" => "gpt-6-sol",
+               "model" => "gpt-6.1-sol",
                "input" => [
                  %{
                    "role" => "user",

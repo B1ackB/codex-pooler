@@ -200,7 +200,7 @@ defmodule CodexPooler.Dev.SeedsTest do
 
     assert Enum.map(result.models, & &1.exposed_model_id) == [
              "gpt-6-luna",
-             "gpt-6-sol",
+             "gpt-6.1-sol",
              "gpt-6-astra"
            ]
 
@@ -797,7 +797,7 @@ defmodule CodexPooler.Dev.SeedsTest do
                row.available?
              }
            end) == [
-             {"gpt-6-sol", "full", "full", true},
+             {"gpt-6.1-sol", "full", "full", true},
              {"gpt-6-luna", "auto", "lite", true},
              {"gpt-6-astra", "auto", "full", true},
              {"gpt-5.5-pro", "lite", "lite", false}

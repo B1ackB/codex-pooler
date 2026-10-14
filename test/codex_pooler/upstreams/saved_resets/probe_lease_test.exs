@@ -56,14 +56,14 @@ defmodule CodexPooler.Upstreams.SavedResets.ProbeLeaseTest do
     %ProbeLease.VerifiedConfirmation{
       credential_epoch: CredentialFencing.credential_epoch(identity),
       probe: probe,
-      upstream_model: "gpt-6-sol",
+      upstream_model: "gpt-6.1-sol",
       serving_mode: :full,
       transport: :http_json
     }
   end
 
   defp admitted_confirmation!(assignment, identity, probe) do
-    accounting = ProviderCreditsDispatchSupport.context!(identity, model: probe.effective_model, upstream_model: "gpt-6-sol", transport: :http_json, route_class: probe.route_class, request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate())
+    accounting = ProviderCreditsDispatchSupport.context!(identity, model: probe.effective_model, upstream_model: "gpt-6.1-sol", transport: :http_json, route_class: probe.route_class, request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate())
 
     assert {:ok, context} =
              ProviderCreditsAdmission.new_context(%{
@@ -73,7 +73,7 @@ defmodule CodexPooler.Upstreams.SavedResets.ProbeLeaseTest do
                upstream_identity_id: identity.id,
                credential_epoch: CredentialFencing.credential_epoch(identity),
                model: probe.effective_model,
-               upstream_model: "gpt-6-sol",
+               upstream_model: "gpt-6.1-sol",
                serving_mode: :full,
                transport: :http_json,
                route_class: probe.route_class,
@@ -97,7 +97,7 @@ defmodule CodexPooler.Upstreams.SavedResets.ProbeLeaseTest do
   end
 
   defp grace_scope(assignment, identity, probe),
-    do: %{pool_upstream_assignment_id: assignment.id, upstream_identity_id: identity.id, model: probe.effective_model, upstream_model: "gpt-6-sol", route_class: probe.route_class, serving_mode: :full, transport: :http_json}
+    do: %{pool_upstream_assignment_id: assignment.id, upstream_identity_id: identity.id, model: probe.effective_model, upstream_model: "gpt-6.1-sol", route_class: probe.route_class, serving_mode: :full, transport: :http_json}
 
   defp snapshot(identity, now), do: Map.fetch!(RoutingQuotaSnapshot.load_by_identity_ids([identity.id], now), identity.id)
 
@@ -107,7 +107,7 @@ defmodule CodexPooler.Upstreams.SavedResets.ProbeLeaseTest do
              |> ResetProbe.bind(
                assignment.id,
                identity.id,
-               "gpt-6-sol",
+               "gpt-6.1-sol",
                "proxy_http"
              )
 

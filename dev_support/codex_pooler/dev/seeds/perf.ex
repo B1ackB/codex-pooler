@@ -34,7 +34,7 @@ defmodule CodexPooler.Dev.Seeds.Perf do
   @perf_bootstrap_dir "tmp/gateway-perf/bootstrap"
   @perf_env_path Path.join(@perf_bootstrap_dir, "perf.env")
   @perf_summary_path Path.join(@perf_bootstrap_dir, "seed-summary.json")
-  @perf_model_ids ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]
+  @perf_model_ids ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"]
 
   @spec run(%{required(:owner) => User.t(), optional(:upstream_base_url) => String.t()}) :: map()
   def run(%{owner: owner} = context) do

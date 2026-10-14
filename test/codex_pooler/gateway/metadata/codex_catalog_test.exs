@@ -12,11 +12,11 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
   # behaviour run through `build_selected_sources/4`.
 
   test "preserves the upstream default and opt-in maximum in the native Codex catalog" do
-    source = Map.put(gpt6_context_metadata(), "slug", "gpt-6-sol-context")
+    source = Map.put(gpt6_context_metadata(), "slug", "gpt-6.1-sol-context")
 
     assert {:ok, result} =
              CodexCatalog.build_selected_sources(
-               [{model("gpt-6-sol-context", %{}), source}],
+               [{model("gpt-6.1-sol-context", %{}), source}],
                unrestricted_policy(),
                %{},
                %{}
@@ -42,7 +42,7 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
 
   test "canonical fixture source preserves released-client capability booleans" do
     source = %{
-      "slug" => "gpt-6-sol",
+      "slug" => "gpt-6.1-sol",
       "supports_responses" => true,
       "supports_streaming" => true,
       "supports_tools" => true,
@@ -56,7 +56,7 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
       }
     }
 
-    assert {:ok, result} = selected([{model("gpt-6-sol", %{}), source}])
+    assert {:ok, result} = selected([{model("gpt-6.1-sol", %{}), source}])
 
     assert [projected] = result.body["models"]
     assert projected["supports_responses"]
