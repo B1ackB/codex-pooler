@@ -3498,10 +3498,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
         {:error, :stale_generation} ->
           WebTelemetry.emit_lifecycle_authorization(:internal_delivery, :stale_generation, started_at)
           :stale_generation
-
-        {:error, _reason} ->
-          WebTelemetry.emit_lifecycle_authorization(:internal_delivery, :other, started_at)
-          :stale_generation
       end
     rescue
       Ecto.NoResultsError ->
@@ -3668,10 +3664,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
         {:error, :stale_generation} = stale ->
           WebTelemetry.emit_lifecycle_authorization(:writer_delivery, :stale_generation, started_at)
           stale
-
-        {:error, _reason} = other ->
-          WebTelemetry.emit_lifecycle_authorization(:writer_delivery, :other, started_at)
-          other
       end
     rescue
       Ecto.NoResultsError ->
