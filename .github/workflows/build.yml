@@ -22,7 +22,7 @@ permissions:
 jobs:
   select:
     if: github.event_name != 'status' || (github.event.context == 'continuous-integration/drone/push' && github.event.state == 'success')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       ready: ${{ steps.publication.outputs.ready }}
       release_tag: ${{ steps.prepare.outputs.release_tag }}
@@ -123,10 +123,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             slug: amd64
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             slug: arm64
     runs-on: ${{ matrix.runner }}
 
@@ -202,7 +202,7 @@ jobs:
   publish:
     needs: [select, image]
     if: ${{ !cancelled() && needs.select.result == 'success' && needs.select.outputs.ready == 'true' && (needs.image.result == 'success' || needs.image.result == 'skipped') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     concurrency:
       group: release-image-publication
       queue: max

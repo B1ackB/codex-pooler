@@ -55,7 +55,7 @@ test("publication queues every pending release and recovery steps also run for r
 });
 
 test("each platform is built natively and only the publish job tags the merged index", () => {
-	assert.match(workflow, /runner: ubuntu-24\.04-arm/);
+	assert.match(workflow, /runner: ubuntu-26\.04-arm/);
 	assert.doesNotMatch(workflow, /setup-qemu-action/);
 	const build = step("Build and push the platform image by digest");
 	assert.match(build, /platforms: \$\{\{ matrix\.platform \}\}/);

@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   release-policy:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - run: node --test test/scripts/release_publish_*_test.mjs assets/js/*_test.mjs
