@@ -48,6 +48,10 @@ function buildPanel(spec) {
       .tooltip(new common.VizTooltipOptionsBuilder().mode(common.TooltipDisplayMode.Multi));
   }
 
+  for (const override of spec.overrides ?? []) {
+    panel.overrideByRegexp(override.regexp, override.properties);
+  }
+
   for (const query of spec.queries) {
     panel.withTarget(
       new prometheus.DataqueryBuilder()
