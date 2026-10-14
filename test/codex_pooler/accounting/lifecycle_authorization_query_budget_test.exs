@@ -17,7 +17,6 @@ defmodule CodexPooler.Accounting.LifecycleAuthorizationQueryBudgetTest do
     turn_lock
     request_lock
     attempt_lock
-    latest_attempt_lock
     entitlement_lock
     ledger_lock
   )a
@@ -27,23 +26,22 @@ defmodule CodexPooler.Accounting.LifecycleAuthorizationQueryBudgetTest do
     turn_session_lookup
     request_lock
     attempt_lock
-    latest_attempt_lock
     entitlement_lock
     ledger_lock
   )a
 
-  test "tracked turn stays within the ten-purpose lifecycle authorization budget" do
+  test "tracked turn stays within the nine-purpose lifecycle authorization budget" do
     fixture = replay_fixture(reservation?: true)
 
     {result, statements} = capture_repo_queries(fn -> authorize(fixture) end)
 
     assert {:ok, :callback_ran} = result
     assert {:ok, summary} = validate_budget(statements, @tracked_purposes)
-    assert summary.select_count == 10
+    assert summary.select_count == 9
     assert summary.purposes == @tracked_purposes
   end
 
-  test "request without a turn stays within the seven-purpose lifecycle authorization budget" do
+  test "request without a turn stays within the six-purpose lifecycle authorization budget" do
     fixture = replay_fixture(reservation?: true)
     Repo.delete!(fixture.turn)
 
@@ -51,8 +49,57 @@ defmodule CodexPooler.Accounting.LifecycleAuthorizationQueryBudgetTest do
 
     assert {:ok, :callback_ran} = result
     assert {:ok, summary} = validate_budget(statements, @no_turn_purposes)
-    assert summary.select_count == 7
+    assert summary.select_count == 6
     assert summary.purposes == @no_turn_purposes
+  end
+
+  test "stale generation refuses without invoking the callback" do
+    fixture = replay_fixture(reservation?: true)
+    Repo.update!(Ecto.Changeset.change(fixture.attempt, replay_generation: 1))
+
+    parent = self()
+
+    assert {:error, :stale_generation} =
+             Accounting.with_current_lifecycle_generation(fixture.request, fixture.attempt, fn ->
+               send(parent, :lifecycle_callback_ran)
+               :callback_ran
+             end)
+
+    refute_received :lifecycle_callback_ran
+  end
+
+  test "missing reservation refuses before invoking the callback" do
+    fixture = replay_fixture(reservation?: false)
+    parent = self()
+
+    assert_raise Ecto.NoResultsError, fn ->
+      Accounting.with_current_lifecycle_generation(fixture.request, fixture.attempt, fn ->
+        send(parent, :lifecycle_callback_ran)
+        :callback_ran
+      end)
+    end
+
+    refute_received :lifecycle_callback_ran
+  end
+
+  test "missing request and attempt preserve no-results refusal" do
+    missing_request = %Request{id: Ecto.UUID.generate()}
+    missing_attempt = %CodexPooler.Accounting.Attempt{id: Ecto.UUID.generate(), request_id: missing_request.id}
+
+    assert_raise Ecto.NoResultsError, fn ->
+      Accounting.with_current_lifecycle_generation(missing_request, missing_attempt, fn ->
+        :callback_ran
+      end)
+    end
+
+    fixture = replay_fixture(reservation?: true)
+    Repo.delete!(fixture.attempt)
+
+    assert_raise Ecto.NoResultsError, fn ->
+      Accounting.with_current_lifecycle_generation(fixture.request, fixture.attempt, fn ->
+        :callback_ran
+      end)
+    end
   end
 
   test "setup query contamination is rejected" do
@@ -69,7 +116,7 @@ defmodule CodexPooler.Accounting.LifecycleAuthorizationQueryBudgetTest do
   end
 
   defp authorize(fixture) do
-    Accounting.with_current_replay_generation(fixture.request, fixture.attempt, fn ->
+    Accounting.with_current_lifecycle_generation(fixture.request, fixture.attempt, fn ->
       :callback_ran
     end)
   end

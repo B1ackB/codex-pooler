@@ -251,6 +251,12 @@ defmodule CodexPooler.Accounting do
         when result: term()
   defdelegate with_current_replay_generation(request, attempt, callback), to: RequestLifecycle
 
+  @doc false
+  @spec with_current_lifecycle_generation(Request.t(), Attempt.t(), (-> result)) ::
+          {:ok, result} | {:error, :stale_generation}
+        when result: term()
+  defdelegate with_current_lifecycle_generation(request, attempt, callback), to: RequestLifecycle
+
   @spec mark_attempt_upstream_transport(Attempt.t(), String.t()) ::
           {:ok, Attempt.t()} | {:error, Ecto.Changeset.t()}
   defdelegate mark_attempt_upstream_transport(attempt, transport), to: RequestLifecycle

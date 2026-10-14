@@ -375,6 +375,27 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
     |> unwrap_transaction()
   end
 
+  @doc false
+  @spec with_current_lifecycle_generation(Request.t(), Attempt.t(), (-> result)) ::
+          {:ok, result} | {:error, :stale_generation}
+        when result: term()
+  def with_current_lifecycle_generation(%Request{} = request, %Attempt{} = attempt, callback)
+      when is_function(callback, 0) do
+    Repo.transaction(fn ->
+      request = Repo.get!(Request, request.id)
+
+      {_request, attempt, _reservation, entitlement} =
+        lock_lifecycle_rows(request, attempt)
+
+      if replay_finalization_authority(attempt, entitlement, %{}) == :stale_generation do
+        Repo.rollback(:stale_generation)
+      else
+        callback.()
+      end
+    end)
+    |> unwrap_transaction()
+  end
+
   defp ensure_request_dispatchable!(%Request{status: status, completed_at: nil})
        when status in @dispatchable_request_statuses,
        do: :ok
@@ -1186,6 +1207,53 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
     |> Repo.update!()
 
     :ok
+  end
+
+  defp lock_lifecycle_rows(%Request{} = request, %Attempt{} = attempt) do
+    :ok = lock_replay_prefix(request)
+
+    request =
+      Repo.one!(
+        from locked_request in Request,
+          where: locked_request.id == ^request.id,
+          lock: "FOR UPDATE"
+      )
+
+    attempt =
+      Repo.one!(
+        from locked_attempt in Attempt,
+          where: locked_attempt.id == ^attempt.id,
+          lock: "FOR UPDATE"
+      )
+
+    entitlement =
+      Repo.one(
+        from replay in RequestReplayEntitlement,
+          where: replay.request_id == ^request.id,
+          lock: "FOR UPDATE"
+      )
+
+    reservation_source_event_id = LedgerEntries.reservation_source_event_id(request.id)
+
+    reservation_query =
+      from entry in LedgerEntry,
+        where: entry.source_event_id == ^reservation_source_event_id
+
+    ledger_entries =
+      Repo.all(
+        from entry in LedgerEntry,
+          where:
+            entry.request_id == ^request.id and
+              (entry.source_event_id == ^reservation_source_event_id or
+                 (entry.entry_kind == "settlement" and entry.amount_status == "recorded")),
+          lock: "FOR UPDATE"
+      )
+
+    reservation =
+      Enum.find(ledger_entries, &(&1.source_event_id == reservation_source_event_id)) ||
+        raise Ecto.NoResultsError, queryable: reservation_query
+
+    {request, attempt, reservation, entitlement}
   end
 
   defp lock_finalization_rows(%Request{} = request, %Attempt{} = attempt) do
