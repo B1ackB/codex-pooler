@@ -566,6 +566,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   defp start_saved_reset_status(socket, force?) do
     scope = socket.assigns.current_scope
     identity_id = socket.assigns.cockpit.identity.id
+    deletion_state = socket.assigns.cockpit.deletion_state
 
     token = %{
       generation: socket.assigns.saved_reset_status_generation + 1,
@@ -577,7 +578,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
     socket
     |> assign(saved_reset_status_generation: token.generation, saved_reset_status_running: token, saved_reset_status_rerun?: false, saved_reset_status_force?: false)
     |> start_async({:saved_reset_status, token}, fn ->
-      UpstreamCockpitReadModel.load_visible_without_request_metrics(scope, identity_id)
+      UpstreamCockpitReadModel.refresh_visible_status(scope, identity_id, deletion_state)
     end)
   end
 
@@ -592,17 +593,26 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   defp scope_signature(scope), do: {scope.user.id, scope.roles, scope.assigned_pool_ids}
 
   defp apply_saved_reset_status(socket, {:ok, cockpit}, token) do
-    if UpstreamAccountsReadModel.newer_saved_reset_refresh_cursor?(cockpit.saved_reset_refresh_cursor, token.cursor) do
+    if cockpit.deletion_state != socket.assigns.cockpit.deletion_state or UpstreamAccountsReadModel.newer_saved_reset_refresh_cursor?(cockpit.saved_reset_refresh_cursor, token.cursor) do
       assign_cockpit(socket, preserve_request_metrics(socket, cockpit))
     else
       socket
     end
   end
 
-  defp apply_saved_reset_status(socket, :error, _token) do
+  defp apply_saved_reset_status(socket, :deleted, _token) do
     socket
     |> clear_inaccessible_cockpit()
-    |> put_flash(:info, "Your Pool access changed")
+    |> put_flash(:info, "Upstream account permanently deleted")
+    |> push_navigate(to: ~p"/admin/upstreams")
+  end
+
+  defp apply_saved_reset_status(socket, :error, _token) do
+    message = if socket.assigns.cockpit.deletion_state in [:in_progress, :failed], do: "Upstream account is no longer available", else: "Your Pool access changed"
+
+    socket
+    |> clear_inaccessible_cockpit()
+    |> put_flash(:info, message)
     |> push_navigate(to: ~p"/admin/upstreams")
   end
 
@@ -646,7 +656,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
     operation = cockpit && cockpit.saved_reset_operation
 
     cockpit != nil and
-      (socket.assigns[:quota_observations_open?] == true or
+      (cockpit.deletion_state in [:in_progress, :failed] or socket.assigns[:quota_observations_open?] == true or
          (is_map(operation) and (operation.active? or operation.request.state in [:queued, :processing])))
   end
 
@@ -664,7 +674,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
         do: SavedResetOperationProjection.observe(operation, paused?: true),
         else: operation
 
-    cockpit |> Map.delete(:saved_reset_refresh_cursor) |> Map.put(:saved_reset_status_refreshing?, assigns.saved_reset_status_running != nil) |> Map.put(:saved_reset_operation, operation)
+    cockpit |> Map.delete(:saved_reset_refresh_cursor) |> Map.put(:saved_reset_status_refreshing?, assigns.saved_reset_status_running != nil) |> Map.put(:saved_reset_operation, operation) |> Map.put(:deletion_updates_paused?, assigns[:live_updates_paused?] == true)
   end
 
   defp request_cockpit_metrics(socket) do

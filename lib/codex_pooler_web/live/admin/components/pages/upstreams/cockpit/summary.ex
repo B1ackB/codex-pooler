@@ -9,6 +9,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting, as: ResetFormatting
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting
   alias CodexPoolerWeb.Admin.UpstreamCockpitReadModel
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.DeletionNotice
 
   @doc """
   Relink in progress: a status timeline for the account's pending OAuth flow,
@@ -246,6 +247,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
     ~H"""
     <section
       id="upstream-cockpit-header"
+      data-deletion-state={Map.get(@cockpit, :deletion_state, :none)}
       aria-label="Account identity"
       class="relative min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100"
     >
@@ -304,6 +306,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
           title={workspace_title(@cockpit.identity)}
         />
       </dl>
+      <div :if={Map.get(@cockpit, :deletion_state) == :in_progress} class="border-t border-base-300 p-4">
+        <DeletionNotice.deletion_notice
+          id="upstream-cockpit-deletion-notice"
+          label={@cockpit.header.title}
+          paused={Map.get(@cockpit, :deletion_updates_paused?, false)}
+          surface={:cockpit}
+        />
+      </div>
     </section>
     """
   end

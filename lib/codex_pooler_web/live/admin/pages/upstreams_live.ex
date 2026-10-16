@@ -1039,18 +1039,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   end
 
   defp saved_reset_status_targets(socket) do
-    if unrelated_upstream_dialog_open?(socket) do
-      []
-    else
-      editing_id = get_in(socket.assigns, [:editing_saved_reset_policy, :identity, Access.key(:id)])
+    editing_id = get_in(socket.assigns, [:editing_saved_reset_policy, :identity, Access.key(:id)])
+    unrelated_dialog? = unrelated_upstream_dialog_open?(socket)
 
-      socket.assigns.upstream_accounts
-      |> Enum.filter(fn account ->
-        account.identity.id == editing_id or socket.assigns[:quota_observations_open?] == true or
-          get_in(account, [:saved_reset_operation, :active?]) == true
-      end)
-      |> Enum.map(& &1.identity.id)
-    end
+    socket.assigns.upstream_accounts
+    |> Enum.filter(fn account ->
+      account.deletion_state in [:in_progress, :failed] or
+        (not unrelated_dialog? and
+           (account.identity.id == editing_id or socket.assigns[:quota_observations_open?] == true or
+              get_in(account, [:saved_reset_operation, :active?]) == true))
+    end)
+    |> Enum.map(& &1.identity.id)
   end
 
   defp unrelated_upstream_dialog_open?(socket) do
@@ -1121,6 +1120,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
           not MapSet.member?(targets, id) -> [current]
           current.saved_reset_refresh_cursor != running.cursors[id] -> [current]
           not Map.has_key?(fresh, id) -> []
+          fresh[id].deletion_state != current.deletion_state -> [fresh[id]]
           UpstreamAccountsReadModel.newer_saved_reset_refresh_cursor?(fresh[id].saved_reset_refresh_cursor, current.saved_reset_refresh_cursor) -> [fresh[id]]
           true -> [current]
         end
@@ -1178,7 +1178,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
     decorate = fn account ->
       operation = SavedResetOperationProjection.observe(account.saved_reset_operation, paused?: paused?, connected?: connected?)
 
-      account |> Map.put(:saved_reset_operation, operation) |> Map.put(:saved_reset_status_refreshing?, running != nil and account.identity.id in running.identity_ids)
+      account |> Map.put(:saved_reset_operation, operation) |> Map.put(:saved_reset_status_refreshing?, running != nil and account.identity.id in running.identity_ids) |> Map.put(:deletion_updates_paused?, paused?)
     end
 
     assigns

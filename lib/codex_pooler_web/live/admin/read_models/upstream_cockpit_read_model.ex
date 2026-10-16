@@ -6,6 +6,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   alias CodexPooler.Admin.{UpstreamCircuitReadiness, UpstreamCockpitMetrics}
   alias CodexPooler.Audit
   alias CodexPooler.Pools
+  alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Auth.{AccessTokenExpiry, TokenRefreshMetadata}
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
@@ -151,6 +152,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   @type oauth_flow_state :: UpstreamAccountsReadModel.oauth_flow_state()
   @type t :: %{
           required(:identity) => safe_identity(),
+          required(:deletion_state) => :in_progress | :failed | nil,
           required(:header) => header(),
           required(:assignments) => assignments(),
           required(:charts) => charts(),
@@ -182,6 +184,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   @spec load_visible_without_request_metrics(term(), Ecto.UUID.t()) :: {:ok, t()} | :error
   def load_visible_without_request_metrics(scope, identity_id) when is_binary(identity_id) do
     load_visible(scope, identity_id, request_metrics?: false, request_events?: false)
+  end
+
+  @doc "Status refresh for an already visible account, distinguishing removal from lost access."
+  @spec refresh_visible_status(Scope.t(), Ecto.UUID.t(), :in_progress | :failed | nil) :: {:ok, t()} | :deleted | :error
+  def refresh_visible_status(%Scope{} = scope, identity_id, previous_deletion_state) do
+    case load_visible_without_request_metrics(scope, identity_id) do
+      :error ->
+        if previous_deletion_state in [:in_progress, :failed] and Pools.owner?(scope) and is_nil(Upstreams.get_upstream_identity(identity_id)), do: :deleted, else: :error
+
+      result ->
+        result
+    end
   end
 
   @spec deferred_request_data(Scope.t(), t()) :: %{
@@ -337,6 +351,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
 
     %{
       identity: safe_identity,
+      deletion_state: Map.get(account, :deletion_state),
       header: header,
       assignments: assignments,
       charts: charts,

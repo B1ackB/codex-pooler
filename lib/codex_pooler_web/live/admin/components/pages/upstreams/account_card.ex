@@ -18,6 +18,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   }
 
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.{
+    DeletionNotice,
     ProviderCreditsComponents,
     ReconciliationStatus,
     ReinviteLink,
@@ -51,6 +52,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     assigns =
       assigns
       |> assign(:datetime_preferences, datetime_preferences)
+      |> assign(:deleting?, Map.get(assigns.account, :deletion_state) == :in_progress)
       |> assign(:reported_quota_limits, reported_quota_limits(assigns.account.quota_limits))
       |> assign(:workspace_context_label, workspace_context_label(assigns.account))
       |> assign(:workspace_context_title, workspace_context_title(assigns.account))
@@ -70,380 +72,396 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     <article
       id={"upstream-account-#{@account.identity.id}"}
       data-role="upstream-account-card"
+      data-deletion-state={Map.get(@account, :deletion_state, :none)}
       data-routing-state={@routing_readiness.state}
       data-routing-tone={@routing_readiness.tone}
       data-routing-ready-now={to_string(@routing_readiness.routing_ready_now?)}
       class={[
         "upstream-account-card min-w-0 rounded-box border border-base-300 bg-base-100 transition-colors",
+        @deleting? && "grid isolate",
         token_burn_active?(@account) && "admin-token-burn-active"
       ]}
       style={quota_shine_style(@account, @account_index)}
     >
-      <header
-        data-role="upstream-account-card-header"
-        class="flex items-center justify-between gap-2 border-b border-base-300 bg-base-200/35 px-4 py-3"
+      <div
+        data-role="upstream-account-card-content"
+        inert={@deleting?}
+        aria-busy={to_string(@deleting?)}
+        class={@deleting? && "pointer-events-none col-start-1 row-start-1 min-w-0 opacity-35"}
       >
-        <div class="min-w-0 flex-1">
-          <div class="flex flex-wrap items-center gap-2">
-            <h3 class="min-w-0 max-w-full text-base font-semibold leading-5 text-base-content">
-              <.link
-                id={"upstream-account-#{@account.identity.id}-mail"}
-                navigate={~p"/admin/upstreams/#{@account.identity.id}"}
-                class="block truncate hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-              >
-                {@account.label}
-              </.link>
-            </h3>
-            <span
-              :if={@workspace_context_label != ""}
-              id={"upstream-account-#{@account.identity.id}-workspace"}
-              data-role="upstream-workspace-context"
-              class={[
-                AdminBadges.metadata_chip_class(:neutral),
-                "!px-2 !py-0.5 !text-[10px] shrink-0 max-w-48 truncate"
-              ]}
-              title={@workspace_context_title}
-            >
-              {@workspace_context_label}
-            </span>
-          </div>
-          <p
-            id={"upstream-account-#{@account.identity.id}-auth-expiration"}
-            data-role="upstream-auth-expiration"
-            class="truncate text-xs leading-4 text-base-content/55"
-            title={@auth_expiration.title}
-          >
-            {@auth_expiration.label}
-          </p>
-        </div>
-        <div
-          id={"upstream-account-#{@account.identity.id}-header-actions"}
-          class="flex shrink-0 items-center gap-2 self-center"
+        <header
+          data-role="upstream-account-card-header"
+          class="flex items-center justify-between gap-2 border-b border-base-300 bg-base-200/35 px-4 py-3"
         >
-          <.upstream_plan_indicator account={@account} account_index={@account_index} />
-          <.upstream_account_actions account={@account} />
-        </div>
-      </header>
-
-      <div class="grid gap-4 p-4">
-        <div
-          id={"upstream-account-#{@account.identity.id}-panel-switcher"}
-          data-role="upstream-account-panel-switcher"
-          data-panel-view={@panel_view}
-          class="grid min-w-0"
-        >
-          <section
-            id={"upstream-account-#{@account.identity.id}-usage-panel"}
-            data-role="upstream-account-usage-panel"
-            aria-hidden={aria_bool(@panel_view != :usage)}
-            inert={@panel_view != :usage}
-            class={account_panel_class(@panel_view == :usage)}
-          >
-            <div class="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
-              <div class="min-w-0">
-                <p class="text-xs font-semibold uppercase text-primary">Status</p>
-                <p
-                  id={"upstream-account-#{@account.identity.id}-limits-summary"}
-                  class="truncate text-xs text-base-content/60"
+          <div class="min-w-0 flex-1">
+            <div class="flex flex-wrap items-center gap-2">
+              <h3 class="min-w-0 max-w-full text-base font-semibold leading-5 text-base-content">
+                <.link
+                  id={"upstream-account-#{@account.identity.id}-mail"}
+                  navigate={~p"/admin/upstreams/#{@account.identity.id}"}
+                  class="block truncate hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
                 >
-                  {account_status_label(@account)}
-                </p>
+                  {@account.label}
+                </.link>
+              </h3>
+              <span
+                :if={@workspace_context_label != ""}
+                id={"upstream-account-#{@account.identity.id}-workspace"}
+                data-role="upstream-workspace-context"
+                class={[
+                  AdminBadges.metadata_chip_class(:neutral),
+                  "!px-2 !py-0.5 !text-[10px] shrink-0 max-w-48 truncate"
+                ]}
+                title={@workspace_context_title}
+              >
+                {@workspace_context_label}
+              </span>
+            </div>
+            <p
+              id={"upstream-account-#{@account.identity.id}-auth-expiration"}
+              data-role="upstream-auth-expiration"
+              class="truncate text-xs leading-4 text-base-content/55"
+              title={@auth_expiration.title}
+            >
+              {@auth_expiration.label}
+            </p>
+          </div>
+          <div
+            id={"upstream-account-#{@account.identity.id}-header-actions"}
+            class="flex shrink-0 items-center gap-2 self-center"
+          >
+            <.upstream_plan_indicator account={@account} account_index={@account_index} />
+            <.upstream_account_actions account={@account} />
+          </div>
+        </header>
+
+        <div class="grid gap-4 p-4">
+          <div
+            id={"upstream-account-#{@account.identity.id}-panel-switcher"}
+            data-role="upstream-account-panel-switcher"
+            data-panel-view={@panel_view}
+            class="grid min-w-0"
+          >
+            <section
+              id={"upstream-account-#{@account.identity.id}-usage-panel"}
+              data-role="upstream-account-usage-panel"
+              aria-hidden={aria_bool(@panel_view != :usage)}
+              inert={@panel_view != :usage}
+              class={account_panel_class(@panel_view == :usage)}
+            >
+              <div class="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+                <div class="min-w-0">
+                  <p class="text-xs font-semibold uppercase text-primary">Status</p>
+                  <p
+                    id={"upstream-account-#{@account.identity.id}-limits-summary"}
+                    class="truncate text-xs text-base-content/60"
+                  >
+                    {account_status_label(@account)}
+                  </p>
+                </div>
+                <div
+                  id={"upstream-account-#{@account.identity.id}-token-burn"}
+                  data-role="upstream-token-burn-summary"
+                  data-usage-state={token_burn_usage_state(@account)}
+                  class="text-right"
+                >
+                  <p
+                    id={"upstream-account-#{@account.identity.id}-token-burn-label"}
+                    class="text-xs font-semibold uppercase text-primary"
+                  >
+                    TOKEN BURN
+                  </p>
+                  <TokenBurnPopover.token_burn_popover
+                    id={"upstream-account-#{@account.identity.id}-token-burn-value"}
+                    content_id={"upstream-account-#{@account.identity.id}-token-burn-content"}
+                    token_burn={@account.token_burn}
+                  />
+                </div>
               </div>
               <div
-                id={"upstream-account-#{@account.identity.id}-token-burn"}
-                data-role="upstream-token-burn-summary"
-                data-usage-state={token_burn_usage_state(@account)}
-                class="text-right"
+                id={"upstream-account-#{@account.identity.id}-limits"}
+                data-role="upstream-account-quota-limits"
+                class={quota_limits_grid_class(@reported_quota_limits)}
               >
-                <p
-                  id={"upstream-account-#{@account.identity.id}-token-burn-label"}
-                  class="text-xs font-semibold uppercase text-primary"
-                >
-                  TOKEN BURN
-                </p>
-                <TokenBurnPopover.token_burn_popover
-                  id={"upstream-account-#{@account.identity.id}-token-burn-value"}
-                  content_id={"upstream-account-#{@account.identity.id}-token-burn-content"}
-                  token_burn={@account.token_burn}
+                <QuotaLimitRow.quota_limit_row
+                  :for={limit <- @reported_quota_limits}
+                  id={"upstream-account-#{@account.identity.id}-limit-#{limit.key}"}
+                  limit={limit}
+                />
+                <ProviderCreditsComponents.provider_credits_summary
+                  :if={Map.has_key?(@account, :provider_credits_summary)}
+                  id={"upstream-account-#{@account.identity.id}-provider-credits"}
+                  summary={@account.provider_credits_summary}
+                  open_policy={if @account.can_manage_provider_credits? and @account.identity.status != "deleted", do: JS.push_focus() |> JS.push("open_provider_credits_policy", value: %{id: @account.identity.id})}
+                />
+                <SavedResetMeter.saved_reset_meter
+                  :if={@account.identity.status != "deleted" and saved_reset_panel_available?(@saved_resets, @saved_reset_confirmation)}
+                  id={"upstream-account-#{@account.identity.id}-saved-reset-meter"}
+                  identity_id={@account.identity.id}
+                  saved_resets={@saved_resets}
+                  saved_reset_policy={@saved_reset_policy}
+                  class={saved_reset_meter_grid_class(@reported_quota_limits)}
                 />
               </div>
-            </div>
-            <div
-              id={"upstream-account-#{@account.identity.id}-limits"}
-              data-role="upstream-account-quota-limits"
-              class={quota_limits_grid_class(@reported_quota_limits)}
-            >
-              <QuotaLimitRow.quota_limit_row
-                :for={limit <- @reported_quota_limits}
-                id={"upstream-account-#{@account.identity.id}-limit-#{limit.key}"}
-                limit={limit}
-              />
-              <ProviderCreditsComponents.provider_credits_summary
-                :if={Map.has_key?(@account, :provider_credits_summary)}
-                id={"upstream-account-#{@account.identity.id}-provider-credits"}
-                summary={@account.provider_credits_summary}
-                open_policy={if @account.can_manage_provider_credits? and @account.identity.status != "deleted", do: JS.push_focus() |> JS.push("open_provider_credits_policy", value: %{id: @account.identity.id})}
-              />
-              <SavedResetMeter.saved_reset_meter
-                :if={@account.identity.status != "deleted" and saved_reset_panel_available?(@saved_resets, @saved_reset_confirmation)}
-                id={"upstream-account-#{@account.identity.id}-saved-reset-meter"}
+              <AdminComponents.saved_reset_operation
+                :if={Map.has_key?(@account, :saved_reset_operation) && SavedResetOperation.list_visible?(@account.saved_reset_operation)}
                 identity_id={@account.identity.id}
-                saved_resets={@saved_resets}
-                saved_reset_policy={@saved_reset_policy}
-                class={saved_reset_meter_grid_class(@reported_quota_limits)}
+                surface={:list}
+                operation={@account.saved_reset_operation}
+                refreshing={Map.get(@account, :saved_reset_status_refreshing?, false)}
+                status_view_disabled={UpstreamAccountActions.assignment_unavailable_reason(@account.assignments) != nil or @account.identity.status == "deleted"}
               />
-            </div>
-            <AdminComponents.saved_reset_operation
-              :if={Map.has_key?(@account, :saved_reset_operation) && SavedResetOperation.list_visible?(@account.saved_reset_operation)}
-              identity_id={@account.identity.id}
-              surface={:list}
-              operation={@account.saved_reset_operation}
-              refreshing={Map.get(@account, :saved_reset_status_refreshing?, false)}
-              status_view_disabled={UpstreamAccountActions.assignment_unavailable_reason(@account.assignments) != nil or @account.identity.status == "deleted"}
-            />
-          </section>
+            </section>
 
-          <section
-            id={"upstream-account-#{@account.identity.id}-tokens-panel"}
-            data-role="upstream-account-tokens-panel"
-            aria-hidden={aria_bool(@panel_view != :tokens)}
-            inert={@panel_view != :tokens}
-            class={account_panel_class(@panel_view == :tokens)}
-          >
-            <div class="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
-              <div class="min-w-0">
-                <p class="text-xs font-semibold uppercase text-primary">
-                  tokens/<span class="normal-case">5m</span>
-                </p>
-                <p
-                  id={"upstream-account-#{@account.identity.id}-tokens-summary"}
-                  class="truncate text-xs text-base-content/60"
-                >
-                  {tokens_panel_summary(@token_leaderboard)}
-                </p>
-              </div>
-              <div class="min-w-0 text-right">
-                <p class="text-xs font-semibold uppercase text-primary">Requests</p>
-                <p
-                  id={"upstream-account-#{@account.identity.id}-tokens-requests-summary"}
-                  class="truncate text-xs text-base-content/60"
-                  title="Settled requests in the last 5 minutes"
-                >
-                  {recent_request_count_label(@account)}
-                </p>
-              </div>
-            </div>
-
-            <div
-              id={"upstream-account-#{@account.identity.id}-token-models"}
-              data-role="upstream-account-token-models"
-              class="upstream-account-token-model-grid grid max-h-[24rem] content-start gap-0.5 overflow-y-auto pr-1"
+            <section
+              id={"upstream-account-#{@account.identity.id}-tokens-panel"}
+              data-role="upstream-account-tokens-panel"
+              aria-hidden={aria_bool(@panel_view != :tokens)}
+              inert={@panel_view != :tokens}
+              class={account_panel_class(@panel_view == :tokens)}
             >
-              <p
-                :if={@token_leaderboard == []}
-                data-role="upstream-account-token-models-empty"
-                class="text-xs text-base-content/60"
-              >
-                No models advertised or used in the last 5 minutes.
-              </p>
+              <div class="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+                <div class="min-w-0">
+                  <p class="text-xs font-semibold uppercase text-primary">
+                    tokens/<span class="normal-case">5m</span>
+                  </p>
+                  <p
+                    id={"upstream-account-#{@account.identity.id}-tokens-summary"}
+                    class="truncate text-xs text-base-content/60"
+                  >
+                    {tokens_panel_summary(@token_leaderboard)}
+                  </p>
+                </div>
+                <div class="min-w-0 text-right">
+                  <p class="text-xs font-semibold uppercase text-primary">Requests</p>
+                  <p
+                    id={"upstream-account-#{@account.identity.id}-tokens-requests-summary"}
+                    class="truncate text-xs text-base-content/60"
+                    title="Settled requests in the last 5 minutes"
+                  >
+                    {recent_request_count_label(@account)}
+                  </p>
+                </div>
+              </div>
 
               <div
-                :for={row <- @token_leaderboard}
-                id={"upstream-account-#{@account.identity.id}-token-model-#{row.dom_id}"}
-                data-role="upstream-account-token-model"
-                class="upstream-account-token-model-row grid min-w-0 items-center rounded px-2 py-1.5 text-xs odd:bg-base-200/40"
+                id={"upstream-account-#{@account.identity.id}-token-models"}
+                data-role="upstream-account-token-models"
+                class="upstream-account-token-model-grid grid max-h-[24rem] content-start gap-0.5 overflow-y-auto pr-1"
               >
-                <div
-                  data-role="upstream-account-token-model-id"
-                  class="min-w-0"
-                  title={row.label}
+                <p
+                  :if={@token_leaderboard == []}
+                  data-role="upstream-account-token-models-empty"
+                  class="text-xs text-base-content/60"
                 >
-                  <AdminComponents.model_info_popover
-                    :if={ModelInfo.present?(row.model_info)}
-                    id={
+                  No models advertised or used in the last 5 minutes.
+                </p>
+
+                <div
+                  :for={row <- @token_leaderboard}
+                  id={"upstream-account-#{@account.identity.id}-token-model-#{row.dom_id}"}
+                  data-role="upstream-account-token-model"
+                  class="upstream-account-token-model-row grid min-w-0 items-center rounded px-2 py-1.5 text-xs odd:bg-base-200/40"
+                >
+                  <div
+                    data-role="upstream-account-token-model-id"
+                    class="min-w-0"
+                    title={row.label}
+                  >
+                    <AdminComponents.model_info_popover
+                      :if={ModelInfo.present?(row.model_info)}
+                      id={
                       "upstream-account-#{@account.identity.id}-token-model-#{row.dom_id}-model-info"
                     }
-                    model_id={row.label}
-                    info={row.model_info}
-                    trigger={:label}
-                    class="w-full min-w-0"
-                    trigger_class="block w-full"
-                  />
+                      model_id={row.label}
+                      info={row.model_info}
+                      trigger={:label}
+                      class="w-full min-w-0"
+                      trigger_class="block w-full"
+                    />
+                    <span
+                      :if={!ModelInfo.present?(row.model_info)}
+                      class="block min-w-0 truncate font-medium text-base-content"
+                    >
+                      {row.label}
+                    </span>
+                  </div>
+                  <span class="h-1 overflow-hidden rounded-full bg-base-300/60" aria-hidden="true">
+                    <span
+                      class="block h-full rounded-full bg-primary/70"
+                      style={"width: #{row.share_percent}%"}
+                    ></span>
+                  </span>
                   <span
-                    :if={!ModelInfo.present?(row.model_info)}
-                    class="block min-w-0 truncate font-medium text-base-content"
+                    data-role="upstream-account-token-model-tokens"
+                    class={[
+                      "justify-self-end tabular-nums",
+                      if(row.tokens == 0, do: "text-base-content/45", else: "text-base-content/75")
+                    ]}
                   >
-                    {row.label}
+                    {Format.token_count(row.tokens)}
+                  </span>
+                  <span
+                    data-role="upstream-account-token-model-cost"
+                    class={[
+                      "justify-self-end tabular-nums",
+                      if(row.cost_micros == 0,
+                        do: "text-base-content/40",
+                        else: "text-base-content/60"
+                      )
+                    ]}
+                  >
+                    {Format.money_from_micros(row.cost_micros)}
                   </span>
                 </div>
-                <span class="h-1 overflow-hidden rounded-full bg-base-300/60" aria-hidden="true">
-                  <span
-                    class="block h-full rounded-full bg-primary/70"
-                    style={"width: #{row.share_percent}%"}
-                  ></span>
-                </span>
-                <span
-                  data-role="upstream-account-token-model-tokens"
-                  class={[
-                    "justify-self-end tabular-nums",
-                    if(row.tokens == 0, do: "text-base-content/45", else: "text-base-content/75")
-                  ]}
-                >
-                  {Format.token_count(row.tokens)}
-                </span>
-                <span
-                  data-role="upstream-account-token-model-cost"
-                  class={[
-                    "justify-self-end tabular-nums",
-                    if(row.cost_micros == 0,
-                      do: "text-base-content/40",
-                      else: "text-base-content/60"
-                    )
-                  ]}
-                >
-                  {Format.money_from_micros(row.cost_micros)}
-                </span>
               </div>
-            </div>
-          </section>
+            </section>
 
-          <section
-            :if={pools_panel_available?(@account)}
-            id={"upstream-account-#{@account.identity.id}-pools-panel"}
-            data-role="upstream-account-pools-panel"
-            aria-hidden={aria_bool(@panel_view != :pools)}
-            inert={@panel_view != :pools}
-            class={account_panel_class(@panel_view == :pools)}
-          >
-            <div class="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
-              <div class="min-w-0">
-                <p class="text-xs font-semibold uppercase text-primary">Pools</p>
-                <p
-                  id={"upstream-account-#{@account.identity.id}-pools-summary"}
-                  class="truncate text-xs text-base-content/60"
-                >
-                  {pool_assignment_summary_label(@account.assignments)}
-                </p>
-              </div>
-              <div class="min-w-0 text-right">
-                <p class="text-xs font-semibold uppercase text-primary">Routing</p>
-                <p
-                  id={"upstream-account-#{@account.identity.id}-pools-routing-summary"}
-                  class="truncate text-xs text-base-content/60"
-                  title={@routing_readiness.reason}
-                >
-                  {@routing_readiness.label}
-                </p>
-              </div>
-            </div>
-
-            <div
-              id={"upstream-account-#{@account.identity.id}-pool-assignments"}
-              data-role="upstream-account-pool-assignments"
-              class="grid max-h-[24rem] gap-3 overflow-y-auto pr-1"
+            <section
+              :if={pools_panel_available?(@account)}
+              id={"upstream-account-#{@account.identity.id}-pools-panel"}
+              data-role="upstream-account-pools-panel"
+              aria-hidden={aria_bool(@panel_view != :pools)}
+              inert={@panel_view != :pools}
+              class={account_panel_class(@panel_view == :pools)}
             >
-              <.pool_assignment_block
-                :for={assignment <- @account.assignments}
-                account_id={@account.identity.id}
-                assignment={assignment}
-                can_manage_pools?={@can_manage_pools?}
-                query_params={@pool_editor_query_params}
-              />
-            </div>
-          </section>
+              <div class="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+                <div class="min-w-0">
+                  <p class="text-xs font-semibold uppercase text-primary">Pools</p>
+                  <p
+                    id={"upstream-account-#{@account.identity.id}-pools-summary"}
+                    class="truncate text-xs text-base-content/60"
+                  >
+                    {pool_assignment_summary_label(@account.assignments)}
+                  </p>
+                </div>
+                <div class="min-w-0 text-right">
+                  <p class="text-xs font-semibold uppercase text-primary">Routing</p>
+                  <p
+                    id={"upstream-account-#{@account.identity.id}-pools-routing-summary"}
+                    class="truncate text-xs text-base-content/60"
+                    title={@routing_readiness.reason}
+                  >
+                    {@routing_readiness.label}
+                  </p>
+                </div>
+              </div>
+
+              <div
+                id={"upstream-account-#{@account.identity.id}-pool-assignments"}
+                data-role="upstream-account-pool-assignments"
+                class="grid max-h-[24rem] gap-3 overflow-y-auto pr-1"
+              >
+                <.pool_assignment_block
+                  :for={assignment <- @account.assignments}
+                  account_id={@account.identity.id}
+                  assignment={assignment}
+                  can_manage_pools?={@can_manage_pools?}
+                  query_params={@pool_editor_query_params}
+                />
+              </div>
+            </section>
+          </div>
+
+          <ReconciliationStatus.reconciliation_status
+            id_prefix={"upstream-account-#{@account.identity.id}"}
+            identity_observability={@account.identity_observability}
+            reauth_required?={@account.reauth_required?}
+            lifecycle_warning={@lifecycle_warning}
+          />
+
+          <UsagePollPause.usage_poll_pause
+            :if={@account.identity.status != "deleted"}
+            id_prefix={"upstream-account-#{@account.identity.id}"}
+            pause={Map.get(@account, :usage_poll_pause)}
+          />
         </div>
-
-        <ReconciliationStatus.reconciliation_status
-          id_prefix={"upstream-account-#{@account.identity.id}"}
-          identity_observability={@account.identity_observability}
-          reauth_required?={@account.reauth_required?}
-          lifecycle_warning={@lifecycle_warning}
-        />
-
-        <UsagePollPause.usage_poll_pause
-          :if={@account.identity.status != "deleted"}
-          id_prefix={"upstream-account-#{@account.identity.id}"}
-          pause={Map.get(@account, :usage_poll_pause)}
+        <AdminComponents.card_fact_strip
+          id={"upstream-account-#{@account.identity.id}-routing-readiness"}
+          data-role="upstream-account-card-footer"
+          class="upstream-account-card-footer"
+        >
+          <:fact role="upstream-routing-cell">
+            <AdminComponents.card_fact_label>Routing</AdminComponents.card_fact_label>
+            <AdminComponents.card_fact_value title={@routing_readiness.reason}>
+              {@routing_readiness.label}
+            </AdminComponents.card_fact_value>
+          </:fact>
+          <:fact role="upstream-pool-count-cell" interactive>
+            <AdminComponents.card_fact_label
+              tone_class={footer_panel_label_tone(@panel_view == :pools)}
+              class="transition-colors"
+            >
+              <button
+                id={"upstream-account-#{@account.identity.id}-pools-panel-trigger"}
+                type="button"
+                class={footer_panel_trigger_class(@panel_view == :pools, :middle)}
+                phx-click="toggle_account_pools_panel"
+                phx-value-id={@account.identity.id}
+                aria-controls={"upstream-account-#{@account.identity.id}-pools-panel"}
+                aria-expanded={aria_bool(@panel_view == :pools)}
+                aria-label={pools_panel_trigger_label(@panel_view, @account.assignments)}
+              >
+                <span class="sr-only">Pools</span>
+              </button>
+              <span class="pointer-events-none relative z-30 block max-w-full truncate text-left">
+                Pools
+              </span>
+            </AdminComponents.card_fact_label>
+            <AdminComponents.card_fact_value
+              tone_class={
+                if @account.assignments == [],
+                  do: "text-warning",
+                  else: footer_panel_value_tone(@panel_view == :pools)
+              }
+              class="pointer-events-none relative z-30 transition-colors"
+            >
+              {assignment_count_label(@account.assignments)}
+            </AdminComponents.card_fact_value>
+          </:fact>
+          <:fact role="upstream-token-status-cell" interactive>
+            <AdminComponents.card_fact_label
+              tone_class={footer_panel_label_tone(@panel_view == :tokens)}
+              class="transition-colors"
+            >
+              <button
+                id={"upstream-account-#{@account.identity.id}-tokens-panel-trigger"}
+                type="button"
+                class={footer_panel_trigger_class(@panel_view == :tokens, :last)}
+                phx-click="toggle_account_tokens_panel"
+                phx-value-id={@account.identity.id}
+                aria-controls={"upstream-account-#{@account.identity.id}-tokens-panel"}
+                aria-describedby={"upstream-account-#{@account.identity.id}-tokens-5m-value"}
+                aria-expanded={aria_bool(@panel_view == :tokens)}
+                aria-label={tokens_panel_trigger_label(@panel_view)}
+              >
+                <span class="sr-only">Tokens/5m</span>
+              </button>
+              <span class="pointer-events-none relative z-30 block max-w-full truncate text-left">
+                tokens/<span class="normal-case">5m</span>
+              </span>
+            </AdminComponents.card_fact_label>
+            <AdminComponents.card_fact_value
+              id={"upstream-account-#{@account.identity.id}-tokens-5m-value"}
+              data-usage-state={token_burn_usage_state(@account)}
+              tone_class={footer_panel_value_tone(@panel_view == :tokens)}
+              class="pointer-events-none relative z-30 transition-colors"
+              title={token_burn_title(@account)}
+            >
+              {recent_token_count_label(@account)}
+            </AdminComponents.card_fact_value>
+          </:fact>
+        </AdminComponents.card_fact_strip>
+        <SelectorContracts.refresh_status account={@account} />
+        <SelectorContracts.selector_contracts account={@account} routing_readiness={@routing_readiness} />
+      </div>
+      <div :if={@deleting?} class="z-10 col-start-1 row-start-1 min-w-0 self-center p-4">
+        <DeletionNotice.deletion_notice
+          id={"upstream-account-#{@account.identity.id}-deletion-notice"}
+          label={@account.label}
+          paused={Map.get(@account, :deletion_updates_paused?, false)}
         />
       </div>
-      <AdminComponents.card_fact_strip
-        id={"upstream-account-#{@account.identity.id}-routing-readiness"}
-        data-role="upstream-account-card-footer"
-        class="upstream-account-card-footer"
-      >
-        <:fact role="upstream-routing-cell">
-          <AdminComponents.card_fact_label>Routing</AdminComponents.card_fact_label>
-          <AdminComponents.card_fact_value title={@routing_readiness.reason}>
-            {@routing_readiness.label}
-          </AdminComponents.card_fact_value>
-        </:fact>
-        <:fact role="upstream-pool-count-cell" interactive>
-          <AdminComponents.card_fact_label
-            tone_class={footer_panel_label_tone(@panel_view == :pools)}
-            class="transition-colors"
-          >
-            <button
-              id={"upstream-account-#{@account.identity.id}-pools-panel-trigger"}
-              type="button"
-              class={footer_panel_trigger_class(@panel_view == :pools, :middle)}
-              phx-click="toggle_account_pools_panel"
-              phx-value-id={@account.identity.id}
-              aria-controls={"upstream-account-#{@account.identity.id}-pools-panel"}
-              aria-expanded={aria_bool(@panel_view == :pools)}
-              aria-label={pools_panel_trigger_label(@panel_view, @account.assignments)}
-            >
-              <span class="sr-only">Pools</span>
-            </button>
-            <span class="pointer-events-none relative z-30 block max-w-full truncate text-left">
-              Pools
-            </span>
-          </AdminComponents.card_fact_label>
-          <AdminComponents.card_fact_value
-            tone_class={
-              if @account.assignments == [],
-                do: "text-warning",
-                else: footer_panel_value_tone(@panel_view == :pools)
-            }
-            class="pointer-events-none relative z-30 transition-colors"
-          >
-            {assignment_count_label(@account.assignments)}
-          </AdminComponents.card_fact_value>
-        </:fact>
-        <:fact role="upstream-token-status-cell" interactive>
-          <AdminComponents.card_fact_label
-            tone_class={footer_panel_label_tone(@panel_view == :tokens)}
-            class="transition-colors"
-          >
-            <button
-              id={"upstream-account-#{@account.identity.id}-tokens-panel-trigger"}
-              type="button"
-              class={footer_panel_trigger_class(@panel_view == :tokens, :last)}
-              phx-click="toggle_account_tokens_panel"
-              phx-value-id={@account.identity.id}
-              aria-controls={"upstream-account-#{@account.identity.id}-tokens-panel"}
-              aria-describedby={"upstream-account-#{@account.identity.id}-tokens-5m-value"}
-              aria-expanded={aria_bool(@panel_view == :tokens)}
-              aria-label={tokens_panel_trigger_label(@panel_view)}
-            >
-              <span class="sr-only">Tokens/5m</span>
-            </button>
-            <span class="pointer-events-none relative z-30 block max-w-full truncate text-left">
-              tokens/<span class="normal-case">5m</span>
-            </span>
-          </AdminComponents.card_fact_label>
-          <AdminComponents.card_fact_value
-            id={"upstream-account-#{@account.identity.id}-tokens-5m-value"}
-            data-usage-state={token_burn_usage_state(@account)}
-            tone_class={footer_panel_value_tone(@panel_view == :tokens)}
-            class="pointer-events-none relative z-30 transition-colors"
-            title={token_burn_title(@account)}
-          >
-            {recent_token_count_label(@account)}
-          </AdminComponents.card_fact_value>
-        </:fact>
-      </AdminComponents.card_fact_strip>
-      <SelectorContracts.refresh_status account={@account} />
-      <SelectorContracts.selector_contracts account={@account} routing_readiness={@routing_readiness} />
     </article>
     """
   end

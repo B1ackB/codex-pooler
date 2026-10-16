@@ -490,6 +490,8 @@ Some actions are disabled or hidden depending on the account state. For example,
 
 Accounts that are marked deleted without a permanent removal request appear under `Any status` and `Deleted`, so an operator can remove them using the same `Delete` action. They remain unavailable for routing and recovery actions. Requests already in progress finish before physical removal; large histories are cleaned up in the background. Cleanup reduces its batch size after a database statement cancellation and automatically resumes after temporary database contention without exhausting its retry allowance. The account shows `Deletion in progress` until it disappears, or `Deletion failed - retry Delete` if another failure exhausts that allowance. Retrying Delete resumes the remaining cleanup and preserves request history. Permanent deletion cannot be undone.
 
+During cleanup, the account card is dimmed and its controls are disabled beneath a loading message. The account detail shows the same background-cleanup notice. With live updates enabled, the card disappears when cleanup completes and an open account detail returns to the list. If cleanup fails, the busy treatment clears and Delete becomes available for retry. Pausing live updates pauses this display refresh, with an explicit notice; resume updates to see the current result. A historical deleted account without a pending cleanup job does not show the loading treatment.
+
 ## Rename Dialog
 
 `Rename` opens a small account dialog.
