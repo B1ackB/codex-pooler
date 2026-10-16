@@ -55,6 +55,10 @@
 </p>
 
 <p align="center">
+  <a href="https://trendshift.io/repositories/53664?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-53664" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/53664/daily?language=Elixir" alt="icoretech%2Fcodex-pooler | Trendshift" width="250" height="55"/></a>
+</p>
+
+<p align="center">
   <img src=".github/assets/codex-pooler-readme-banner.png" alt="Codex Pooler ゲートウェイの概要">
 </p>
 
