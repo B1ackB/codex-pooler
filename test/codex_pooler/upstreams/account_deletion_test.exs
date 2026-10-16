@@ -60,14 +60,55 @@ defmodule CodexPooler.Upstreams.AccountDeletionTest do
     assert Repo.get!(UpstreamIdentity, identity.id) == identity
   end
 
-  test "deletion worker reports a bounded database cancellation error", %{scope: scope} do
+  test "database cancellations remain scheduled beyond the retry ceiling and complete after recovery", %{scope: scope} do
     Application.put_env(:codex_pooler, :upstream_deletion_immediate_row_limit, 0)
     identity = active_upstream_identity_fixture()
     assert {:deleting, _} = Upstreams.delete_account_for_scope(scope, identity.id)
+    assert [job] = deletion_jobs(identity.id)
+    queue = "upstream_deletion_#{System.unique_integer([:positive])}"
+    job |> change(queue: queue) |> Repo.update!()
     Repo.query!("CREATE FUNCTION pg_temp.cancel_upstream_detach() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'sample cancellation' USING ERRCODE = 'query_canceled'; END $$")
     Repo.query!("CREATE TRIGGER cancel_upstream_detach BEFORE UPDATE ON ledger_entries FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.cancel_upstream_detach()")
-    assert {:error, %{code: :upstream_deletion_busy}} = perform_job(UpstreamDeletionWorker, %{upstream_identity_id: identity.id})
-    assert Repo.get!(UpstreamIdentity, identity.id).status == "deleted"
+
+    for snoozes <- 1..(job.max_attempts + 1) do
+      {result, log} = ExUnit.CaptureLog.with_log(fn -> Oban.drain_queue(queue: queue, with_scheduled: true) end)
+      assert %{failure: 0, snoozed: 1, success: 0} = result
+      assert log =~ "upstream deletion deferred job_id=#{job.id} reason=upstream_deletion_busy retry_in_seconds=30"
+      pending = Repo.get!(Oban.Job, job.id)
+      assert pending.state == "scheduled"
+      assert pending.attempt == 0
+      assert pending.max_attempts == job.max_attempts
+      assert pending.meta["snoozed"] == snoozes
+      assert pending.errors == []
+      assert Upstreams.account_deletion_states([identity.id]) == %{identity.id => :in_progress}
+      assert Repo.get!(UpstreamIdentity, identity.id).metadata["permanent_deletion_requested_at"]
+      assert Repo.get!(UpstreamIdentity, identity.id).status == "deleted"
+    end
+
+    Repo.query!("DROP TRIGGER cancel_upstream_detach ON ledger_entries")
+    assert %{failure: 0, snoozed: 0, success: 1} = Oban.drain_queue(queue: queue, with_scheduled: true)
+    assert Repo.get!(Oban.Job, job.id).state == "completed"
+    refute Repo.get(UpstreamIdentity, identity.id)
+  end
+
+  test "unexpected database faults still consume a retry and remain visible", %{scope: scope} do
+    Application.put_env(:codex_pooler, :upstream_deletion_immediate_row_limit, 0)
+    identity = active_upstream_identity_fixture()
+    assert {:deleting, _} = Upstreams.delete_account_for_scope(scope, identity.id)
+    assert [job] = deletion_jobs(identity.id)
+    queue = "upstream_deletion_#{System.unique_integer([:positive])}"
+    job |> change(queue: queue) |> Repo.update!()
+    Repo.query!("CREATE FUNCTION pg_temp.reject_upstream_detach() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'sample database fault' USING ERRCODE = 'object_not_in_prerequisite_state'; END $$")
+    Repo.query!("CREATE TRIGGER reject_upstream_detach BEFORE UPDATE ON ledger_entries FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.reject_upstream_detach()")
+
+    {result, log} = ExUnit.CaptureLog.with_log(fn -> Oban.drain_queue(queue: queue) end)
+    assert %{failure: 1, snoozed: 0, success: 0} = result
+    assert log =~ "oban job failed"
+    pending = Repo.get!(Oban.Job, job.id)
+    assert pending.state == "retryable"
+    assert pending.attempt == 1
+    assert length(pending.errors) == 1
+    assert Repo.get!(UpstreamIdentity, identity.id).metadata["permanent_deletion_requested_at"]
   end
 
   for status <- ["active", "deleted"] do

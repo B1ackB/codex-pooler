@@ -25,6 +25,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountDeletion do
   @immediate_timeout_ms 5_000
   @batch_timeout_ms 10_000
   @batch_size 500
+  @batch_size_key "permanent_deletion_batch_size"
 
   # Preserve shared request accounting and replay provenance. Assignment-owned state is left
   # for the final foreign-key cascade; no secret is copied into the job or deletion receipt.
@@ -187,8 +188,8 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountDeletion do
       result = detach_batch(identity_id, table, field, reference)
 
       case result do
-        {:ok, {:batch, count}} when count < @batch_size -> detach_history(rest, identity_id, deadline)
-        {:ok, {:batch, _count}} -> detach_history(steps, identity_id, deadline)
+        {:ok, {:batch, count, limit}} when count < limit -> detach_history(rest, identity_id, deadline)
+        {:ok, {:batch, _count, _limit}} -> detach_history(steps, identity_id, deadline)
         {:ok, result} -> result
         {:error, reason} -> {:error, reason}
       end
@@ -196,12 +197,21 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountDeletion do
   end
 
   defp detach_batch(identity_id, table, field, reference) do
-    transaction(
-      fn ->
-        with_locked_target(identity_id, fn identity, assignments -> detach_idle_batch(identity, assignments, table, field, reference) end)
-      end,
-      @batch_timeout_ms
-    )
+    result =
+      transaction(
+        fn ->
+          with_locked_target(identity_id, fn identity, assignments -> detach_idle_batch(identity, assignments, table, field, reference) end)
+        end,
+        @batch_timeout_ms
+      )
+
+    case result do
+      {:error, {:batch_canceled, limit}} ->
+        persist_smaller_batch(identity_id, limit)
+
+      result ->
+        result
+    end
   end
 
   defp detach_idle_batch(identity, assignments, table, field, reference) do
@@ -212,9 +222,45 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountDeletion do
       # reference index can satisfy ORDER BY without scanning unrelated history when
       # LIMIT and stale/generic estimates would otherwise favor a sequential scan.
       ids = reference_ids(reference, identity, assignments)
+      limit = batch_size(identity)
       sql = "UPDATE #{table} SET #{field} = NULL WHERE ctid = ANY(ARRAY(SELECT ctid FROM #{table} WHERE #{field} = ANY($1::uuid[]) ORDER BY #{field} LIMIT $2))"
-      %{num_rows: count} = Repo.query!(sql, [ids, @batch_size], timeout: @batch_timeout_ms + 1_000)
-      {:batch, count}
+
+      try do
+        %{num_rows: count} = Repo.query!(sql, [ids, limit], timeout: @batch_timeout_ms + 1_000)
+        {:batch, count, limit}
+      rescue
+        exception in Postgrex.Error ->
+          if match?(%Postgrex.Error{postgres: %{code: :query_canceled}}, exception), do: Repo.rollback({:batch_canceled, limit}), else: reraise(exception, __STACKTRACE__)
+      end
+    end
+  end
+
+  defp persist_smaller_batch(identity_id, failed_limit) do
+    # The failed batch has rolled back. Commit learning separately, under the same
+    # identity lock, so a later worker or another node resumes at the smaller size.
+    result =
+      transaction(
+        fn ->
+          with_locked_target(identity_id, fn identity, _assignments ->
+            limit = min(batch_size(identity), max(div(failed_limit, 2), 1))
+            metadata = Map.put(identity.metadata, @batch_size_key, limit)
+            identity |> Ecto.Changeset.change(metadata: metadata) |> Repo.update!()
+            :reduced
+          end)
+        end,
+        @batch_timeout_ms
+      )
+
+    case result do
+      {:ok, :reduced} -> {:error, error(:upstream_deletion_busy, "upstream deletion is waiting for database work to finish")}
+      result -> result
+    end
+  end
+
+  defp batch_size(%UpstreamIdentity{metadata: metadata}) do
+    case Map.get(metadata, @batch_size_key) do
+      limit when is_integer(limit) and limit >= 1 and limit <= @batch_size -> limit
+      _invalid -> @batch_size
     end
   end
 

@@ -488,7 +488,7 @@ The current actions are:
 
 Some actions are disabled or hidden depending on the account state. For example, `Reactivate` is not useful while an account is already active, and recovery actions only appear when the account is in a recovery-eligible state. A disabled action states why in its tooltip; on a narrow screen, where there is no hover, the reason also shows as a line under the action.
 
-Accounts that are marked deleted without a permanent removal request appear under `Any status` and `Deleted`, so an operator can remove them using the same `Delete` action. They remain unavailable for routing and recovery actions. Requests already in progress finish before physical removal; large histories are cleaned up in the background. The account shows `Deletion in progress` until it disappears, or `Deletion failed - retry Delete` if cleanup needs another attempt. Permanent deletion cannot be undone.
+Accounts that are marked deleted without a permanent removal request appear under `Any status` and `Deleted`, so an operator can remove them using the same `Delete` action. They remain unavailable for routing and recovery actions. Requests already in progress finish before physical removal; large histories are cleaned up in the background. Cleanup reduces its batch size after a database statement cancellation and automatically resumes after temporary database contention without exhausting its retry allowance. The account shows `Deletion in progress` until it disappears, or `Deletion failed - retry Delete` if another failure exhausts that allowance. Retrying Delete resumes the remaining cleanup and preserves request history. Permanent deletion cannot be undone.
 
 ## Rename Dialog
 
