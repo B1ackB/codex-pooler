@@ -18,6 +18,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketSteeringCompletionTest do
   alias CodexPooler.InstanceSettings
   alias CodexPooler.Repo
   alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
+  alias Ecto.Adapters.SQL.Sandbox
 
   @moduletag capture_log: true
   # A detection budget, not a scenario delay: successful drains finish on frames,
@@ -55,10 +56,18 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketSteeringCompletionTest do
     end
   end
 
-  defp assert_transport_failure!(forwarding, failure) do
+  test "successor delivery logs remain captured when publication follows settled request visibility" do
+    # The paused receipt writer owns a checkout. Separate connections let this
+    # test observe settlement without waiting on that writer's connection.
+    on_exit(fn -> Sandbox.mode(Repo, :manual) end)
+    :ok = Sandbox.mode(Repo, :auto)
+    assert_transport_failure!(:off, :tcp_close, hold_delivery_log?: true)
+  end
+
+  defp assert_transport_failure!(forwarding, failure, opts \\ []) do
     put_owner_forwarding!(forwarding)
     previous_settings = if failure == :receive_timeout, do: CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
-    fixture = start_successor!(successor_frames: :partial)
+    fixture = start_successor!(successor_frames: :partial, committed?: opts[:hold_delivery_log?])
     if failure == :receive_timeout, do: set_receive_timeout!(previous_settings)
 
     {{client, [original, successor]}, log} =
@@ -67,6 +76,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketSteeringCompletionTest do
         {client, handler} = open_successor!(fixture, 4, receive_timeout_ms)
         [original, successor] = assert_active_successor!(fixture, client)
         assert_successful_response!(fixture.setup, original, @original_usage)
+        if opts[:hold_delivery_log?], do: hold_delivery_log_until_receipt_read!(successor.id)
         handler_monitor = Process.monitor(handler)
         assert :ok = FakeUpstream.release_frame(fixture.upstream, fixture.hold)
 
@@ -96,6 +106,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketSteeringCompletionTest do
     expected_code = if failure == :receive_timeout, do: "stream_idle_timeout", else: "upstream_stream_error"
     assert_unknown_failure!(fixture.setup, successor, expected_code, 502)
     assert %{"outcome" => "aborted", "terminal_class" => "none", "pushed_at" => nil, "frames_after_visible" => 2, "highest_frame_class" => "delta"} = await_delivery!(successor)
+    if opts[:hold_delivery_log?], do: assert_receive({:delivery_log_released, request_id} when request_id == successor.id, @detection_timeout_ms)
     assert_single_delivery_log!(log, original, "delivered", "response.completed")
     assert_single_delivery_log!(log, successor, "aborted", "none")
     assert_independent_responses!(fixture, original, successor)
@@ -218,11 +229,26 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketSteeringCompletionTest do
     response = FakeUpstream.websocket_steerable([created(original_id)], notify: self(), ref: hold, response_id: original_id, terminal_frames: [completed(original_id, @original_usage)], successor_frames: successor, batches: :separate)
     expected = FakeUpstream.expect_request(method: "WEBSOCKET", path: @turn_path, websocket_connection_ordinal: 1, json: [valid: true, equals: %{"type" => "response.create"}], respond: response)
     upstream = start_upstream(FakeUpstream.strict_sequence([expected]))
-    setup = gateway_setup(upstream)
+    setup = successor_gateway_setup!(upstream, opts[:committed?])
     set_model_serving_mode!(model_serving_scope(), setup, "full")
     {_server, port} = start_public_endpoint_with_server!()
     %{upstream: upstream, setup: setup, port: port, hold: hold, original_id: original_id, successor_id: successor_id, successor_frames: successor, thread: Ecto.UUID.generate(), turn_id: Ecto.UUID.generate()}
   end
+
+  defp successor_gateway_setup!(upstream, true) do
+    # Partial fixture setup rolls back; cleanup is registered before any of
+    # the complete graph commits, including an interrupted commit response.
+    {:ok, setup} =
+      Repo.transaction(fn ->
+        setup = gateway_setup(upstream)
+        register_unboxed_pool_cleanup!(setup)
+        setup
+      end)
+
+    setup
+  end
+
+  defp successor_gateway_setup!(upstream, _boxed), do: gateway_setup(upstream)
 
   defp open_successor!(fixture, prefix_count, receive_timeout_ms \\ nil) do
     client = connect!(fixture)
@@ -352,6 +378,63 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketSteeringCompletionTest do
     assert line =~ "outcome=#{outcome} terminal_class=#{terminal} "
   end
 
+  defp hold_delivery_log_until_receipt_read!(request_id) do
+    # Before the fix this read happened only after with_info_log returned,
+    # placing the real emission outside capture deterministically. Observing
+    # the durable receipt inside capture releases and captures the same log.
+    owner = self()
+    ref = make_ref()
+    filter_id = :steering_completion_delivery_log_hold
+    handler_id = {__MODULE__, ref}
+    dumped_id = Ecto.UUID.dump!(request_id)
+
+    on_exit(fn ->
+      :logger.remove_primary_filter(filter_id)
+      :telemetry.detach(handler_id)
+    end)
+
+    :ok =
+      :logger.add_primary_filter(
+        filter_id,
+        {fn
+           %{msg: {:string, chardata}} = event, _config ->
+             if String.contains?(IO.chardata_to_string(chardata), "downstream terminal pushed request_id=#{request_id} ") do
+               monitor = Process.monitor(owner)
+               send(owner, {:delivery_log_held, ref, self()})
+
+               receive do
+                 {:release_delivery_log, ^ref} -> :ok
+                 {:DOWN, ^monitor, :process, ^owner, _reason} -> :ok
+               after
+                 @detection_timeout_ms -> raise "delivery log hold was not released by its receipt read"
+               end
+
+               Process.demonitor(monitor, [:flush])
+             end
+
+             event
+
+           event, _config ->
+             event
+         end, nil}
+      )
+
+    :ok = :telemetry.attach(handler_id, [:codex_pooler, :repo, :query], &__MODULE__.release_delivery_log_on_read/4, %{owner: owner, ref: ref, request_id: request_id, dumped_id: dumped_id})
+  end
+
+  @doc false
+  def release_delivery_log_on_read(_event, _measurements, metadata, %{owner: owner, ref: ref, request_id: request_id, dumped_id: dumped_id}) do
+    if self() == owner and String.contains?(metadata.query, ~s(FROM "attempts")) and dumped_id in (metadata.params || []) do
+      receive do
+        {:delivery_log_held, ^ref, emitter} ->
+          send(emitter, {:release_delivery_log, ref})
+          send(owner, {:delivery_log_released, request_id})
+      after
+        0 -> :ok
+      end
+    end
+  end
+
   defp queued_continuation(fixture) do
     released_client_frame(fixture.setup, fixture.thread).([%{"type" => "function_call_output", "call_id" => "call_synthetic_completion_queued", "output" => "synthetic queued tool output"}], Ecto.UUID.generate(), %{"previous_response_id" => fixture.successor_id})
   end
@@ -477,7 +560,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketSteeringCompletionTest do
   defp pool_requests(setup), do: Repo.all(from(row in Request, where: row.pool_id == ^setup.pool.id, order_by: [asc: row.admitted_at]))
   defp request_attempts(row), do: Repo.all(from(attempt in Attempt, where: attempt.request_id == ^row.id))
   defp request_ledger(row), do: Repo.all(from(entry in LedgerEntry, where: entry.request_id == ^row.id))
-  defp await_settled_rows!(setup), do: await_rows!(setup, &(length(&1) == 2 and Enum.all?(&1, fn row -> row.completed_at != nil end)))
+
+  defp await_settled_rows!(setup) do
+    rows = await_rows!(setup, &(length(&1) == 2 and Enum.all?(&1, fn row -> row.completed_at != nil end)))
+    # The native lane publishes delivery after request settlement and socket
+    # cleanup. Its log precedes receipt persistence, so keep capture open until
+    # each receipt is visible rather than treating completed_at as a log fence.
+    Enum.each(rows, &await_delivery!/1)
+    rows
+  end
 
   defp await_rows!(setup, ready?, deadline \\ nil) do
     deadline = deadline || System.monotonic_time(:millisecond) + @detection_timeout_ms
